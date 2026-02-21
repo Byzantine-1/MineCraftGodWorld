@@ -3,6 +3,7 @@ const { sanitizeTurn } = require('./turnGuard')
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
 const { createSemaphore, withTimeout } = require('./flowControl')
+const { incrementMetric } = require('./runtimeMetrics')
 
 /**
  * @param {unknown} value
@@ -194,6 +195,7 @@ function createDialogueService(deps) {
 
     return withDialogueSlot(async () => {
       try {
+        incrementMetric('openAiRequests')
         const response = await withTimeout(client.responses.create({
           model,
           input: [
@@ -213,6 +215,9 @@ function createDialogueService(deps) {
         safe.trust_delta = clamp(Number(safe.trust_delta || 0), -2, 2)
         return safe
       } catch (err) {
+        if (err instanceof Error && err.message === 'dialogue_request_timeout') {
+          incrementMetric('openAiTimeouts')
+        }
         logger.errorWithStack('dialogue_generation_failed', err, { agent: agent.name })
         return fallback
       }

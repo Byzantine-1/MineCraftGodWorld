@@ -14,8 +14,10 @@ const { createLogger } = require('./logger')
 const { installCrashHandlers } = require('./crashHandlers')
 const { AppError } = require('./errors')
 const { createKeyedQueue, deriveOperationId, hashText } = require('./flowControl')
+const { startRuntimeMetricsReporter } = require('./runtimeMetrics')
 
 const logger = createLogger({ component: 'cli' })
+startRuntimeMetricsReporter(logger.child({ subsystem: 'metrics' }), 60000)
 const memoryStore = createMemoryStore({
   filePath: path.resolve(__dirname, './memory.json'),
   logger: logger.child({ subsystem: 'memory' })

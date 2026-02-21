@@ -2,6 +2,12 @@ const fs = require('fs')
 const path = require('path')
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
+const {
+  incrementMetric,
+  getRuntimeMetrics,
+  recordTransactionDuration,
+  recordLockAcquisition
+} = require('./runtimeMetrics')
 
 /**
  * @typedef {{
@@ -150,11 +156,61 @@ function cloneMemory(memory) {
 }
 
 /**
+ * @param {MemoryState} memory
+ * @returns {{ok: boolean, issues: string[]}}
+ */
+function validateMemoryIntegritySnapshot(memory) {
+  const issues = []
+  const world = memory?.world || {}
+  const ids = Array.isArray(world.processedEventIds) ? world.processedEventIds : null
+
+  if (!ids) {
+    issues.push('world.processedEventIds must be an array.')
+  } else {
+    const seen = new Set()
+    for (const id of ids) {
+      if (typeof id !== 'string' || !id.trim()) issues.push('processedEventIds contains invalid value.')
+      if (seen.has(id)) issues.push(`Duplicate eventId found: ${id}`)
+      seen.add(id)
+    }
+  }
+
+  const agents = memory?.agents || {}
+  for (const [name, agent] of Object.entries(agents)) {
+    if (!agent || typeof agent !== 'object') {
+      issues.push(`Invalid agent record for ${name}.`)
+      continue
+    }
+    if (Object.prototype.hasOwnProperty.call(agent, 'profile') && agent.profile === undefined) {
+      issues.push(`Agent ${name} has undefined profile.`)
+      continue
+    }
+    if (agent.profile && typeof agent.profile === 'object') {
+      const trust = Number(agent.profile.trust)
+      if (!Number.isFinite(trust) || trust < 0 || trust > 10) {
+        issues.push(`Agent ${name} has out-of-range trust: ${agent.profile.trust}`)
+      }
+    }
+  }
+
+  if (typeof world.warActive !== 'boolean') issues.push('world.warActive must be boolean.')
+  if (typeof world.rules?.allowLethalPolitics !== 'boolean') issues.push('world.rules.allowLethalPolitics must be boolean.')
+  if (typeof world.player?.alive !== 'boolean') issues.push('world.player.alive must be boolean.')
+  const legitimacy = Number(world.player?.legitimacy)
+  if (!Number.isFinite(legitimacy) || legitimacy < 0 || legitimacy > 100) {
+    issues.push(`world.player.legitimacy out of range: ${world.player?.legitimacy}`)
+  }
+
+  return { ok: issues.length === 0, issues }
+}
+
+/**
  * @param {{
  *   filePath?: string,
  *   fsModule?: typeof fs,
  *   logger?: ReturnType<typeof createLogger>,
- *   now?: () => number
+ *   now?: () => number,
+ *   enableTxTimers?: boolean
  * }} options
  */
 function createMemoryStore(options = {}) {
@@ -165,9 +221,13 @@ function createMemoryStore(options = {}) {
     : fs.promises
   const logger = options.logger || createLogger({ component: 'memory' })
   const now = options.now || (() => Date.now())
+  const enableTxTimers = typeof options.enableTxTimers === 'boolean'
+    ? options.enableTxTimers
+    : process.argv.includes('--timers')
   // Cross-process lock file used to serialize writers touching memory.json.
   const lockPath = `${filePath}.lock`
   const maxLockRetries = 5
+  const simulateCrash = process.argv.includes('--simulate-crash')
 
   /** @type {MemoryState | null} */
   let state = null
@@ -217,9 +277,16 @@ function createMemoryStore(options = {}) {
 
   async function acquireLockWithRetry() {
     // Small bounded backoff avoids hot-spinning when another process holds the lock.
+    const startedAt = now()
     for (let attempt = 0; attempt <= maxLockRetries; attempt += 1) {
       try {
-        return await fsPromises.open(lockPath, 'wx')
+        const handle = await fsPromises.open(lockPath, 'wx')
+        const elapsedMs = now() - startedAt
+        recordLockAcquisition(elapsedMs)
+        if (elapsedMs > 50) {
+          logger.warn('SLOW_LOCK_ACQUISITION', { lockPath, elapsedMs, retries: attempt })
+        }
+        return handle
       } catch (err) {
         const isEexist = err && typeof err === 'object' && err.code === 'EEXIST'
         if (!isEexist) {
@@ -230,7 +297,9 @@ function createMemoryStore(options = {}) {
             metadata: { lockPath, error: err instanceof Error ? err.message : String(err) }
           })
         }
+        incrementMetric('lockRetries')
         if (attempt === maxLockRetries) {
+          incrementMetric('lockTimeouts')
           throw new AppError({
             code: 'MEMORY_LOCK_TIMEOUT',
             message: 'Timed out acquiring memory lock.',
@@ -241,6 +310,7 @@ function createMemoryStore(options = {}) {
         await wait(15 * (attempt + 1))
       }
     }
+    incrementMetric('lockTimeouts')
     throw new AppError({
       code: 'MEMORY_LOCK_TIMEOUT',
       message: 'Timed out acquiring memory lock.',
@@ -250,9 +320,11 @@ function createMemoryStore(options = {}) {
   }
 
   async function withFileLock(fn) {
+    const lockWaitStartedAt = now()
     const lockHandle = await acquireLockWithRetry()
+    const lockWaitMs = now() - lockWaitStartedAt
     try {
-      return await fn()
+      return await fn({ lockWaitMs })
     } finally {
       try {
         await lockHandle.close()
@@ -262,13 +334,19 @@ function createMemoryStore(options = {}) {
     }
   }
 
-  async function persistSnapshotAtomically(snapshot) {
+  async function persistSnapshotAtomically(snapshot, phaseDurations) {
+    const stringifyStartedAt = now()
     const payload = JSON.stringify(snapshot, null, 2)
+    if (phaseDurations) phaseDurations.stringifyMs = now() - stringifyStartedAt
     const tempPath = `${filePath}.${process.pid}.${Date.now()}.tmp`
     try {
+      const writeStartedAt = now()
       await fsPromises.writeFile(tempPath, payload, 'utf-8')
+      if (phaseDurations) phaseDurations.writeMs = now() - writeStartedAt
       // Rename on the same filesystem is atomic, so readers never observe partial JSON.
+      const renameStartedAt = now()
       await fsPromises.rename(tempPath, filePath)
+      if (phaseDurations) phaseDurations.renameMs = now() - renameStartedAt
     } catch (err) {
       await fsPromises.unlink(tempPath).catch(() => {})
       throw new AppError({
@@ -290,24 +368,63 @@ function createMemoryStore(options = {}) {
   function transact(mutator, opts = {}) {
     const run = async () => {
       const eventId = opts.eventId ? asText(opts.eventId, '', 200) : ''
-      return withFileLock(async () => {
-        // Always reload inside the lock so each writer mutates the latest committed snapshot.
-        const current = await loadFromDiskUnderLock()
-        state = current
-
-        if (eventId && hasEvent(current.world.processedEventIds, eventId)) {
-          return { skipped: true, result: null }
+      const startedAt = now()
+      const phaseDurations = enableTxTimers
+        ? {
+          lockWaitMs: 0,
+          cloneMs: 0,
+          stringifyMs: 0,
+          writeMs: 0,
+          renameMs: 0,
+          totalTxMs: 0
         }
+        : null
+      try {
+        const txResult = await withFileLock(async ({ lockWaitMs }) => {
+          if (phaseDurations) phaseDurations.lockWaitMs = lockWaitMs
+          // Always reload inside the lock so each writer mutates the latest committed snapshot.
+          const current = await loadFromDiskUnderLock()
+          state = current
 
-        const working = cloneMemory(current)
-        const result = await mutator(working)
+          if (eventId && hasEvent(current.world.processedEventIds, eventId)) {
+            incrementMetric('duplicateEventsSkipped')
+            incrementMetric('transactionsAborted')
+            logger.warn(`DUPLICATE_EVENT_SKIPPED: ${eventId}`)
+            return { skipped: true, result: null }
+          }
 
-        if (eventId) markEvent(working, eventId)
-        if (opts.persist !== false) await persistSnapshotAtomically(working)
-        state = working
+          if (simulateCrash && Math.random() < 0.1) {
+            throw new AppError({
+              code: 'SIMULATED_CRASH',
+              message: 'Simulated crash after lock acquisition before commit.',
+              recoverable: false,
+              metadata: { eventId }
+            })
+          }
 
-        return { skipped: false, result }
-      })
+          const cloneStartedAt = phaseDurations ? now() : 0
+          const working = cloneMemory(current)
+          if (phaseDurations) phaseDurations.cloneMs = now() - cloneStartedAt
+          const result = await mutator(working)
+
+          if (eventId) markEvent(working, eventId)
+          if (opts.persist !== false) await persistSnapshotAtomically(working, phaseDurations)
+          state = working
+
+          incrementMetric('transactionsCommitted')
+          if (eventId) incrementMetric('eventsProcessed')
+          return { skipped: false, result }
+        })
+
+        const durationMs = now() - startedAt
+        if (phaseDurations) phaseDurations.totalTxMs = durationMs
+        recordTransactionDuration(durationMs, { isSlow: durationMs > 75, phaseDurations })
+        if (durationMs > 75) logger.warn('SLOW_TRANSACTION', { durationMs, eventId: eventId || null })
+        return txResult
+      } catch (err) {
+        incrementMetric('transactionsAborted')
+        throw err
+      }
     }
 
     const chained = txQueue.then(run, run)
@@ -449,10 +566,16 @@ function createMemoryStore(options = {}) {
     await transact(() => {}, { persist: true, eventId: undefined })
   }
 
+  function validateMemoryIntegrity() {
+    return validateMemoryIntegritySnapshot(getSnapshot())
+  }
+
   return {
     loadAllMemory,
     saveAllMemory,
     getSnapshot,
+    getRuntimeMetrics,
+    validateMemoryIntegrity,
     transact,
     hasProcessedEvent,
     rememberAgent,
@@ -464,4 +587,4 @@ function createMemoryStore(options = {}) {
   }
 }
 
-module.exports = { createMemoryStore, freshMemoryShape }
+module.exports = { createMemoryStore, freshMemoryShape, validateMemoryIntegritySnapshot }

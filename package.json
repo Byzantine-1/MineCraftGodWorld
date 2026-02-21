@@ -3,8 +3,10 @@
   "version": "1.0.0",
   "main": "src/index.js",
   "scripts": {
-    "test": "node --test",
+    "test": "node --test \"test/*.test.js\"",
     "smoke": "node ./scripts/smoke.js",
+    "stress": "node ./scripts/stressTest.js",
+    "scale": "node ./scripts/scaleValidation.js",
     "bots": "node ./src/minecraftBridge.js",
     "cli": "node ./src/index.js"
   },
