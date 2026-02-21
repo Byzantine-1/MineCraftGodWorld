@@ -45,8 +45,9 @@ function parseCliInput(input) {
   }
 
   if (commandName === 'god') {
-    if (!target) return { type: 'error', message: 'No god command provided.' }
-    return { type: 'god', command: target.toLowerCase() }
+    const payload = asText(trimmed.substring(command.length), '', 240)
+    if (!payload) return { type: 'error', message: 'No god command provided.' }
+    return { type: 'god', command: payload }
   }
 
   if (commandName === 'exit') return { type: 'exit' }
@@ -68,7 +69,7 @@ function parseBridgeChat(text) {
     return { type: 'party_leader', leaderName: sanitizeMinecraftName(candidate) }
   }
   if (lower.startsWith('god ')) {
-    return { type: 'god', command: asText(message.substring(4), '', 80).toLowerCase() }
+    return { type: 'god', command: asText(message.substring(4), '', 240) }
   }
 
   const match = /^([a-zA-Z0-9_]{3,16})\s*:\s*(.+)$/.exec(message)

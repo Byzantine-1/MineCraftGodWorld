@@ -1,5 +1,6 @@
 require('dotenv').config()
 
+const fs = require('fs')
 const path = require('path')
 const readline = require('readline')
 
@@ -14,7 +15,8 @@ const { createLogger } = require('./logger')
 const { installCrashHandlers } = require('./crashHandlers')
 const { AppError } = require('./errors')
 const { createKeyedQueue, deriveOperationId, hashText } = require('./flowControl')
-const { startRuntimeMetricsReporter } = require('./runtimeMetrics')
+const { startRuntimeMetricsReporter, getObservabilitySnapshot } = require('./runtimeMetrics')
+const { createWorldLoop } = require('./worldLoop')
 
 const logger = createLogger({ component: 'cli' })
 startRuntimeMetricsReporter(logger.child({ subsystem: 'metrics' }), 60000)
@@ -35,10 +37,6 @@ const turnEngine = createTurnEngine({
   actionEngine,
   logger: logger.child({ subsystem: 'turn_engine' })
 })
-const godCommandService = createGodCommandService({
-  memoryStore,
-  logger: logger.child({ subsystem: 'god_commands' })
-})
 const runSerial = createKeyedQueue()
 
 /** @type {Record<string, Agent>} */
@@ -46,8 +44,6 @@ const agents = {
   mara: new Agent({ name: 'Mara', role: 'Scout', faction: 'Pilgrims' }),
   eli: new Agent({ name: 'Eli', role: 'Guard', faction: 'Pilgrims' })
 }
-
-memoryStore.loadAllMemory()
 
 const rl = readline.createInterface({
   input: process.stdin,
@@ -66,10 +62,87 @@ function writeLine(text, context = {}) {
   logger.info('user_message', { text, ...context })
 }
 
+/**
+ * @returns {{loopStatus: any, agentsOnline: number, avgTxMs: number, p95TxMs: number, p99TxMs: number, lockWaitP95Ms: number, lockWaitP99Ms: number, memoryBytes: number, heapMb: number, guardrailFlags: string[]}}
+ */
+function buildGodStatusSnapshot() {
+  const loopStatus = worldLoop.getWorldLoopStatus()
+  const observability = getObservabilitySnapshot()
+  const runtime = memoryStore.getRuntimeMetrics()
+  const avgTxMs = observability.txDurationCount > 0
+    ? observability.txDurationTotalMs / observability.txDurationCount
+    : 0
+  const slowRate = observability.txDurationCount > 0
+    ? observability.slowTransactionCount / observability.txDurationCount
+    : 0
+  const guardrailFlags = []
+  const integrity = memoryStore.validateMemoryIntegrity()
+  if (!integrity.ok) guardrailFlags.push('CRITICAL:integrity_failed')
+  if (runtime.lockTimeouts > 0) guardrailFlags.push('CRITICAL:lock_timeouts')
+  if (observability.txDurationP99Ms >= 500) guardrailFlags.push('CRITICAL:p99_tx_ge_500')
+  if (slowRate > 0.10) guardrailFlags.push('WARN:slow_tx_rate_gt_0_10')
+  if (loopStatus.backpressure) guardrailFlags.push(`WARN:backpressure:${loopStatus.reason}`)
+
+  let memoryBytes = 0
+  try {
+    memoryBytes = fs.statSync(path.resolve(__dirname, './memory.json')).size
+  } catch (err) {
+    memoryBytes = Buffer.byteLength(JSON.stringify(memoryStore.getSnapshot()), 'utf-8')
+  }
+
+  return {
+    loopStatus,
+    agentsOnline: Object.keys(agents).length,
+    avgTxMs,
+    p95TxMs: observability.txDurationP95Ms,
+    p99TxMs: observability.txDurationP99Ms,
+    lockWaitP95Ms: observability.txPhaseP95Ms.lockWaitMs,
+    lockWaitP99Ms: observability.txPhaseP99Ms.lockWaitMs,
+    memoryBytes,
+    heapMb: process.memoryUsage().heapUsed / (1024 * 1024),
+    guardrailFlags
+  }
+}
+
+const worldLoop = createWorldLoop({
+  memoryStore,
+  getAgents: () => Object.values(agents),
+  logger: logger.child({ subsystem: 'world_loop' }),
+  runtimeActions: {
+    onWander: ({ agent, direction }) => {
+      writeLine(`[LOOP] ${agent.name} wanders ${direction}.`)
+    },
+    onFollow: ({ agent, leaderName }) => {
+      if (!leaderName) return
+      writeLine(`[LOOP] ${agent.name} follows ${leaderName}.`)
+    },
+    onRespond: ({ agent, message }) => {
+      writeLine(`${agent.name}: ${message}`)
+    }
+  }
+})
+
+const godCommandService = createGodCommandService({
+  memoryStore,
+  logger: logger.child({ subsystem: 'god_commands' }),
+  worldLoop,
+  runtimeSay: ({ agent, message }) => {
+    writeLine(`${agent.name}: ${message}`)
+  },
+  getStatusSnapshot: () => buildGodStatusSnapshot()
+})
+
+memoryStore.loadAllMemory()
+
 async function shutdown(reason) {
   if (shuttingDown) return
   shuttingDown = true
   logger.info('shutdown_start', { reason })
+  try {
+    worldLoop.stopWorldLoop()
+  } catch (err) {
+    logger.warn('shutdown_loop_stop_failed', { error: err instanceof Error ? err.message : String(err) })
+  }
   try {
     await memoryStore.saveAllMemory()
   } catch (err) {
@@ -182,12 +255,18 @@ async function handleLine(rawInput) {
       return
     }
 
-    for (const agent of Object.values(agents)) {
-      await memoryStore.rememberAgent(agent.name, `God issued command "${parsed.command}".`, true, `${operationId}:audit`)
-      await memoryStore.rememberFaction(agent.faction, `God issued command "${parsed.command}".`, true, `${operationId}:audit`)
+    if (result.audit) {
+      for (const agent of Object.values(agents)) {
+        await memoryStore.rememberAgent(agent.name, `God issued command "${parsed.command}".`, true, `${operationId}:audit`)
+        await memoryStore.rememberFaction(agent.faction, `God issued command "${parsed.command}".`, true, `${operationId}:audit`)
+      }
+      await memoryStore.rememberWorld(`God issued command "${parsed.command}".`, true, `${operationId}:audit`)
     }
-    await memoryStore.rememberWorld(`God issued command "${parsed.command}".`, true, `${operationId}:audit`)
 
+    if (Array.isArray(result.outputLines) && result.outputLines.length > 0) {
+      result.outputLines.forEach(line => writeLine(line))
+      return
+    }
     writeLine(`GOD COMMAND APPLIED: ${parsed.command}`)
   }
 }

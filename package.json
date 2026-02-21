@@ -3,7 +3,10 @@
   "version": "1.0.0",
   "main": "src/index.js",
   "scripts": {
-    "test": "node --test \"test/*.test.js\"",
+    "test": "npm run test:public",
+    "test:public": "node --test \"test/*.test.js\"",
+    "test:blackbox": "node ./scripts/runBlackboxTests.js",
+    "test:all": "npm run test:public && npm run test:blackbox",
     "smoke": "node ./scripts/smoke.js",
     "stress": "node ./scripts/stressTest.js",
     "scale": "node ./scripts/scaleValidation.js",

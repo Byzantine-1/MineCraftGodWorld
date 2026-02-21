@@ -1,3 +1,0 @@
-session_id,run_type,repeat,agents,tier,total_commands,avg_tx,avg_tx_std,max_tx,max_tx_std,p50_tx,p95_tx,p99_tx,slow_tx,slow_tx_std,slow_tx_rate,heap_mb,heap_mb_std,memory_bytes,memory_bytes_std,lock_retries,lock_timeouts,duplicates_skipped,openai_timeouts,integrity_ok,lock_wait_p95,lock_wait_p99,clone_p95,clone_p99,stringify_p95,stringify_p99,write_p95,write_p99,rename_p95,rename_p99,total_tx_p95,total_tx_p99
-2026-02-21T06:10:53.304Z,repeat,1,1,2,120,30.11,0,57,0,30,39,47,0,0,0,10.14,0,98974,0,0,0,17,0,true,2,2,1,1,1,1,3,4,2,3,39,47
-2026-02-21T06:10:53.304Z,agg,0,1,2,120,30.11,0,57,0,30,39,47,0,0,0,10.14,0,98974,0,0,0,17,0,true,2,2,1,1,1,1,3,4,2,3,39,47

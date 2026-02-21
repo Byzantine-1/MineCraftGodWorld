@@ -23,3 +23,15 @@ test('parseBridgeChat parses npc talk and party commands', () => {
   const partyOn = parseBridgeChat('party on')
   assert.equal(partyOn.type, 'party_on')
 })
+
+test('parseCliInput preserves full multi-word god command payload', () => {
+  const parsed = parseCliInput('god intent set Mara follow Eli')
+  assert.equal(parsed.type, 'god')
+  assert.equal(parsed.command, 'intent set Mara follow Eli')
+})
+
+test('parseBridgeChat preserves full god command payload', () => {
+  const parsed = parseBridgeChat('god say Mara Hold this line')
+  assert.equal(parsed.type, 'god')
+  assert.equal(parsed.command, 'say Mara Hold this line')
+})
