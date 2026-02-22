@@ -1,5 +1,17 @@
 # Scaling Ceiling Discovery (File-Backed Transaction Store)
 
+## Current Applicability Note
+
+- This report captures a specific validation session from 2026-02-21.
+- Since then, gameplay systems were expanded (town board visibility, chronicle/news, quests, mood/events, rumors/decisions, traits/titles).
+- Re-run scale checks after major command-surface or schema additions.
+
+Recommended refresh command:
+
+```powershell
+node scripts/scaleValidation.js --fresh-csv --repeats=5 --timers --agent-series=1,3,5,7 --tier=2
+```
+
 ## Run Context
 - Date: 2026-02-21
 - Host OS: Microsoft Windows 11 Home (10.0.26200, 64-bit)
