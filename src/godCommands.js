@@ -6,16 +6,63 @@ const SUPPORTED_GOD_COMMANDS = new Set(['declare_war', 'make_peace', 'bless_peop
 const INTENT_TYPES = new Set(['idle', 'wander', 'follow', 'respond'])
 const JOB_ROLES = new Set(['scout', 'guard', 'builder', 'farmer', 'hauler'])
 const FEED_MAX_ENTRIES = 200
-const QUEST_TYPES = new Set(['trade_n', 'visit_town'])
+const QUEST_TYPES = new Set(['trade_n', 'visit_town', 'rumor_task'])
+const RUMOR_TASK_KINDS = new Set(['rumor_trade', 'rumor_visit', 'rumor_choice'])
 const QUEST_STATES = new Set(['offered', 'accepted', 'in_progress', 'completed', 'cancelled', 'failed'])
 const QUEST_ACTIVE_STATES = new Set(['accepted', 'in_progress'])
 const QUEST_CANCELABLE_STATES = new Set(['offered', 'accepted', 'in_progress'])
 const DEFAULT_TRADE_QUEST_REWARD = 8
 const DEFAULT_VISIT_QUEST_REWARD = 5
+const RUMOR_KIND_SET = new Set(['grounded', 'supernatural', 'political'])
+const DECISION_STATES = new Set(['open', 'chosen', 'expired'])
+const TRAIT_NAMES = ['courage', 'greed', 'faith']
+const TRAIT_NAME_SET = new Set(TRAIT_NAMES)
+const DEFAULT_AGENT_TRAITS = { courage: 1, greed: 1, faith: 1 }
+const MAX_AGENT_TITLE_LEN = 32
+const MAX_AGENT_TITLE_COUNT = 20
 const CLOCK_PHASES = new Set(['day', 'night'])
 const CLOCK_SEASONS = new Set(['dawn', 'long_night'])
 const STORY_FACTION_NAMES = ['iron_pact', 'veil_church']
 const STORY_FACTION_NAME_SET = new Set(STORY_FACTION_NAMES)
+const MOOD_LABEL_THRESHOLD = 25
+const MOOD_THRESHOLDS = [25, 50, 75]
+const EVENT_TYPES = new Set(['festival', 'shortage', 'omen', 'patrol', 'fog', 'tax_day'])
+const EVENT_MOD_KEYS = new Set([
+  'fear',
+  'unrest',
+  'prosperity',
+  'trade_reward_bonus',
+  'visit_reward_bonus',
+  'iron_pact_rep_bonus',
+  'veil_church_rep_bonus'
+])
+const EVENT_DECK = ['festival', 'shortage', 'omen', 'patrol', 'fog', 'tax_day']
+const EVENT_TYPE_CONFIG = {
+  festival: {
+    title: 'Festival lights warm the market square.',
+    mods: { prosperity: 3, trade_reward_bonus: 1 }
+  },
+  shortage: {
+    title: 'Storehouses thin and tempers fray.',
+    mods: { unrest: 2, trade_reward_bonus: 2 }
+  },
+  omen: {
+    title: 'An omen passes over the steeples.',
+    mods: { fear: 2, veil_church_rep_bonus: 1 }
+  },
+  patrol: {
+    title: 'Iron patrols sweep the roads.',
+    mods: { fear: -1, iron_pact_rep_bonus: 1 }
+  },
+  fog: {
+    title: 'Thick fog swallows the crossroads.',
+    mods: { fear: 3, visit_reward_bonus: 2 }
+  },
+  tax_day: {
+    title: 'Tax day rattles every door.',
+    mods: { unrest: 2 }
+  }
+}
 const STORY_FACTION_DEFAULTS = {
   iron_pact: {
     towns: ['alpha'],
@@ -31,6 +78,94 @@ const STORY_FACTION_DEFAULTS = {
 const SEASON_THREAT_RATES = {
   dawn: { nightRise: 5, dayFall: 3 },
   long_night: { nightRise: 8, dayFall: 2 }
+}
+const RUMOR_TEMPLATE_LIBRARY = {
+  grounded: {
+    missing_goods: {
+      day: 'Warm bread and whispers circle {town}: goods keep vanishing from crates.',
+      night: 'Lanterns dim in {town}; shopkeepers count missing sacks by candlelight.'
+    },
+    dock_counts: {
+      day: 'Porters in {town} whisper of carts that arrive half-empty.',
+      night: 'Footsteps fade at the docks of {town}; inventories never add up.'
+    }
+  },
+  supernatural: {
+    mist_shapes: {
+      day: 'Children in {town} sketch pale figures they swear they saw in the fog.',
+      night: 'A pale shape slides through the mist outside {town} and vanishes at dawn.'
+    },
+    relic_prophecy: {
+      day: 'A market elder in {town} mutters that an old relic has awakened.',
+      night: 'In {town}, a cracked bell rings alone when no hand is near.'
+    }
+  },
+  political: {
+    levy_accusations: {
+      day: 'Town clerks in {town} trade accusations over who raised the levy.',
+      night: 'Behind shuttered windows in {town}, blame passes faster than coin.'
+    },
+    guild_blame: {
+      day: 'Merchants in {town} whisper that guild books hide a second ledger.',
+      night: 'In {town}, quiet voices name rivals as traitors to the commons.'
+    }
+  }
+}
+const EVENT_TO_AUTO_RUMOR = {
+  shortage: { kind: 'grounded', templateKey: 'missing_goods', severity: 2, expiresInDays: 2 },
+  fog: { kind: 'supernatural', templateKey: 'mist_shapes', severity: 2, expiresInDays: 2 },
+  omen: { kind: 'supernatural', templateKey: 'relic_prophecy', severity: 3, expiresInDays: 3 },
+  tax_day: { kind: 'political', templateKey: 'levy_accusations', severity: 2, expiresInDays: 2 }
+}
+const DECISION_TEMPLATE_BY_EVENT = {
+  shortage: {
+    prompt: 'Storehouses are thinning. What policy will the mayor choose?',
+    options: [
+      { key: 'ration', label: 'Ration Bread', effects: { mood: { unrest: 1, prosperity: -1 }, threat_delta: -1 } },
+      { key: 'import', label: 'Hire Caravans', effects: { mood: { prosperity: 1 }, threat_delta: -1, rumor_spawn: { kind: 'grounded', severity: 1, templateKey: 'dock_counts', expiresInDays: 1 } } },
+      { key: 'free_market', label: 'Free Market', effects: { mood: { prosperity: 2, unrest: 1 }, threat_delta: 1 } }
+    ]
+  },
+  festival: {
+    prompt: 'Festival crowds gather at the gates. Where will funds go?',
+    options: [
+      { key: 'fund_music', label: 'Fund Music', effects: { mood: { prosperity: 2, fear: -1 } } },
+      { key: 'open_stalls', label: 'Open Stalls', effects: { mood: { prosperity: 1, unrest: -1 } } },
+      { key: 'hold_feast', label: 'Hold Feast', effects: { mood: { prosperity: 2, unrest: -1 }, threat_delta: -1 } }
+    ]
+  },
+  omen: {
+    prompt: 'An omen shadows the steeples. How should the mayor respond?',
+    options: [
+      { key: 'heed_omens', label: 'Heed Omens', effects: { mood: { fear: -1 }, rep_delta: { veil_church: 1 }, rumor_spawn: { kind: 'supernatural', severity: 2, templateKey: 'relic_prophecy', expiresInDays: 1 } } },
+      { key: 'denounce', label: 'Denounce Fear', effects: { mood: { unrest: 1, fear: -1 }, rep_delta: { veil_church: -1 } } },
+      { key: 'investigate', label: 'Send Investigators', effects: { mood: { fear: -1, prosperity: 1 }, threat_delta: -1 } }
+    ]
+  },
+  patrol: {
+    prompt: 'Iron patrols report thin borders. What order goes out?',
+    options: [
+      { key: 'reinforce', label: 'Reinforce Gates', effects: { mood: { fear: -1 }, rep_delta: { iron_pact: 1 }, threat_delta: -1 } },
+      { key: 'expand_routes', label: 'Expand Routes', effects: { mood: { prosperity: 1, unrest: 1 } } },
+      { key: 'stand_down', label: 'Stand Down', effects: { mood: { prosperity: 1, fear: 1 }, threat_delta: 1 } }
+    ]
+  },
+  fog: {
+    prompt: 'Fog blankets the roads tonight. Which order stands?',
+    options: [
+      { key: 'light_beacons', label: 'Light Beacons', effects: { mood: { fear: -1, prosperity: 1 }, threat_delta: -1 } },
+      { key: 'send_scouts', label: 'Send Scouts', effects: { mood: { fear: 1, unrest: 1 }, rumor_spawn: { kind: 'supernatural', severity: 2, templateKey: 'mist_shapes', expiresInDays: 1 } } },
+      { key: 'stay_inside', label: 'Curfew Bells', effects: { mood: { fear: -1, unrest: 1 }, threat_delta: -1 } }
+    ]
+  },
+  tax_day: {
+    prompt: 'Tax ledgers spark unrest. What decree will the mayor sign?',
+    options: [
+      { key: 'relief', label: 'Grant Relief', effects: { mood: { unrest: -2, prosperity: -1 }, threat_delta: -1 } },
+      { key: 'enforce', label: 'Enforce Collections', effects: { mood: { unrest: 1, prosperity: 1 }, threat_delta: 1 } },
+      { key: 'blame_outsiders', label: 'Blame Outsiders', effects: { mood: { fear: 1, unrest: 1 }, rumor_spawn: { kind: 'political', severity: 2, templateKey: 'guild_blame', expiresInDays: 1 } } }
+    ]
+  }
 }
 
 /**
@@ -116,6 +251,133 @@ function ensureAgentProfile(memory, agentName) {
     memory.agents[agentName].profile = {}
   }
   return memory.agents[agentName].profile
+}
+
+/**
+ * @param {unknown} traitsInput
+ */
+function normalizeAgentTraits(traitsInput) {
+  const source = (traitsInput && typeof traitsInput === 'object' && !Array.isArray(traitsInput))
+    ? traitsInput
+    : {}
+  const traits = {}
+  for (const traitName of TRAIT_NAMES) {
+    const value = Number(source[traitName])
+    traits[traitName] = Number.isFinite(value)
+      ? clamp(Math.trunc(value), 0, 3)
+      : DEFAULT_AGENT_TRAITS[traitName]
+  }
+  return traits
+}
+
+/**
+ * @param {unknown} titlesInput
+ */
+function normalizeAgentTitles(titlesInput) {
+  const source = Array.isArray(titlesInput) ? titlesInput : []
+  const titles = []
+  const seen = new Set()
+  for (const rawTitle of source) {
+    const title = asText(rawTitle, '', MAX_AGENT_TITLE_LEN)
+    if (!title) continue
+    const key = title.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    titles.push(title)
+    if (titles.length >= MAX_AGENT_TITLE_COUNT) break
+  }
+  return titles
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeRumorsCompleted(value) {
+  const count = Number(value)
+  if (!Number.isInteger(count) || count < 0) return 0
+  return count
+}
+
+/**
+ * @param {any} profile
+ */
+function ensureAgentStoryProfile(profile) {
+  profile.traits = normalizeAgentTraits(profile.traits)
+  profile.titles = normalizeAgentTitles(profile.titles)
+  profile.rumors_completed = normalizeRumorsCompleted(profile.rumors_completed)
+  profile.rep = normalizeAgentRep(profile.rep)
+  return profile
+}
+
+/**
+ * @param {any} memory
+ * @param {string} agentName
+ * @param {string} title
+ * @param {number} at
+ * @param {string} idPrefix
+ * @param {string | null} town
+ */
+function grantAgentTitleIfMissing(memory, agentName, title, at, idPrefix, town) {
+  const safeAgentName = asText(agentName, '', 80)
+  const safeTitle = asText(title, '', MAX_AGENT_TITLE_LEN)
+  const safeIdPrefix = asText(idPrefix, '', 200)
+  if (!safeAgentName || !safeTitle || !safeIdPrefix) return false
+  const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, safeAgentName))
+  const titles = normalizeAgentTitles(profile.titles)
+  if (titles.some(item => sameText(item, safeTitle, MAX_AGENT_TITLE_LEN))) return false
+  titles.push(safeTitle)
+  profile.titles = normalizeAgentTitles(titles)
+  const townName = asText(town, '', 80) || undefined
+  const message = `${safeAgentName} earns the title "${safeTitle}".`
+  appendChronicle(memory, {
+    id: `${safeIdPrefix}:chronicle:title_award:${safeAgentName.toLowerCase()}:${safeTitle.toLowerCase()}`,
+    type: 'title',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      agent: safeAgentName,
+      title: safeTitle
+    }
+  })
+  appendNews(memory, {
+    id: `${safeIdPrefix}:news:title_award:${safeAgentName.toLowerCase()}:${safeTitle.toLowerCase()}`,
+    topic: 'title',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      agent: safeAgentName,
+      title: safeTitle
+    }
+  })
+  return true
+}
+
+/**
+ * @param {any} memory
+ * @param {string} agentName
+ * @param {number} at
+ * @param {string} idPrefix
+ * @param {string | null} town
+ */
+function applyRepThresholdTitleAwards(memory, agentName, at, idPrefix, town) {
+  const safeAgentName = asText(agentName, '', 80)
+  if (!safeAgentName) return []
+  const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, safeAgentName))
+  const rep = normalizeAgentRep(profile.rep)
+  const awarded = []
+  if (Number(rep.iron_pact || 0) >= 5) {
+    if (grantAgentTitleIfMissing(memory, safeAgentName, 'Pact Friend', at, `${idPrefix}:pact_friend`, town)) {
+      awarded.push('Pact Friend')
+    }
+  }
+  if (Number(rep.veil_church || 0) >= 5) {
+    if (grantAgentTitleIfMissing(memory, safeAgentName, 'Veil Initiate', at, `${idPrefix}:veil_initiate`, town)) {
+      awarded.push('Veil Initiate')
+    }
+  }
+  return awarded
 }
 
 /**
@@ -507,6 +769,994 @@ function ensureWorldThreat(world) {
 }
 
 /**
+ * @param {unknown} moodInput
+ */
+function normalizeTownMood(moodInput) {
+  if (!moodInput || typeof moodInput !== 'object' || Array.isArray(moodInput)) return null
+  const fear = Number(moodInput.fear)
+  const unrest = Number(moodInput.unrest)
+  const prosperity = Number(moodInput.prosperity)
+  return {
+    fear: Number.isFinite(fear) ? clamp(Math.trunc(fear), 0, 100) : 0,
+    unrest: Number.isFinite(unrest) ? clamp(Math.trunc(unrest), 0, 100) : 0,
+    prosperity: Number.isFinite(prosperity) ? clamp(Math.trunc(prosperity), 0, 100) : 0
+  }
+}
+
+/**
+ * @param {unknown} moodsInput
+ */
+function normalizeWorldMoods(moodsInput) {
+  const source = (moodsInput && typeof moodsInput === 'object' && !Array.isArray(moodsInput))
+    ? moodsInput
+    : {}
+  const byTownSource = (source.byTown && typeof source.byTown === 'object' && !Array.isArray(source.byTown))
+    ? source.byTown
+    : {}
+  const byTown = {}
+  for (const [townRaw, moodRaw] of Object.entries(byTownSource)) {
+    const townName = asText(townRaw, '', 80)
+    if (!townName) continue
+    const mood = normalizeTownMood(moodRaw)
+    if (!mood) continue
+    byTown[townName] = mood
+  }
+  return { byTown }
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldMoods(world) {
+  world.moods = normalizeWorldMoods(world.moods)
+  return world.moods
+}
+
+function freshTownMood() {
+  return { fear: 0, unrest: 0, prosperity: 0 }
+}
+
+/**
+ * @param {{fear: number, unrest: number, prosperity: number}} mood
+ */
+function deriveDominantMoodLabel(mood) {
+  const normalized = normalizeTownMood(mood) || freshTownMood()
+  const pairs = [
+    ['fearful', normalized.fear],
+    ['unrestful', normalized.unrest],
+    ['prosperous', normalized.prosperity]
+  ]
+  const maxValue = Math.max(...pairs.map(([, value]) => value))
+  if (maxValue < MOOD_LABEL_THRESHOLD) return 'steady'
+  const leaders = pairs.filter(([, value]) => value === maxValue)
+  if (leaders.length !== 1) return 'steady'
+  return leaders[0][0]
+}
+
+/**
+ * @param {{fear: number, unrest: number, prosperity: number}} moodBefore
+ * @param {{fear: number, unrest: number, prosperity: number}} moodAfter
+ */
+function collectMoodThresholdCrossings(moodBefore, moodAfter) {
+  const before = normalizeTownMood(moodBefore) || freshTownMood()
+  const after = normalizeTownMood(moodAfter) || freshTownMood()
+  const crossings = []
+  for (const meter of ['fear', 'unrest', 'prosperity']) {
+    for (const threshold of MOOD_THRESHOLDS) {
+      const crossedUp = before[meter] < threshold && after[meter] >= threshold
+      const crossedDown = before[meter] > threshold && after[meter] <= threshold
+      if (!crossedUp && !crossedDown) continue
+      crossings.push({ meter, threshold })
+    }
+  }
+  return crossings
+}
+
+/**
+ * @param {string} townName
+ * @param {{fear: number, unrest: number, prosperity: number}} mood
+ * @param {string} label
+ */
+function buildMoodNarration(townName, mood, label) {
+  const town = asText(townName, '-', 80) || '-'
+  const safeMood = normalizeTownMood(mood) || freshTownMood()
+  if (label === 'unrestful') {
+    return `[${town}] The streets grow tense. Mood: unrestful (unrest ${safeMood.unrest}).`
+  }
+  if (label === 'prosperous') {
+    return `[${town}] Lanterns glow and laughter returns. Mood: prosperous (prosperity ${safeMood.prosperity}).`
+  }
+  if (label === 'fearful') {
+    return `[${town}] Doors bar early. Mood: fearful (fear ${safeMood.fear}).`
+  }
+  return `[${town}] The town holds steady. Mood: steady.`
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string | null | undefined,
+ *   delta: {fear?: number, unrest?: number, prosperity?: number},
+ *   at: number,
+ *   idPrefix: string,
+ *   reason?: string
+ * }} input
+ */
+function applyTownMoodDelta(memory, input) {
+  const townName = asText(input?.townName, '-', 80) || '-'
+  const moods = ensureWorldMoods(memory.world)
+  const existing = normalizeTownMood(moods.byTown[townName]) || freshTownMood()
+  const before = { ...existing }
+  const deltaFear = Number.isFinite(Number(input?.delta?.fear)) ? Math.trunc(Number(input.delta.fear)) : 0
+  const deltaUnrest = Number.isFinite(Number(input?.delta?.unrest)) ? Math.trunc(Number(input.delta.unrest)) : 0
+  const deltaProsperity = Number.isFinite(Number(input?.delta?.prosperity)) ? Math.trunc(Number(input.delta.prosperity)) : 0
+  const next = {
+    fear: clamp(before.fear + deltaFear, 0, 100),
+    unrest: clamp(before.unrest + deltaUnrest, 0, 100),
+    prosperity: clamp(before.prosperity + deltaProsperity, 0, 100)
+  }
+  moods.byTown[townName] = next
+
+  const beforeLabel = deriveDominantMoodLabel(before)
+  const afterLabel = deriveDominantMoodLabel(next)
+  const thresholdCrossings = collectMoodThresholdCrossings(before, next)
+  const shouldNarrate = beforeLabel !== afterLabel || thresholdCrossings.length > 0
+  const safeIdPrefix = asText(input?.idPrefix, '', 200)
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  if (shouldNarrate && safeIdPrefix) {
+    const message = buildMoodNarration(townName, next, afterLabel)
+    appendChronicle(memory, {
+      id: `${safeIdPrefix}:chronicle:mood:${townName.toLowerCase()}`,
+      type: 'mood',
+      msg: message,
+      at,
+      town: townName,
+      meta: {
+        fear: next.fear,
+        unrest: next.unrest,
+        prosperity: next.prosperity,
+        mood: afterLabel,
+        reason: asText(input?.reason, '', 80) || ''
+      }
+    })
+    appendNews(memory, {
+      id: `${safeIdPrefix}:news:mood:${townName.toLowerCase()}`,
+      topic: 'world',
+      msg: message,
+      at,
+      town: townName,
+      meta: {
+        fear: next.fear,
+        unrest: next.unrest,
+        prosperity: next.prosperity,
+        mood: afterLabel
+      }
+    })
+  }
+
+  return {
+    townName,
+    before,
+    after: next,
+    label: afterLabel,
+    shouldNarrate,
+    thresholdCrossings
+  }
+}
+
+/**
+ * @param {unknown} modsInput
+ */
+function normalizeWorldEventMods(modsInput) {
+  if (!modsInput || typeof modsInput !== 'object' || Array.isArray(modsInput)) return {}
+  const mods = {}
+  for (const [keyRaw, valueRaw] of Object.entries(modsInput)) {
+    const key = asText(keyRaw, '', 80)
+    if (!key || !EVENT_MOD_KEYS.has(key)) continue
+    const value = Number(valueRaw)
+    if (!Number.isFinite(value)) continue
+    const safeValue = Math.trunc(value)
+    if (safeValue === 0) continue
+    mods[key] = safeValue
+  }
+  return mods
+}
+
+/**
+ * @param {unknown} entry
+ */
+function normalizeWorldEvent(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const id = asText(entry.id, '', 200)
+  const type = asText(entry.type, '', 40).toLowerCase()
+  const town = asText(entry.town, '', 80)
+  const startsDay = Number(entry.starts_day)
+  const endsDay = Number(entry.ends_day)
+  const mods = normalizeWorldEventMods(entry.mods)
+  if (!id || !town) return null
+  if (!EVENT_TYPES.has(type)) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(endsDay) || endsDay < startsDay) return null
+  return {
+    id,
+    type,
+    town,
+    starts_day: startsDay,
+    ends_day: endsDay,
+    mods
+  }
+}
+
+/**
+ * @param {unknown} eventsInput
+ */
+function normalizeWorldEvents(eventsInput) {
+  const source = (eventsInput && typeof eventsInput === 'object' && !Array.isArray(eventsInput))
+    ? eventsInput
+    : {}
+  const seed = Number(source.seed)
+  const index = Number(source.index)
+  const active = (Array.isArray(source.active) ? source.active : [])
+    .map(normalizeWorldEvent)
+    .filter(Boolean)
+  return {
+    seed: Number.isInteger(seed) ? seed : 1337,
+    index: Number.isInteger(index) && index >= 0 ? index : 0,
+    active
+  }
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldEvents(world) {
+  world.events = normalizeWorldEvents(world.events)
+  return world.events
+}
+
+/**
+ * @param {unknown} entry
+ */
+function normalizeRumor(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const id = asText(entry.id, '', 200)
+  const town = asText(entry.town, '', 80)
+  const text = asText(entry.text, '', 240)
+  const kind = asText(entry.kind, '', 20).toLowerCase()
+  const severity = Number(entry.severity)
+  const startsDay = Number(entry.starts_day)
+  const expiresDay = Number(entry.expires_day)
+  const createdAt = Number(entry.created_at)
+  const spawnedByEventId = asText(entry.spawned_by_event_id, '', 200)
+  const resolvedByQuestId = asText(entry.resolved_by_quest_id, '', 200)
+  if (!id || !town || !text) return null
+  if (!RUMOR_KIND_SET.has(kind)) return null
+  if (!Number.isInteger(severity) || severity < 1 || severity > 3) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(expiresDay) || expiresDay < startsDay) return null
+  if (!Number.isFinite(createdAt) || createdAt < 0) return null
+  const rumor = {
+    id,
+    town,
+    text,
+    kind,
+    severity,
+    starts_day: startsDay,
+    expires_day: expiresDay,
+    created_at: createdAt
+  }
+  if (spawnedByEventId) rumor.spawned_by_event_id = spawnedByEventId
+  if (resolvedByQuestId) rumor.resolved_by_quest_id = resolvedByQuestId
+  return rumor
+}
+
+/**
+ * @param {unknown} rumorsInput
+ */
+function normalizeWorldRumors(rumorsInput) {
+  return (Array.isArray(rumorsInput) ? rumorsInput : [])
+    .map(normalizeRumor)
+    .filter(Boolean)
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldRumors(world) {
+  world.rumors = normalizeWorldRumors(world.rumors)
+  return world.rumors
+}
+
+/**
+ * @param {any[]} rumors
+ * @param {string} rumorId
+ */
+function findRumorById(rumors, rumorId) {
+  const target = asText(rumorId, '', 200).toLowerCase()
+  if (!target) return null
+  for (const entry of rumors || []) {
+    const rumor = normalizeRumor(entry)
+    if (!rumor) continue
+    if (rumor.id.toLowerCase() === target) return rumor
+  }
+  return null
+}
+
+/**
+ * @param {any[]} rumors
+ * @param {string} idPrefix
+ * @param {string} townName
+ * @param {string} kind
+ * @param {number} day
+ */
+function createRumorId(rumors, idPrefix, townName, kind, day) {
+  const used = new Set((rumors || [])
+    .map(entry => asText(entry?.id, '', 200).toLowerCase())
+    .filter(Boolean))
+  const base = asText(
+    `r_${shortStableHash(`${idPrefix}:${townName}:${kind}:${day}`)}`,
+    `r_${shortStableHash(`${townName}:${kind}:${day}`)}`,
+    200
+  )
+  if (!used.has(base.toLowerCase())) return base
+  let suffix = 2
+  while (suffix < 10000) {
+    const candidate = asText(`${base}-${suffix}`, base, 200)
+    if (!used.has(candidate.toLowerCase())) return candidate
+    suffix += 1
+  }
+  return asText(`${base}-${shortStableHash(`${base}:fallback`)}`, base, 200)
+}
+
+/**
+ * @param {string} text
+ * @param {string} townName
+ */
+function replaceTownToken(text, townName) {
+  return asText(text, '', 240).replace(/\{town\}/g, townName)
+}
+
+/**
+ * @param {{kind: string, templateKey: string, townName: string, phase: string}} input
+ */
+function renderRumorTemplate(input) {
+  const kind = asText(input?.kind, '', 20).toLowerCase()
+  const templateKey = asText(input?.templateKey, '', 80).toLowerCase()
+  const townName = asText(input?.townName, '-', 80) || '-'
+  const phase = asText(input?.phase, 'day', 20).toLowerCase()
+  const byKind = RUMOR_TEMPLATE_LIBRARY[kind] || {}
+  const template = byKind[templateKey]
+  if (!template) return ''
+  const base = phase === 'night'
+    ? asText(template.night, '', 240)
+    : asText(template.day, '', 240)
+  return replaceTownToken(base, townName)
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   kind: string,
+ *   severity: number,
+ *   templateKey: string,
+ *   expiresInDays?: number | null,
+ *   at: number,
+ *   idPrefix: string,
+ *   spawnedByEventId?: string | null
+ * }} input
+ */
+function spawnWorldRumor(memory, input) {
+  const world = memory.world
+  const clock = ensureWorldClock(world)
+  const rumors = ensureWorldRumors(world)
+  const townName = resolveTownName(world, input.townName)
+  if (!townName) {
+    throw new AppError({
+      code: 'UNKNOWN_TOWN',
+      message: `Unknown town for rumor: ${input.townName}`,
+      recoverable: true
+    })
+  }
+  const kind = asText(input.kind, '', 20).toLowerCase()
+  if (!RUMOR_KIND_SET.has(kind)) {
+    throw new AppError({
+      code: 'INVALID_RUMOR_KIND',
+      message: `Invalid rumor kind: ${input.kind}`,
+      recoverable: true
+    })
+  }
+  const severity = Number(input.severity)
+  if (!Number.isInteger(severity) || severity < 1 || severity > 3) {
+    throw new AppError({
+      code: 'INVALID_RUMOR_SEVERITY',
+      message: `Invalid rumor severity: ${input.severity}`,
+      recoverable: true
+    })
+  }
+  const templateKey = asText(input.templateKey, '', 80).toLowerCase()
+  const text = renderRumorTemplate({
+    kind,
+    templateKey,
+    townName,
+    phase: clock.phase
+  })
+  if (!text) {
+    throw new AppError({
+      code: 'UNKNOWN_RUMOR_TEMPLATE',
+      message: `Unknown rumor template: ${templateKey}`,
+      recoverable: true
+    })
+  }
+  const expiresInDaysRaw = Number(input.expiresInDays)
+  const expiresInDays = Number.isInteger(expiresInDaysRaw) && expiresInDaysRaw >= 0
+    ? expiresInDaysRaw
+    : 1
+  const startsDay = clock.day
+  const expiresDay = startsDay + expiresInDays
+  const idPrefix = asText(input.idPrefix, '', 200)
+  const rumorId = createRumorId(rumors, idPrefix, townName, kind, startsDay)
+  const createdAt = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
+  const rumor = {
+    id: rumorId,
+    town: townName,
+    text,
+    kind,
+    severity,
+    starts_day: startsDay,
+    expires_day: expiresDay,
+    created_at: createdAt
+  }
+  const spawnedByEventId = asText(input.spawnedByEventId, '', 200)
+  if (spawnedByEventId) rumor.spawned_by_event_id = spawnedByEventId
+  rumors.push(rumor)
+
+  const narration = clock.phase === 'night'
+    ? `Lanterns dim. A rumor crawls through ${townName}...`
+    : `Warm bread and whispers—rumor spreads in ${townName}.`
+  const message = `${narration} ${text}`
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:rumor_spawn:${rumor.id.toLowerCase()}`,
+    type: 'rumor_spawn',
+    msg: message,
+    at: createdAt,
+    town: townName,
+    meta: {
+      rumor_id: rumor.id,
+      kind: rumor.kind,
+      severity: rumor.severity
+    }
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:rumor_spawn:${rumor.id.toLowerCase()}`,
+    topic: 'rumor',
+    msg: message,
+    at: createdAt,
+    town: townName,
+    meta: {
+      rumor_id: rumor.id,
+      kind: rumor.kind,
+      severity: rumor.severity
+    }
+  })
+  return rumor
+}
+
+/**
+ * @param {any} effectsInput
+ */
+function normalizeDecisionEffects(effectsInput) {
+  if (!effectsInput || typeof effectsInput !== 'object' || Array.isArray(effectsInput)) return null
+  const effects = {}
+  const moodSource = (effectsInput.mood && typeof effectsInput.mood === 'object' && !Array.isArray(effectsInput.mood))
+    ? effectsInput.mood
+    : null
+  if (moodSource) {
+    const mood = {}
+    for (const key of ['fear', 'unrest', 'prosperity']) {
+      const value = Number(moodSource[key])
+      if (!Number.isInteger(value) || value === 0) continue
+      mood[key] = value
+    }
+    if (Object.keys(mood).length > 0) effects.mood = mood
+  }
+  const threatDelta = Number(effectsInput.threat_delta)
+  if (Number.isInteger(threatDelta) && threatDelta !== 0) effects.threat_delta = threatDelta
+
+  const repDeltaSource = (effectsInput.rep_delta && typeof effectsInput.rep_delta === 'object' && !Array.isArray(effectsInput.rep_delta))
+    ? effectsInput.rep_delta
+    : null
+  if (repDeltaSource) {
+    const repDelta = {}
+    for (const [factionRaw, valueRaw] of Object.entries(repDeltaSource)) {
+      const faction = asText(factionRaw, '', 80).toLowerCase()
+      const value = Number(valueRaw)
+      if (!faction || !Number.isInteger(value) || value === 0) continue
+      repDelta[faction] = value
+    }
+    if (Object.keys(repDelta).length > 0) effects.rep_delta = repDelta
+  }
+
+  const rumorSpawnSource = (effectsInput.rumor_spawn && typeof effectsInput.rumor_spawn === 'object' && !Array.isArray(effectsInput.rumor_spawn))
+    ? effectsInput.rumor_spawn
+    : null
+  if (rumorSpawnSource) {
+    const rumorKind = asText(rumorSpawnSource.kind, '', 20).toLowerCase()
+    const severity = Number(rumorSpawnSource.severity)
+    const templateKey = asText(rumorSpawnSource.templateKey, '', 80).toLowerCase()
+    const expiresInDays = Number(rumorSpawnSource.expiresInDays)
+    if (
+      RUMOR_KIND_SET.has(rumorKind)
+      && Number.isInteger(severity) && severity >= 1 && severity <= 3
+      && templateKey
+    ) {
+      const rumorSpawn = { kind: rumorKind, severity, templateKey }
+      if (Number.isInteger(expiresInDays) && expiresInDays >= 0) {
+        rumorSpawn.expiresInDays = expiresInDays
+      }
+      effects.rumor_spawn = rumorSpawn
+    }
+  }
+  return Object.keys(effects).length > 0 ? effects : null
+}
+
+/**
+ * @param {any} optionInput
+ */
+function normalizeDecisionOption(optionInput) {
+  if (!optionInput || typeof optionInput !== 'object' || Array.isArray(optionInput)) return null
+  const key = asText(optionInput.key, '', 40).toLowerCase()
+  const label = asText(optionInput.label, '', 120)
+  const effects = normalizeDecisionEffects(optionInput.effects)
+  if (!key || !label || !effects) return null
+  return { key, label, effects }
+}
+
+/**
+ * @param {unknown} entry
+ */
+function normalizeDecision(entry) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return null
+  const id = asText(entry.id, '', 200)
+  const town = asText(entry.town, '', 80)
+  const eventId = asText(entry.event_id, '', 200)
+  const eventType = asText(entry.event_type, '', 40).toLowerCase()
+  const prompt = asText(entry.prompt, '', 240)
+  const state = asText(entry.state, '', 20).toLowerCase()
+  const chosenKey = asText(entry.chosen_key, '', 40).toLowerCase()
+  const startsDay = Number(entry.starts_day)
+  const expiresDay = Number(entry.expires_day)
+  const createdAt = Number(entry.created_at)
+  if (!id || !town || !eventId || !prompt) return null
+  if (!EVENT_TYPES.has(eventType)) return null
+  if (!DECISION_STATES.has(state)) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(expiresDay) || expiresDay < startsDay) return null
+  if (!Number.isFinite(createdAt) || createdAt < 0) return null
+  const optionsRaw = Array.isArray(entry.options) ? entry.options : []
+  const options = []
+  const seen = new Set()
+  for (const rawOption of optionsRaw) {
+    const option = normalizeDecisionOption(rawOption)
+    if (!option) continue
+    if (seen.has(option.key)) continue
+    seen.add(option.key)
+    options.push(option)
+    if (options.length >= 3) break
+  }
+  if (options.length < 2) return null
+  if (state === 'chosen') {
+    if (!chosenKey || !seen.has(chosenKey)) return null
+  }
+  const decision = {
+    id,
+    town,
+    event_id: eventId,
+    event_type: eventType,
+    prompt,
+    options,
+    state,
+    starts_day: startsDay,
+    expires_day: expiresDay,
+    created_at: createdAt
+  }
+  if (chosenKey) decision.chosen_key = chosenKey
+  return decision
+}
+
+/**
+ * @param {unknown} decisionsInput
+ */
+function normalizeWorldDecisions(decisionsInput) {
+  return (Array.isArray(decisionsInput) ? decisionsInput : [])
+    .map(normalizeDecision)
+    .filter(Boolean)
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldDecisions(world) {
+  world.decisions = normalizeWorldDecisions(world.decisions)
+  return world.decisions
+}
+
+/**
+ * @param {any[]} decisions
+ * @param {string} decisionId
+ */
+function findDecisionById(decisions, decisionId) {
+  const target = asText(decisionId, '', 200).toLowerCase()
+  if (!target) return null
+  for (const entry of decisions || []) {
+    const decision = normalizeDecision(entry)
+    if (!decision) continue
+    if (decision.id.toLowerCase() === target) return decision
+  }
+  return null
+}
+
+/**
+ * @param {any[]} decisions
+ * @param {string} idPrefix
+ * @param {string} townName
+ * @param {string} eventId
+ */
+function createDecisionId(decisions, idPrefix, townName, eventId) {
+  const used = new Set((decisions || [])
+    .map(entry => asText(entry?.id, '', 200).toLowerCase())
+    .filter(Boolean))
+  const base = asText(
+    `d_${shortStableHash(`${idPrefix}:${townName}:${eventId}`)}`,
+    `d_${shortStableHash(`${townName}:${eventId}`)}`,
+    200
+  )
+  if (!used.has(base.toLowerCase())) return base
+  let suffix = 2
+  while (suffix < 10000) {
+    const candidate = asText(`${base}-${suffix}`, base, 200)
+    if (!used.has(candidate.toLowerCase())) return candidate
+    suffix += 1
+  }
+  return asText(`${base}-${shortStableHash(`${base}:fallback`)}`, base, 200)
+}
+
+/**
+ * @param {string} eventType
+ */
+function buildDecisionTemplate(eventType) {
+  const type = asText(eventType, '', 40).toLowerCase()
+  const template = DECISION_TEMPLATE_BY_EVENT[type]
+  if (!template) return null
+  const options = (Array.isArray(template.options) ? template.options : [])
+    .map(normalizeDecisionOption)
+    .filter(Boolean)
+    .slice(0, 3)
+  if (options.length < 2) return null
+  return {
+    prompt: asText(template.prompt, '', 240),
+    options
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {any} event
+ * @param {{at: number, idPrefix: string}} input
+ */
+function createDecisionForEvent(memory, event, input) {
+  const normalizedEvent = normalizeWorldEvent(event)
+  if (!normalizedEvent) return null
+  const template = buildDecisionTemplate(normalizedEvent.type)
+  if (!template) return null
+  const clock = ensureWorldClock(memory.world)
+  const decisions = ensureWorldDecisions(memory.world)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const decisionId = createDecisionId(decisions, idPrefix, normalizedEvent.town, normalizedEvent.id)
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const decision = {
+    id: decisionId,
+    town: normalizedEvent.town,
+    event_id: normalizedEvent.id,
+    event_type: normalizedEvent.type,
+    prompt: template.prompt,
+    options: template.options,
+    state: 'open',
+    starts_day: clock.day,
+    expires_day: clock.day,
+    created_at: at
+  }
+  decisions.push(decision)
+  const message = `[${normalizedEvent.town}] MAYOR DECISION: ${decision.prompt}`
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:decision_open:${decision.id.toLowerCase()}`,
+    type: 'decision_open',
+    msg: message,
+    at,
+    town: normalizedEvent.town,
+    meta: {
+      decision_id: decision.id,
+      event_id: normalizedEvent.id,
+      event_type: normalizedEvent.type
+    }
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:decision_open:${decision.id.toLowerCase()}`,
+    topic: 'world',
+    msg: message,
+    at,
+    town: normalizedEvent.town,
+    meta: {
+      decision_id: decision.id,
+      event_id: normalizedEvent.id,
+      event_type: normalizedEvent.type
+    }
+  })
+  return decision
+}
+
+/**
+ * @param {any} event
+ * @param {number} day
+ */
+function isEventActiveForDay(event, day) {
+  const normalized = normalizeWorldEvent(event)
+  if (!normalized) return false
+  if (!Number.isInteger(day) || day < 1) return false
+  return normalized.starts_day <= day && normalized.ends_day >= day
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {number} day
+ */
+function findActiveEventsForTown(world, townName, day) {
+  const safeTownName = asText(townName, '', 80)
+  if (!safeTownName) return []
+  const events = normalizeWorldEvents(world?.events).active
+  return events
+    .filter(event => sameText(event.town, safeTownName, 80) && isEventActiveForDay(event, day))
+    .sort((a, b) => {
+      const dayDiff = Number(b.starts_day || 0) - Number(a.starts_day || 0)
+      if (dayDiff !== 0) return dayDiff
+      return asText(a.id, '', 200).localeCompare(asText(b.id, '', 200))
+    })
+}
+
+/**
+ * @param {any[]} events
+ * @param {string} key
+ */
+function sumEventModifier(events, key) {
+  let total = 0
+  for (const event of events || []) {
+    const mods = normalizeWorldEventMods(event?.mods)
+    total += Number(mods[key] || 0)
+  }
+  return total
+}
+
+/**
+ * @param {any} world
+ */
+function deriveTownNamesForEvents(world) {
+  const names = new Map()
+  const towns = deriveTownsFromMarkers(world?.markers || [])
+  for (const town of towns) {
+    const safeName = asText(town?.townName, '', 80)
+    if (!safeName) continue
+    names.set(safeName.toLowerCase(), safeName)
+  }
+  const threat = normalizeWorldThreat(world?.threat)
+  for (const townName of Object.keys(threat.byTown || {})) {
+    const safeName = asText(townName, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
+  const moods = normalizeWorldMoods(world?.moods)
+  for (const townName of Object.keys(moods.byTown || {})) {
+    const safeName = asText(townName, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
+  return Array.from(names.values()).sort((a, b) => a.localeCompare(b))
+}
+
+/**
+ * @param {any} world
+ */
+function pickAutoEventTown(world) {
+  const townNames = deriveTownNamesForEvents(world)
+  if (townNames.length === 0) return '-'
+  const threat = normalizeWorldThreat(world?.threat)
+  const rows = townNames.map((townName) => ({
+    townName,
+    threat: Number(threat.byTown[townName] || 0)
+  }))
+  rows.sort((a, b) => {
+    const diff = b.threat - a.threat
+    if (diff !== 0) return diff
+    return a.townName.localeCompare(b.townName)
+  })
+  return rows[0]?.townName || townNames[0]
+}
+
+/**
+ * @param {number} seed
+ * @param {number} index
+ */
+function drawEventType(seed, index) {
+  const safeSeed = Number.isInteger(seed) ? seed : 1337
+  const safeIndex = Number.isInteger(index) && index >= 0 ? index : 0
+  const raw = Math.imul((safeSeed ^ (safeIndex + 1)) >>> 0, 1664525) + 1013904223
+  const idx = (raw >>> 0) % EVENT_DECK.length
+  return EVENT_DECK[idx]
+}
+
+/**
+ * @param {any[]} activeEvents
+ * @param {string} idPrefix
+ * @param {string} townName
+ * @param {string} type
+ * @param {number} day
+ * @param {number} index
+ */
+function createWorldEventId(activeEvents, idPrefix, townName, type, day, index) {
+  const used = new Set((activeEvents || [])
+    .map(entry => asText(entry?.id, '', 200).toLowerCase())
+    .filter(Boolean))
+  const base = asText(
+    `e_${shortStableHash(`${idPrefix}:${townName}:${type}:${day}:${index}`)}`,
+    `e_${shortStableHash(`${townName}:${type}:${day}:${index}`)}`,
+    200
+  )
+  if (!used.has(base.toLowerCase())) return base
+  let suffix = 2
+  while (suffix < 10000) {
+    const candidate = asText(`${base}-${suffix}`, base, 200)
+    if (!used.has(candidate.toLowerCase())) return candidate
+    suffix += 1
+  }
+  return asText(`${base}-${shortStableHash(`${base}:fallback`)}`, base, 200)
+}
+
+/**
+ * @param {Record<string, number>} mods
+ */
+function summarizeEventMods(mods) {
+  const normalized = normalizeWorldEventMods(mods)
+  const keys = Object.keys(normalized).sort((a, b) => a.localeCompare(b))
+  if (keys.length === 0) return '-'
+  return keys.map((key) => {
+    const value = Number(normalized[key] || 0)
+    const sign = value > 0 ? '+' : ''
+    return `${key}=${sign}${value}`
+  }).join('|')
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   operationId: string,
+ *   idPrefix: string,
+ *   at: number,
+ *   requestedTownName?: string | null
+ * }} input
+ */
+function drawAndApplyWorldEvent(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  const events = ensureWorldEvents(memory.world)
+  const moods = ensureWorldMoods(memory.world)
+  // Keep active deck bounded to currently relevant windows on each draw.
+  events.active = events.active
+    .map(normalizeWorldEvent)
+    .filter(Boolean)
+    .filter(event => event.ends_day >= clock.day)
+  moods.byTown = normalizeWorldMoods(moods).byTown
+
+  let townName = asText(input?.requestedTownName, '', 80)
+  if (townName) {
+    const candidates = deriveTownNamesForEvents(memory.world)
+    const resolved = candidates.find(candidate => sameText(candidate, townName, 80))
+    if (!resolved) {
+      throw new AppError({
+        code: 'UNKNOWN_TOWN',
+        message: `Unknown town for event draw: ${townName}`,
+        recoverable: true
+      })
+    }
+    townName = resolved
+  } else {
+    townName = pickAutoEventTown(memory.world)
+  }
+
+  const drawIndex = events.index
+  const type = drawEventType(events.seed, drawIndex)
+  const config = EVENT_TYPE_CONFIG[type] || EVENT_TYPE_CONFIG.festival
+  const mods = normalizeWorldEventMods(config.mods)
+  const day = clock.day
+  const eventId = createWorldEventId(
+    events.active,
+    asText(input?.idPrefix, '', 200) || asText(input?.operationId, '', 200),
+    townName,
+    type,
+    day,
+    drawIndex
+  )
+  const event = {
+    id: eventId,
+    type,
+    town: townName,
+    starts_day: day,
+    ends_day: day,
+    mods
+  }
+  events.index = drawIndex + 1
+  events.active.push(event)
+
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const message = `[${townName}] EVENT: ${config.title}`
+  appendChronicle(memory, {
+    id: `${input.idPrefix}:chronicle:event_draw:${eventId.toLowerCase()}`,
+    type: 'event',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      event_id: event.id,
+      event_type: event.type,
+      starts_day: event.starts_day,
+      ends_day: event.ends_day,
+      effects: summarizeEventMods(event.mods)
+    }
+  })
+  appendNews(memory, {
+    id: `${input.idPrefix}:news:event_draw:${eventId.toLowerCase()}`,
+    topic: 'world',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      event_id: event.id,
+      event_type: event.type,
+      effects: summarizeEventMods(event.mods)
+    }
+  })
+  applyTownMoodDelta(memory, {
+    townName,
+    delta: {
+      fear: Number(mods.fear || 0),
+      unrest: Number(mods.unrest || 0),
+      prosperity: Number(mods.prosperity || 0)
+    },
+    at,
+    idPrefix: `${input.idPrefix}:event_mood:${eventId.toLowerCase()}`,
+    reason: `event:${event.type}`
+  })
+  const autoRumorConfig = EVENT_TO_AUTO_RUMOR[event.type]
+  if (autoRumorConfig) {
+    spawnWorldRumor(memory, {
+      townName,
+      kind: autoRumorConfig.kind,
+      severity: autoRumorConfig.severity,
+      templateKey: autoRumorConfig.templateKey,
+      expiresInDays: autoRumorConfig.expiresInDays,
+      at,
+      idPrefix: `${input.idPrefix}:event_rumor:${eventId.toLowerCase()}`,
+      spawnedByEventId: event.id
+    })
+  }
+  createDecisionForEvent(memory, event, {
+    at,
+    idPrefix: `${input.idPrefix}:event_decision:${eventId.toLowerCase()}`
+  })
+  return event
+}
+
+/**
  * @param {Record<string, any>} factions
  * @param {string} townName
  */
@@ -621,7 +1871,7 @@ function normalizeIsoDate(value) {
 }
 
 /**
- * @param {'trade_n' | 'visit_town'} type
+ * @param {'trade_n' | 'visit_town' | 'rumor_task'} type
  * @param {unknown} objectiveInput
  * @param {unknown} progressInput
  */
@@ -661,6 +1911,43 @@ function normalizeQuestObjectiveProgress(type, objectiveInput, progressInput) {
     }
   }
 
+  if (type === 'rumor_task') {
+    const kind = asText(objective.kind, '', 20).toLowerCase()
+    const rumorId = asText(objective.rumor_id, '', 200)
+    const rumorTask = asText(objective.rumor_task, '', 20).toLowerCase()
+    if (kind !== 'rumor_task') return null
+    if (!rumorId || !RUMOR_TASK_KINDS.has(rumorTask)) return null
+    const normalizedObjective = {
+      kind: 'rumor_task',
+      rumor_id: rumorId,
+      rumor_task: rumorTask
+    }
+    if (rumorTask === 'rumor_trade') {
+      const n = Number(objective.n)
+      const market = asText(objective.market, '', 80)
+      const done = Number(progress.done)
+      if (!Number.isInteger(n) || n < 1) return null
+      if (!Number.isInteger(done) || done < 0) return null
+      normalizedObjective.n = n
+      if (market) normalizedObjective.market = market
+      return {
+        objective: normalizedObjective,
+        progress: { done }
+      }
+    }
+    if (rumorTask === 'rumor_visit' || rumorTask === 'rumor_choice') {
+      const town = asText(objective.town, '', 80)
+      if (!town) return null
+      if (typeof progress.visited !== 'boolean') return null
+      normalizedObjective.town = town
+      return {
+        objective: normalizedObjective,
+        progress: { visited: progress.visited }
+      }
+    }
+    return null
+  }
+
   return null
 }
 
@@ -680,6 +1967,7 @@ function normalizeQuest(entry) {
   const title = asText(entry.title, '', 120)
   const desc = asText(entry.desc, '', 120)
   const meta = normalizeFeedMeta(entry.meta)
+  const rumorIdRaw = asText(entry.rumor_id, '', 200)
 
   if (!id) return null
   if (!QUEST_TYPES.has(type)) return null
@@ -702,6 +1990,10 @@ function normalizeQuest(entry) {
     title,
     desc
   }
+  const objectiveRumorId = asText(objectiveProgress.objective?.rumor_id, '', 200)
+  const rumorId = rumorIdRaw || objectiveRumorId
+  if (type === 'rumor_task' && !rumorId) return null
+  if (rumorId) quest.rumor_id = rumorId
   if (town) quest.town = town
   if (acceptedAt) quest.accepted_at = acceptedAt
   if (owner) quest.owner = owner
@@ -790,6 +2082,15 @@ function isQuestObjectiveSatisfied(quest) {
   if (normalized.type === 'visit_town') {
     return normalized.progress.visited === true
   }
+  if (normalized.type === 'rumor_task') {
+    const rumorTask = asText(normalized.objective.rumor_task, '', 20).toLowerCase()
+    if (rumorTask === 'rumor_trade') {
+      return Number(normalized.progress.done || 0) >= Number(normalized.objective.n || 0)
+    }
+    if (rumorTask === 'rumor_visit' || rumorTask === 'rumor_choice') {
+      return normalized.progress.visited === true
+    }
+  }
   return false
 }
 
@@ -804,6 +2105,15 @@ function summarizeQuestProgress(quest) {
   }
   if (normalized.type === 'visit_town') {
     return normalized.progress.visited ? 'visited' : 'pending'
+  }
+  if (normalized.type === 'rumor_task') {
+    const rumorTask = asText(normalized.objective.rumor_task, '', 20).toLowerCase()
+    if (rumorTask === 'rumor_trade') {
+      return `${Number(normalized.progress.done || 0)}/${Number(normalized.objective.n || 0)}`
+    }
+    if (rumorTask === 'rumor_visit' || rumorTask === 'rumor_choice') {
+      return normalized.progress.visited ? 'visited' : 'pending'
+    }
   }
   return '-'
 }
@@ -833,6 +2143,21 @@ function completeQuestAndReward(quest, townFallback, at, idPrefix, memory) {
     })
   }
 
+  const clock = ensureWorldClock(memory.world)
+  const town = asText(normalized.town, '', 80) || asText(townFallback, '', 80) || '-'
+  const activeEvents = findActiveEventsForTown(memory.world, town, clock.day)
+  const ironPactRepBonus = sumEventModifier(activeEvents, 'iron_pact_rep_bonus')
+  const veilChurchRepBonus = sumEventModifier(activeEvents, 'veil_church_rep_bonus')
+  const storyFactions = ensureWorldStoryFactions(memory.world)
+  const townFaction = findStoryFactionByTown(storyFactions, town)
+  const rumorQuestFactionBonus = (
+    normalized.type === 'rumor_task'
+    && townFaction
+    && STORY_FACTION_NAME_SET.has(townFaction.name)
+  )
+    ? { [townFaction.name]: 1 }
+    : {}
+
   const economy = ensureWorldEconomy(memory.world)
   const reward = Number(normalized.reward || 0)
   if (reward > 0) {
@@ -840,19 +2165,67 @@ function completeQuestAndReward(quest, townFallback, at, idPrefix, memory) {
     economy.ledger[ownerName] = current + reward
     economy.minted_total = Number(economy.minted_total || 0) + reward
   }
+  const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, ownerName))
+  if (
+    ironPactRepBonus !== 0
+    || veilChurchRepBonus !== 0
+    || Object.keys(rumorQuestFactionBonus).length > 0
+  ) {
+    const rep = normalizeAgentRep(profile.rep)
+    if (ironPactRepBonus !== 0) {
+      rep.iron_pact = Number(rep.iron_pact || 0) + ironPactRepBonus
+    }
+    if (veilChurchRepBonus !== 0) {
+      rep.veil_church = Number(rep.veil_church || 0) + veilChurchRepBonus
+    }
+    for (const [factionName, delta] of Object.entries(rumorQuestFactionBonus)) {
+      rep[factionName] = Number(rep[factionName] || 0) + Number(delta || 0)
+    }
+    profile.rep = rep
+    applyRepThresholdTitleAwards(memory, ownerName, at, `${idPrefix}:rep_title`, town)
+  }
+  if (normalized.type === 'rumor_task') {
+    const currentCompleted = normalizeRumorsCompleted(profile.rumors_completed)
+    profile.rumors_completed = currentCompleted + 1
+    if (profile.rumors_completed >= 3) {
+      grantAgentTitleIfMissing(memory, ownerName, 'Wanderer', at, `${idPrefix}:wanderer`, town)
+    }
+    if (normalized.rumor_id) {
+      const rumors = ensureWorldRumors(memory.world)
+      const rumorIdx = rumors.findIndex(entry => sameText(entry?.id, normalized.rumor_id, 200))
+      if (rumorIdx >= 0) {
+        const rumor = normalizeRumor(rumors[rumorIdx])
+        if (rumor && !asText(rumor.resolved_by_quest_id, '', 200)) {
+          rumors[rumorIdx] = {
+            ...rumor,
+            resolved_by_quest_id: normalized.id
+          }
+        }
+      }
+    }
+  }
+
   normalized.state = 'completed'
-  const town = asText(normalized.town, '', 80) || asText(townFallback, '', 80) || undefined
-  const msg = `QUEST: ${ownerName} completed ${normalized.id} (+${reward} emeralds)`
+  const repParts = []
+  if (ironPactRepBonus > 0) repParts.push(`+${ironPactRepBonus} iron_pact rep`)
+  if (veilChurchRepBonus > 0) repParts.push(`+${veilChurchRepBonus} veil_church rep`)
+  for (const [factionName, delta] of Object.entries(rumorQuestFactionBonus)) {
+    if (delta > 0) repParts.push(`+${delta} ${factionName} rep`)
+  }
+  const msg = `QUEST: ${ownerName} completed ${normalized.id} (+${reward} emeralds${repParts.length ? `, ${repParts.join(', ')}` : ''})`
   appendChronicle(memory, {
     id: `${idPrefix}:chronicle:quest_complete:${normalized.id.toLowerCase()}`,
     type: 'quest_complete',
     msg,
     at,
-    town,
+    town: town || undefined,
     meta: {
       quest_id: normalized.id,
       owner: ownerName,
-      reward
+      reward,
+      iron_pact_rep_bonus: ironPactRepBonus,
+      veil_church_rep_bonus: veilChurchRepBonus,
+      rumor_id: normalized.rumor_id || ''
     }
   })
   appendNews(memory, {
@@ -860,12 +2233,22 @@ function completeQuestAndReward(quest, townFallback, at, idPrefix, memory) {
     topic: 'quest',
     msg,
     at,
-    town,
+    town: town || undefined,
     meta: {
       quest_id: normalized.id,
       owner: ownerName,
-      reward
+      reward,
+      iron_pact_rep_bonus: ironPactRepBonus,
+      veil_church_rep_bonus: veilChurchRepBonus,
+      rumor_id: normalized.rumor_id || ''
     }
+  })
+  applyTownMoodDelta(memory, {
+    townName: town,
+    delta: { prosperity: 2, fear: -1, unrest: -1 },
+    at,
+    idPrefix: `${idPrefix}:quest_complete:${normalized.id.toLowerCase()}`,
+    reason: 'quest_complete'
   })
   return normalized
 }
@@ -893,6 +2276,235 @@ function buildQuestFlavor(type, sourceTown, objective) {
     title: 'Scout the Roads',
     desc: asText(`Visit town ${targetTown} and report back to ${sourceTown}.`, 'Visit town and report back.', 120)
   }
+}
+
+/**
+ * @param {any} rumor
+ */
+function selectRumorQuestSubtype(rumor) {
+  const kind = asText(rumor?.kind, '', 20).toLowerCase()
+  if (kind === 'grounded') return 'rumor_trade'
+  if (kind === 'political') return 'rumor_choice'
+  return 'rumor_visit'
+}
+
+/**
+ * @param {any} rumor
+ * @param {string} subtype
+ */
+function buildRumorQuestFlavor(rumor, subtype) {
+  const townName = asText(rumor?.town, 'town', 80) || 'town'
+  if (subtype === 'rumor_trade') {
+    return {
+      title: 'SIDE: Quiet Supply Run',
+      desc: asText(`Help steady ${townName} by closing one urgent trade.`, 'Close one urgent trade.', 120)
+    }
+  }
+  if (subtype === 'rumor_choice') {
+    return {
+      title: 'SIDE: Hear the Crowd',
+      desc: asText(`Visit ${townName} and confirm which whisper is true.`, 'Visit town and hear the crowd.', 120)
+    }
+  }
+  return {
+    title: 'SIDE: Walk the Lanes',
+    desc: asText(`Visit ${townName} and check the streets after dark.`, 'Visit town and check the streets.', 120)
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {any} rumor
+ * @param {{operationId: string, at: number}} input
+ */
+function createRumorSideQuest(memory, rumor, input) {
+  const normalizedRumor = normalizeRumor(rumor)
+  if (!normalizedRumor) {
+    throw new AppError({
+      code: 'UNKNOWN_RUMOR',
+      message: 'Unknown rumor.',
+      recoverable: true
+    })
+  }
+  const clock = ensureWorldClock(memory.world)
+  if (normalizedRumor.expires_day < clock.day) {
+    throw new AppError({
+      code: 'RUMOR_EXPIRED',
+      message: 'Rumor has expired.',
+      recoverable: true
+    })
+  }
+  const quests = ensureWorldQuests(memory.world)
+  const at = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
+  const subtype = selectRumorQuestSubtype(normalizedRumor)
+  const reward = clamp(Number(normalizedRumor.severity || 1) + 1, 0, 4)
+  const questId = createQuestId(quests, input.operationId, normalizedRumor.town, 'rumor_task', at)
+  const objective = {
+    kind: 'rumor_task',
+    rumor_id: normalizedRumor.id,
+    rumor_task: subtype
+  }
+  let progress
+  if (subtype === 'rumor_trade') {
+    objective.n = 1
+    progress = { done: 0 }
+  } else {
+    objective.town = normalizedRumor.town
+    progress = { visited: false }
+  }
+  const flavor = buildRumorQuestFlavor(normalizedRumor, subtype)
+  const quest = {
+    id: questId,
+    type: 'rumor_task',
+    rumor_id: normalizedRumor.id,
+    state: 'offered',
+    town: normalizedRumor.town,
+    offered_at: new Date(at).toISOString(),
+    objective,
+    progress,
+    reward,
+    title: flavor.title,
+    desc: flavor.desc,
+    meta: {
+      side: true,
+      rumor_id: normalizedRumor.id
+    }
+  }
+  quests.push(quest)
+  const message = `SIDE QUEST: born from rumor ${normalizedRumor.id} -> ${quest.id}`
+  appendChronicle(memory, {
+    id: `${input.operationId}:chronicle:rumor_quest:${quest.id.toLowerCase()}`,
+    type: 'quest_offer',
+    msg: message,
+    at,
+    town: normalizedRumor.town,
+    meta: {
+      quest_id: quest.id,
+      quest_type: quest.type,
+      rumor_id: normalizedRumor.id
+    }
+  })
+  appendNews(memory, {
+    id: `${input.operationId}:news:rumor_quest:${quest.id.toLowerCase()}`,
+    topic: 'quest',
+    msg: message,
+    at,
+    town: normalizedRumor.town,
+    meta: {
+      quest_id: quest.id,
+      quest_type: quest.type,
+      rumor_id: normalizedRumor.id
+    }
+  })
+  return quest
+}
+
+/**
+ * @param {any} memory
+ * @param {any} decision
+ * @param {any} option
+ * @param {{operationId: string, at: number}} input
+ */
+function applyDecisionChoiceEffects(memory, decision, option, input) {
+  const normalizedDecision = normalizeDecision(decision)
+  const normalizedOption = normalizeDecisionOption(option)
+  if (!normalizedDecision || !normalizedOption) return null
+  const at = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
+  const idPrefix = asText(input.operationId, '', 200)
+  const effects = normalizeDecisionEffects(normalizedOption.effects) || {}
+  const summary = []
+
+  if (effects.mood) {
+    applyTownMoodDelta(memory, {
+      townName: normalizedDecision.town,
+      delta: effects.mood,
+      at,
+      idPrefix: `${idPrefix}:decision_mood:${normalizedDecision.id.toLowerCase()}`,
+      reason: `decision:${normalizedOption.key}`
+    })
+    const moodSummary = Object.entries(effects.mood)
+      .map(([key, value]) => `${key}${Number(value) > 0 ? '+' : ''}${value}`)
+      .join(',')
+    if (moodSummary) summary.push(`mood(${moodSummary})`)
+  }
+
+  if (Number.isInteger(effects.threat_delta)) {
+    const threat = ensureWorldThreat(memory.world)
+    const current = Number(threat.byTown[normalizedDecision.town] || 0)
+    const next = clamp(current + Number(effects.threat_delta), 0, 100)
+    threat.byTown[normalizedDecision.town] = next
+    summary.push(`threat=${next}`)
+  }
+
+  if (effects.rep_delta && typeof effects.rep_delta === 'object') {
+    const towns = deriveTownsFromMarkers(memory.world?.markers || [])
+    const town = findTownByName(towns, normalizedDecision.town)
+    const markerName = asText(town?.marker?.name, '', 80)
+    for (const [agentName, record] of Object.entries(memory.agents || {})) {
+      const homeMarker = asText(record?.profile?.job?.home_marker, '', 80)
+      if (markerName && !sameText(homeMarker, markerName, 80)) continue
+      const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, agentName))
+      const rep = normalizeAgentRep(profile.rep)
+      let changed = false
+      for (const [factionName, delta] of Object.entries(effects.rep_delta)) {
+        if (!STORY_FACTION_NAME_SET.has(factionName)) continue
+        if (!Number.isInteger(delta) || delta === 0) continue
+        rep[factionName] = Number(rep[factionName] || 0) + delta
+        changed = true
+      }
+      if (!changed) continue
+      profile.rep = rep
+      applyRepThresholdTitleAwards(memory, agentName, at, `${idPrefix}:decision_rep:${normalizedDecision.id.toLowerCase()}`, normalizedDecision.town)
+    }
+  }
+
+  let spawnedRumor = null
+  if (effects.rumor_spawn) {
+    spawnedRumor = spawnWorldRumor(memory, {
+      townName: normalizedDecision.town,
+      kind: effects.rumor_spawn.kind,
+      severity: effects.rumor_spawn.severity,
+      templateKey: effects.rumor_spawn.templateKey,
+      expiresInDays: effects.rumor_spawn.expiresInDays,
+      at,
+      idPrefix: `${idPrefix}:decision_rumor:${normalizedDecision.id.toLowerCase()}`,
+      spawnedByEventId: normalizedDecision.event_id
+    })
+    summary.push(`rumor=${spawnedRumor.id}`)
+  }
+
+  return {
+    effects,
+    spawnedRumor,
+    summary
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {number} day
+ */
+function expireRumorsForDay(memory, day) {
+  const rumors = ensureWorldRumors(memory.world)
+  memory.world.rumors = rumors.filter(rumor => Number(rumor.expires_day || 0) >= day)
+  return memory.world.rumors.length
+}
+
+/**
+ * @param {any} memory
+ * @param {number} day
+ */
+function expireDecisionsForDay(memory, day) {
+  const decisions = ensureWorldDecisions(memory.world)
+  for (let idx = 0; idx < decisions.length; idx += 1) {
+    const decision = normalizeDecision(decisions[idx])
+    if (!decision) continue
+    if (decision.state !== 'open') continue
+    if (decision.expires_day < day) {
+      decisions[idx] = { ...decision, state: 'expired' }
+    }
+  }
+  return decisions
 }
 
 /**
@@ -995,6 +2607,44 @@ function findTownByName(towns, townName) {
     if (asText(town?.townName, '', 80).toLowerCase() === target) return town
   }
   return null
+}
+
+/**
+ * @param {any} world
+ */
+function buildTownNameIndex(world) {
+  const names = new Map()
+  for (const town of deriveTownsFromMarkers(world?.markers || [])) {
+    const safeName = asText(town?.townName, '', 80)
+    if (!safeName) continue
+    names.set(safeName.toLowerCase(), safeName)
+  }
+  const threat = normalizeWorldThreat(world?.threat)
+  for (const townRaw of Object.keys(threat.byTown || {})) {
+    const safeName = asText(townRaw, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
+  const moods = normalizeWorldMoods(world?.moods)
+  for (const townRaw of Object.keys(moods.byTown || {})) {
+    const safeName = asText(townRaw, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
+  return names
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function resolveTownName(world, townName) {
+  const target = asText(townName, '', 80).toLowerCase()
+  if (!target) return ''
+  const byTown = buildTownNameIndex(world)
+  return byTown.get(target) || ''
 }
 
 /**
@@ -1228,6 +2878,55 @@ function parseGodCommand(rawCommand) {
     return { type: 'invalid', reason: 'Usage: god threat [townName] | god threat set <townName> <value>' }
   }
 
+  if (head === 'mood') {
+    if (words.length === 1) return { type: 'mood_list' }
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'list') {
+      if (words.length !== 2) return { type: 'invalid', reason: 'Usage: god mood [townName] | god mood list' }
+      return { type: 'mood_list' }
+    }
+    if (words.length === 2) {
+      const townName = asText(words[1], '', 80)
+      if (!townName) return { type: 'invalid', reason: 'Usage: god mood [townName] | god mood list' }
+      return { type: 'mood_show', townName }
+    }
+    return { type: 'invalid', reason: 'Usage: god mood [townName] | god mood list' }
+  }
+
+  if (head === 'event') {
+    if (words.length === 1) return { type: 'event_list' }
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'list') {
+      if (words.length !== 2) return { type: 'invalid', reason: 'Usage: god event | god event list | god event seed <int> | god event draw [townName] | god event clear <eventId>' }
+      return { type: 'event_list' }
+    }
+    if (action === 'seed') {
+      const seed = asNumber(words[2])
+      if (words.length !== 3 || seed === null) {
+        return { type: 'invalid', reason: 'Usage: god event seed <int>' }
+      }
+      return { type: 'event_seed', seed }
+    }
+    if (action === 'draw') {
+      if (words.length > 3) {
+        return { type: 'invalid', reason: 'Usage: god event draw [townName]' }
+      }
+      const townName = words[2] === undefined ? null : asText(words[2], '', 80)
+      if (words[2] !== undefined && !townName) {
+        return { type: 'invalid', reason: 'Usage: god event draw [townName]' }
+      }
+      return { type: 'event_draw', townName }
+    }
+    if (action === 'clear') {
+      const eventId = asText(words[2], '', 200)
+      if (!eventId || words.length !== 3) {
+        return { type: 'invalid', reason: 'Usage: god event clear <eventId>' }
+      }
+      return { type: 'event_clear', eventId }
+    }
+    return { type: 'invalid', reason: 'Usage: god event | god event list | god event seed <int> | god event draw [townName] | god event clear <eventId>' }
+  }
+
   if (head === 'faction') {
     const action = asText(words[1], '', 20).toLowerCase()
     if (action === 'list' && words.length === 2) return { type: 'faction_list' }
@@ -1259,6 +2958,143 @@ function parseGodCommand(rawCommand) {
       return { type: 'invalid', reason: 'Usage: god rep <agent> [factionName] | god rep add <agent> <factionName> <deltaInt>' }
     }
     return { type: 'rep_show', agentName, factionName }
+  }
+
+  if (head === 'rumor') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'list') {
+      if (words.length > 4) {
+        return { type: 'invalid', reason: 'Usage: god rumor list [townName] [limit]' }
+      }
+      let townName = null
+      let limit = 10
+      if (words[2] !== undefined) {
+        const maybeLimit = Number(words[2])
+        if (Number.isInteger(maybeLimit) && maybeLimit > 0) {
+          limit = maybeLimit
+        } else {
+          townName = asText(words[2], '', 80) || null
+        }
+      }
+      if (words[3] !== undefined) {
+        const parsedLimit = Number(words[3])
+        if (!Number.isInteger(parsedLimit) || parsedLimit <= 0) {
+          return { type: 'invalid', reason: 'Usage: god rumor list [townName] [limit]' }
+        }
+        limit = parsedLimit
+      }
+      return { type: 'rumor_list', townName, limit }
+    }
+    if (action === 'show') {
+      const rumorId = asText(words[2], '', 200)
+      if (!rumorId || words.length !== 3) {
+        return { type: 'invalid', reason: 'Usage: god rumor show <rumorId>' }
+      }
+      return { type: 'rumor_show', rumorId }
+    }
+    if (action === 'spawn') {
+      const townName = asText(words[2], '', 80)
+      const kind = asText(words[3], '', 20).toLowerCase()
+      const severity = Number(words[4])
+      const templateKey = asText(words[5], '', 80).toLowerCase()
+      const expiresInDays = words[6] === undefined ? null : Number(words[6])
+      if (!townName || !kind || !templateKey || words.length < 6 || words.length > 7) {
+        return { type: 'invalid', reason: 'Usage: god rumor spawn <town> <kind> <severity> <templateKey> [expiresInDays]' }
+      }
+      return { type: 'rumor_spawn', townName, kind, severity, templateKey, expiresInDays }
+    }
+    if (action === 'clear') {
+      const rumorId = asText(words[2], '', 200)
+      if (!rumorId || words.length !== 3) {
+        return { type: 'invalid', reason: 'Usage: god rumor clear <rumorId>' }
+      }
+      return { type: 'rumor_clear', rumorId }
+    }
+    if (action === 'resolve') {
+      const rumorId = asText(words[2], '', 200)
+      const questId = asText(words[3], '', 200)
+      if (!rumorId || !questId || words.length !== 4) {
+        return { type: 'invalid', reason: 'Usage: god rumor resolve <rumorId> <questId>' }
+      }
+      return { type: 'rumor_resolve', rumorId, questId }
+    }
+    if (action === 'quest') {
+      const rumorId = asText(words[2], '', 200)
+      if (!rumorId || words.length !== 3) {
+        return { type: 'invalid', reason: 'Usage: god rumor quest <rumorId>' }
+      }
+      return { type: 'rumor_quest', rumorId }
+    }
+    return { type: 'invalid', reason: 'Usage: god rumor list [townName] [limit] | god rumor show <rumorId> | god rumor spawn <town> <kind> <severity> <templateKey> [expiresInDays] | god rumor clear <rumorId> | god rumor resolve <rumorId> <questId> | god rumor quest <rumorId>' }
+  }
+
+  if (head === 'decision') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'list') {
+      if (words.length > 3) return { type: 'invalid', reason: 'Usage: god decision list [town]' }
+      const townName = asText(words[2], '', 80) || null
+      return { type: 'decision_list', townName }
+    }
+    if (action === 'show') {
+      const decisionId = asText(words[2], '', 200)
+      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god decision show <decisionId>' }
+      return { type: 'decision_show', decisionId }
+    }
+    if (action === 'choose') {
+      const decisionId = asText(words[2], '', 200)
+      const optionKey = asText(words[3], '', 40).toLowerCase()
+      if (!decisionId || !optionKey || words.length !== 4) return { type: 'invalid', reason: 'Usage: god decision choose <decisionId> <optionKey>' }
+      return { type: 'decision_choose', decisionId, optionKey }
+    }
+    if (action === 'expire') {
+      const decisionId = asText(words[2], '', 200)
+      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god decision expire <decisionId>' }
+      return { type: 'decision_expire', decisionId }
+    }
+    return { type: 'invalid', reason: 'Usage: god decision list [town] | god decision show <decisionId> | god decision choose <decisionId> <optionKey> | god decision expire <decisionId>' }
+  }
+
+  if (head === 'trait') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'set') {
+      const agentName = asText(words[2], '', 80)
+      const traitName = asText(words[3], '', 20).toLowerCase()
+      const value = Number(words[4])
+      if (!agentName || !traitName || words.length !== 5) {
+        return { type: 'invalid', reason: 'Usage: god trait <agent> | god trait set <agent> <traitName> <0-3>' }
+      }
+      return { type: 'trait_set', agentName, traitName, value }
+    }
+    const agentName = asText(words[1], '', 80)
+    if (!agentName || words.length !== 2) {
+      return { type: 'invalid', reason: 'Usage: god trait <agent> | god trait set <agent> <traitName> <0-3>' }
+    }
+    return { type: 'trait_show', agentName }
+  }
+
+  if (head === 'title') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'grant') {
+      const agentName = asText(words[2], '', 80)
+      const title = asText(words.slice(3).join(' '), '', MAX_AGENT_TITLE_LEN)
+      if (!agentName || !title || words.length < 4) {
+        return { type: 'invalid', reason: 'Usage: god title <agent> | god title grant <agent> <title> | god title revoke <agent> <title>' }
+      }
+      return { type: 'title_grant', agentName, title }
+    }
+    if (action === 'revoke') {
+      const agentName = asText(words[2], '', 80)
+      const title = asText(words.slice(3).join(' '), '', MAX_AGENT_TITLE_LEN)
+      if (!agentName || !title || words.length < 4) {
+        return { type: 'invalid', reason: 'Usage: god title <agent> | god title grant <agent> <title> | god title revoke <agent> <title>' }
+      }
+      return { type: 'title_revoke', agentName, title }
+    }
+    const agentName = asText(words[1], '', 80)
+    if (!agentName || words.length !== 2) {
+      return { type: 'invalid', reason: 'Usage: god title <agent> | god title grant <agent> <title> | god title revoke <agent> <title>' }
+    }
+    return { type: 'title_show', agentName }
   }
 
   if (head === 'chronicle') {
@@ -1801,6 +3637,216 @@ function createGodCommandService(deps) {
       }
     }
 
+    if (parsed.type === 'mood_list') {
+      const snapshot = memoryStore.getSnapshot()
+      const towns = Array.from(buildTownNameIndex(snapshot.world).values()).sort((a, b) => a.localeCompare(b))
+      const moods = normalizeWorldMoods(snapshot.world?.moods)
+      const threat = normalizeWorldThreat(snapshot.world?.threat)
+      const factions = normalizeWorldStoryFactions(snapshot.world?.factions)
+      if (towns.length === 0) {
+        return { applied: true, command, audit: false, outputLines: ['GOD MOOD LIST: (none) default=steady'] }
+      }
+      const lines = [`GOD MOOD LIST: count=${towns.length}`]
+      for (const townName of towns) {
+        const mood = normalizeTownMood(moods.byTown[townName]) || freshTownMood()
+        const label = deriveDominantMoodLabel(mood)
+        const level = Number(threat.byTown[townName] || 0)
+        const faction = findStoryFactionByTown(factions, townName)
+        lines.push(
+          `GOD MOOD TOWN: town=${townName} mood=${label} fear=${mood.fear} unrest=${mood.unrest} prosperity=${mood.prosperity} threat=${level} faction=${faction?.name || '-'}`
+        )
+      }
+      return { applied: true, command, audit: false, outputLines: lines }
+    }
+
+    if (parsed.type === 'mood_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const moods = normalizeWorldMoods(snapshot.world?.moods)
+      const threat = normalizeWorldThreat(snapshot.world?.threat)
+      const factions = normalizeWorldStoryFactions(snapshot.world?.factions)
+      const mood = normalizeTownMood(moods.byTown[townName]) || freshTownMood()
+      const label = deriveDominantMoodLabel(mood)
+      const level = Number(threat.byTown[townName] || 0)
+      const faction = findStoryFactionByTown(factions, townName)
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD MOOD: town=${townName} mood=${label} fear=${mood.fear} unrest=${mood.unrest} prosperity=${mood.prosperity} threat=${level} faction=${faction?.name || '-'}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'event_list') {
+      const snapshot = memoryStore.getSnapshot()
+      const events = normalizeWorldEvents(snapshot.world?.events)
+      const clock = normalizeWorldClock(snapshot.world?.clock)
+      if (events.active.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [`GOD EVENT LIST: count=0 seed=${events.seed} index=${events.index} day=${clock.day}`]
+        }
+      }
+      const rows = events.active
+        .slice()
+        .sort((a, b) => {
+          const dayDiff = Number(b.starts_day || 0) - Number(a.starts_day || 0)
+          if (dayDiff !== 0) return dayDiff
+          const townDiff = asText(a.town, '', 80).localeCompare(asText(b.town, '', 80))
+          if (townDiff !== 0) return townDiff
+          return asText(a.id, '', 200).localeCompare(asText(b.id, '', 200))
+        })
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD EVENT LIST: count=${rows.length} seed=${events.seed} index=${events.index} day=${clock.day}`,
+          ...rows.map(event => (
+            `GOD EVENT: id=${event.id} type=${event.type} town=${event.town} starts_day=${event.starts_day} ends_day=${event.ends_day} active=${isEventActiveForDay(event, clock.day)} effects=${summarizeEventMods(event.mods)}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'event_seed') {
+      if (!Number.isInteger(parsed.seed)) return { applied: false, command, reason: 'Invalid event seed.' }
+      const tx = await memoryStore.transact((memory) => {
+        const events = ensureWorldEvents(memory.world)
+        const at = now()
+        events.seed = parsed.seed
+        const message = `EVENT DECK: seed set to ${events.seed}.`
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:event_seed`,
+          type: 'event',
+          msg: message,
+          at,
+          meta: { seed: events.seed }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:event_seed`,
+          topic: 'world',
+          msg: message,
+          at,
+          meta: { seed: events.seed }
+        })
+        return { seed: events.seed, index: events.index }
+      }, { eventId: `${operationId}:event_seed:${parsed.seed}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD EVENT SEED: seed=${tx.result.seed} index=${tx.result.index}`]
+      }
+    }
+
+    if (parsed.type === 'event_draw') {
+      const snapshot = memoryStore.getSnapshot()
+      let requestedTown = null
+      if (parsed.townName) {
+        const resolvedTown = resolveTownName(snapshot.world, parsed.townName)
+        if (!resolvedTown) return { applied: false, command, reason: 'Unknown town.' }
+        requestedTown = resolvedTown
+      }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const at = now()
+          const townSlug = (requestedTown || 'auto').toLowerCase()
+          const idPrefix = `${operationId}:event_draw:${townSlug}`
+          const event = drawAndApplyWorldEvent(memory, {
+            operationId,
+            idPrefix,
+            at,
+            requestedTownName: requestedTown
+          })
+          return event
+        }, { eventId: `${operationId}:event_draw:${(requestedTown || 'auto').toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') {
+          return { applied: false, command, reason: 'Unknown town.' }
+        }
+        throw err
+      }
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD EVENT DRAW: id=${tx.result.id} type=${tx.result.type} town=${tx.result.town} starts_day=${tx.result.starts_day} ends_day=${tx.result.ends_day} effects=${summarizeEventMods(tx.result.mods)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'event_clear') {
+      const snapshot = memoryStore.getSnapshot()
+      const events = normalizeWorldEvents(snapshot.world?.events)
+      const existing = events.active.find(entry => sameText(entry.id, parsed.eventId, 200))
+      if (!existing) return { applied: false, command, reason: 'Unknown event.' }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const worldEvents = ensureWorldEvents(memory.world)
+          const idx = worldEvents.active.findIndex(entry => sameText(entry?.id, existing.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_EVENT',
+              message: `Unknown event: ${parsed.eventId}`,
+              recoverable: true
+            })
+          }
+          const [removedRaw] = worldEvents.active.splice(idx, 1)
+          const removed = normalizeWorldEvent(removedRaw) || existing
+          const at = now()
+          const message = `[${removed.town}] EVENT: cleared ${removed.type} (${removed.id}).`
+          appendChronicle(memory, {
+            id: `${operationId}:chronicle:event_clear:${removed.id.toLowerCase()}`,
+            type: 'event',
+            msg: message,
+            at,
+            town: removed.town,
+            meta: {
+              event_id: removed.id,
+              event_type: removed.type
+            }
+          })
+          appendNews(memory, {
+            id: `${operationId}:news:event_clear:${removed.id.toLowerCase()}`,
+            topic: 'world',
+            msg: message,
+            at,
+            town: removed.town,
+            meta: {
+              event_id: removed.id,
+              event_type: removed.type
+            }
+          })
+          return removed
+        }, { eventId: `${operationId}:event_clear:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_EVENT') {
+          return { applied: false, command, reason: 'Unknown event.' }
+        }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD EVENT CLEAR: id=${tx.result.id} type=${tx.result.type} town=${tx.result.town}`]
+      }
+    }
+
     if (parsed.type === 'faction_list') {
       const snapshot = memoryStore.getSnapshot()
       const factions = normalizeWorldStoryFactions(snapshot.world?.factions)
@@ -1842,6 +3888,140 @@ function createGodCommandService(deps) {
         command,
         audit: false,
         outputLines: [`GOD REP: agent=${agentName} ${values}`]
+      }
+    }
+
+    if (parsed.type === 'trait_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const agentName = resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
+      const profile = ensureAgentStoryProfile({ ...(snapshot.agents?.[agentName]?.profile || {}) })
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD TRAIT: agent=${agentName} courage=${profile.traits.courage} greed=${profile.traits.greed} faith=${profile.traits.faith}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'title_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const agentName = resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
+      const profile = ensureAgentStoryProfile({ ...(snapshot.agents?.[agentName]?.profile || {}) })
+      const titles = normalizeAgentTitles(profile.titles)
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD TITLE: agent=${agentName} rumors_completed=${normalizeRumorsCompleted(profile.rumors_completed)} count=${titles.length}`,
+          `GOD TITLE LIST: ${titles.length ? titles.join('|') : '(none)'}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'rumor_list') {
+      const snapshot = memoryStore.getSnapshot()
+      let townFilter = null
+      if (parsed.townName) {
+        townFilter = resolveTownName(snapshot.world, parsed.townName)
+        if (!townFilter) return { applied: false, command, reason: 'Unknown town.' }
+      }
+      const limit = Math.max(1, Math.min(200, Number(parsed.limit || 10)))
+      const rumors = normalizeWorldRumors(snapshot.world?.rumors)
+        .filter(rumor => !townFilter || sameText(rumor.town, townFilter, 80))
+        .sort((a, b) => {
+          const diff = Number(b.created_at || 0) - Number(a.created_at || 0)
+          if (diff !== 0) return diff
+          return a.id.localeCompare(b.id)
+        })
+      const rows = rumors.slice(0, limit)
+      if (rows.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [`GOD RUMOR LIST: town=${townFilter || '-'} (none)`]
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD RUMOR LIST: town=${townFilter || '-'} count=${rows.length} total=${rumors.length}`,
+          ...rows.map(rumor => (
+            `GOD RUMOR: id=${rumor.id} town=${rumor.town} kind=${rumor.kind} severity=${rumor.severity} starts_day=${rumor.starts_day} expires_day=${rumor.expires_day} text=${rumor.text}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'rumor_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const rumor = findRumorById(snapshot.world?.rumors || [], parsed.rumorId)
+      if (!rumor) return { applied: false, command, reason: 'Unknown rumor.' }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD RUMOR SHOW: id=${rumor.id} town=${rumor.town} kind=${rumor.kind} severity=${rumor.severity}`,
+          `GOD RUMOR WINDOW: starts_day=${rumor.starts_day} expires_day=${rumor.expires_day} created_at=${rumor.created_at}`,
+          `GOD RUMOR LINKS: spawned_by_event_id=${rumor.spawned_by_event_id || '-'} resolved_by_quest_id=${rumor.resolved_by_quest_id || '-'}`,
+          `GOD RUMOR TEXT: ${rumor.text}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'decision_list') {
+      const snapshot = memoryStore.getSnapshot()
+      let townFilter = null
+      if (parsed.townName) {
+        townFilter = resolveTownName(snapshot.world, parsed.townName)
+        if (!townFilter) return { applied: false, command, reason: 'Unknown town.' }
+      }
+      const decisions = normalizeWorldDecisions(snapshot.world?.decisions)
+        .filter(decision => !townFilter || sameText(decision.town, townFilter, 80))
+        .sort((a, b) => {
+          const diff = Number(b.created_at || 0) - Number(a.created_at || 0)
+          if (diff !== 0) return diff
+          return a.id.localeCompare(b.id)
+        })
+      if (decisions.length === 0) {
+        return { applied: true, command, audit: false, outputLines: [`GOD DECISION LIST: town=${townFilter || '-'} (none)`] }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD DECISION LIST: town=${townFilter || '-'} count=${decisions.length}`,
+          ...decisions.map(decision => (
+            `GOD DECISION: id=${decision.id} town=${decision.town} event_id=${decision.event_id} event_type=${decision.event_type} state=${decision.state} chosen_key=${decision.chosen_key || '-'} expires_day=${decision.expires_day}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'decision_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const decision = findDecisionById(snapshot.world?.decisions || [], parsed.decisionId)
+      if (!decision) return { applied: false, command, reason: 'Unknown decision.' }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD DECISION SHOW: id=${decision.id} town=${decision.town} event_id=${decision.event_id} event_type=${decision.event_type} state=${decision.state} chosen_key=${decision.chosen_key || '-'}`,
+          `GOD DECISION PROMPT: ${decision.prompt}`,
+          ...decision.options.map(option => (
+            `GOD DECISION OPTION: key=${option.key} label=${option.label}`
+          ))
+        ]
       }
     }
 
@@ -1887,15 +4067,20 @@ function createGodCommandService(deps) {
       }
 
       const tx = await memoryStore.transact((memory) => {
-        const clock = ensureWorldClock(memory.world)
+        let clock = ensureWorldClock(memory.world)
         const threat = ensureWorldThreat(memory.world)
+        ensureWorldMoods(memory.world)
+        ensureWorldEvents(memory.world)
         const towns = deriveTownsFromMarkers(memory.world?.markers || [])
         for (let tickIdx = 0; tickIdx < ticks; tickIdx += 1) {
+          clock = ensureWorldClock(memory.world)
           const rates = SEASON_THREAT_RATES[clock.season] || SEASON_THREAT_RATES.dawn
           const nextPhase = clock.phase === 'day' ? 'night' : 'day'
           clock.phase = nextPhase
           if (nextPhase === 'day') clock.day += 1
           const at = now()
+          expireRumorsForDay(memory, clock.day)
+          expireDecisionsForDay(memory, clock.day)
 
           appendChronicle(memory, {
             id: `${operationId}:chronicle:clock_advance:tick:${tickIdx}`,
@@ -1955,8 +4140,24 @@ function createGodCommandService(deps) {
                 level: nextLevel
               }
             })
+            applyTownMoodDelta(memory, {
+              townName,
+              delta: { fear: nextPhase === 'night' ? 3 : -2 },
+              at,
+              idPrefix: `${operationId}:clock_advance:${tickIdx}:${townKey}`,
+              reason: 'clock_advance'
+            })
+          }
+          if (nextPhase === 'night') {
+            drawAndApplyWorldEvent(memory, {
+              operationId,
+              idPrefix: `${operationId}:clock_advance:${tickIdx}:nightfall`,
+              at
+            })
+            clock = ensureWorldClock(memory.world)
           }
         }
+        clock = ensureWorldClock(memory.world)
         clock.updated_at = new Date(now()).toISOString()
         return {
           day: clock.day,
@@ -2080,13 +4281,14 @@ function createGodCommandService(deps) {
       if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
 
       const tx = await memoryStore.transact((memory) => {
-        const profile = ensureAgentProfile(memory, agentName)
+        const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, agentName))
         const rep = normalizeAgentRep(profile.rep)
         const current = Number(rep[parsed.factionName] || 0)
         const next = current + parsed.delta
         rep[parsed.factionName] = next
         profile.rep = rep
         const at = now()
+        applyRepThresholdTitleAwards(memory, agentName, at, `${operationId}:rep_add_titles`, null)
         const message = parsed.delta >= 0
           ? `${agentName} gains favor with ${parsed.factionName} (${next}).`
           : `${agentName} loses favor with ${parsed.factionName} (${next}).`
@@ -2126,6 +4328,525 @@ function createGodCommandService(deps) {
       }
     }
 
+    if (parsed.type === 'trait_set') {
+      if (!TRAIT_NAME_SET.has(parsed.traitName)) return { applied: false, command, reason: 'Invalid trait.' }
+      if (!Number.isInteger(parsed.value) || parsed.value < 0 || parsed.value > 3) {
+        return { applied: false, command, reason: 'Invalid trait value.' }
+      }
+      const snapshot = memoryStore.getSnapshot()
+      const agentName = resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
+
+      const tx = await memoryStore.transact((memory) => {
+        const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, agentName))
+        const traits = normalizeAgentTraits(profile.traits)
+        traits[parsed.traitName] = parsed.value
+        profile.traits = traits
+        const at = now()
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:trait_set:${agentName.toLowerCase()}:${parsed.traitName}`,
+          type: 'trait',
+          msg: `TRAIT: ${agentName} ${parsed.traitName}=${parsed.value}`,
+          at,
+          meta: {
+            agent: agentName,
+            trait: parsed.traitName,
+            value: parsed.value
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:trait_set:${agentName.toLowerCase()}:${parsed.traitName}`,
+          topic: 'trait',
+          msg: `TRAIT: ${agentName} ${parsed.traitName}=${parsed.value}`,
+          at,
+          meta: {
+            agent: agentName,
+            trait: parsed.traitName,
+            value: parsed.value
+          }
+        })
+        return { agentName, traitName: parsed.traitName, value: parsed.value }
+      }, { eventId: `${operationId}:trait_set:${agentName.toLowerCase()}:${parsed.traitName}:${parsed.value}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD TRAIT SET: agent=${tx.result.agentName} ${tx.result.traitName}=${tx.result.value}`]
+      }
+    }
+
+    if (parsed.type === 'title_grant') {
+      const snapshot = memoryStore.getSnapshot()
+      const agentName = resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
+      const title = asText(parsed.title, '', MAX_AGENT_TITLE_LEN)
+      if (!title) return { applied: false, command, reason: 'Invalid title.' }
+      const existingTitles = normalizeAgentTitles(snapshot.agents?.[agentName]?.profile?.titles)
+      if (existingTitles.some(item => sameText(item, title, MAX_AGENT_TITLE_LEN))) {
+        return { applied: false, command, reason: 'Title already granted.' }
+      }
+
+      const tx = await memoryStore.transact((memory) => {
+        const granted = grantAgentTitleIfMissing(memory, agentName, title, now(), `${operationId}:title_grant`, null)
+        return { agentName, title, granted }
+      }, { eventId: `${operationId}:title_grant:${agentName.toLowerCase()}:${title.toLowerCase()}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      if (!tx.result.granted) return { applied: false, command, reason: 'Title already granted.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD TITLE GRANT: agent=${tx.result.agentName} title=${tx.result.title}`]
+      }
+    }
+
+    if (parsed.type === 'title_revoke') {
+      const snapshot = memoryStore.getSnapshot()
+      const agentName = resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!agentName) return { applied: false, command, reason: 'Unknown agent.' }
+      const title = asText(parsed.title, '', MAX_AGENT_TITLE_LEN)
+      if (!title) return { applied: false, command, reason: 'Invalid title.' }
+      const existingTitles = normalizeAgentTitles(snapshot.agents?.[agentName]?.profile?.titles)
+      if (!existingTitles.some(item => sameText(item, title, MAX_AGENT_TITLE_LEN))) {
+        return { applied: false, command, reason: 'Unknown title.' }
+      }
+
+      const tx = await memoryStore.transact((memory) => {
+        const profile = ensureAgentStoryProfile(ensureAgentProfile(memory, agentName))
+        const nextTitles = normalizeAgentTitles(profile.titles)
+          .filter(item => !sameText(item, title, MAX_AGENT_TITLE_LEN))
+        profile.titles = nextTitles
+        const at = now()
+        const message = `${agentName} loses the title "${title}".`
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:title_revoke:${agentName.toLowerCase()}:${title.toLowerCase()}`,
+          type: 'title',
+          msg: message,
+          at,
+          meta: {
+            agent: agentName,
+            title
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:title_revoke:${agentName.toLowerCase()}:${title.toLowerCase()}`,
+          topic: 'title',
+          msg: message,
+          at,
+          meta: {
+            agent: agentName,
+            title
+          }
+        })
+        return { agentName, title }
+      }, { eventId: `${operationId}:title_revoke:${agentName.toLowerCase()}:${title.toLowerCase()}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD TITLE REVOKE: agent=${tx.result.agentName} title=${tx.result.title}`]
+      }
+    }
+
+    if (parsed.type === 'rumor_spawn') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      if (!RUMOR_KIND_SET.has(parsed.kind)) return { applied: false, command, reason: 'Invalid rumor kind.' }
+      if (!Number.isInteger(parsed.severity) || parsed.severity < 1 || parsed.severity > 3) {
+        return { applied: false, command, reason: 'Invalid rumor severity.' }
+      }
+      if (!renderRumorTemplate({
+        kind: parsed.kind,
+        templateKey: parsed.templateKey,
+        townName,
+        phase: normalizeWorldClock(snapshot.world?.clock).phase
+      })) {
+        return { applied: false, command, reason: 'Unknown rumor template.' }
+      }
+      if (parsed.expiresInDays !== null && (!Number.isInteger(parsed.expiresInDays) || parsed.expiresInDays < 0)) {
+        return { applied: false, command, reason: 'Invalid rumor expiry.' }
+      }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const rumor = spawnWorldRumor(memory, {
+            townName,
+            kind: parsed.kind,
+            severity: parsed.severity,
+            templateKey: parsed.templateKey,
+            expiresInDays: parsed.expiresInDays,
+            at: now(),
+            idPrefix: `${operationId}:rumor_spawn`
+          })
+          return rumor
+        }, { eventId: `${operationId}:rumor_spawn:${townName.toLowerCase()}:${parsed.kind}:${parsed.templateKey}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'INVALID_RUMOR_KIND') return { applied: false, command, reason: 'Invalid rumor kind.' }
+        if (err instanceof AppError && err.code === 'INVALID_RUMOR_SEVERITY') return { applied: false, command, reason: 'Invalid rumor severity.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_RUMOR_TEMPLATE') return { applied: false, command, reason: 'Unknown rumor template.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD RUMOR SPAWN: id=${tx.result.id} town=${tx.result.town} kind=${tx.result.kind} severity=${tx.result.severity} expires_day=${tx.result.expires_day}`]
+      }
+    }
+
+    if (parsed.type === 'rumor_clear') {
+      const snapshot = memoryStore.getSnapshot()
+      const rumor = findRumorById(snapshot.world?.rumors || [], parsed.rumorId)
+      if (!rumor) return { applied: false, command, reason: 'Unknown rumor.' }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const rumors = ensureWorldRumors(memory.world)
+          const idx = rumors.findIndex(entry => sameText(entry?.id, rumor.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_RUMOR',
+              message: `Unknown rumor: ${parsed.rumorId}`,
+              recoverable: true
+            })
+          }
+          const [removedRaw] = rumors.splice(idx, 1)
+          const removed = normalizeRumor(removedRaw) || rumor
+          const at = now()
+          appendChronicle(memory, {
+            id: `${operationId}:chronicle:rumor_clear:${removed.id.toLowerCase()}`,
+            type: 'rumor_clear',
+            msg: `RUMOR: cleared ${removed.id}`,
+            at,
+            town: removed.town,
+            meta: {
+              rumor_id: removed.id
+            }
+          })
+          appendNews(memory, {
+            id: `${operationId}:news:rumor_clear:${removed.id.toLowerCase()}`,
+            topic: 'rumor',
+            msg: `RUMOR: cleared ${removed.id}`,
+            at,
+            town: removed.town,
+            meta: {
+              rumor_id: removed.id
+            }
+          })
+          return removed
+        }, { eventId: `${operationId}:rumor_clear:${rumor.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_RUMOR') return { applied: false, command, reason: 'Unknown rumor.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD RUMOR CLEAR: id=${tx.result.id}`]
+      }
+    }
+
+    if (parsed.type === 'rumor_resolve') {
+      const snapshot = memoryStore.getSnapshot()
+      const rumor = findRumorById(snapshot.world?.rumors || [], parsed.rumorId)
+      if (!rumor) return { applied: false, command, reason: 'Unknown rumor.' }
+      const quest = findQuestById(snapshot.world?.quests || [], parsed.questId)
+      if (!quest) return { applied: false, command, reason: 'Unknown quest.' }
+      if (sameText(rumor.resolved_by_quest_id, quest.id, 200)) {
+        return { applied: false, command, reason: 'Rumor already resolved by this quest.' }
+      }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const rumors = ensureWorldRumors(memory.world)
+          const quests = ensureWorldQuests(memory.world)
+          const rumorIdx = rumors.findIndex(entry => sameText(entry?.id, rumor.id, 200))
+          const questRecord = findQuestById(quests, quest.id)
+          if (rumorIdx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_RUMOR',
+              message: `Unknown rumor: ${parsed.rumorId}`,
+              recoverable: true
+            })
+          }
+          if (!questRecord) {
+            throw new AppError({
+              code: 'UNKNOWN_QUEST',
+              message: `Unknown quest: ${parsed.questId}`,
+              recoverable: true
+            })
+          }
+          const current = normalizeRumor(rumors[rumorIdx]) || rumor
+          rumors[rumorIdx] = {
+            ...current,
+            resolved_by_quest_id: questRecord.id
+          }
+          const at = now()
+          const message = `RUMOR: ${current.id} resolved by quest ${questRecord.id}`
+          appendChronicle(memory, {
+            id: `${operationId}:chronicle:rumor_resolve:${current.id.toLowerCase()}`,
+            type: 'rumor_resolve',
+            msg: message,
+            at,
+            town: current.town,
+            meta: {
+              rumor_id: current.id,
+              quest_id: questRecord.id
+            }
+          })
+          appendNews(memory, {
+            id: `${operationId}:news:rumor_resolve:${current.id.toLowerCase()}`,
+            topic: 'rumor',
+            msg: message,
+            at,
+            town: current.town,
+            meta: {
+              rumor_id: current.id,
+              quest_id: questRecord.id
+            }
+          })
+          return {
+            rumorId: current.id,
+            questId: questRecord.id
+          }
+        }, { eventId: `${operationId}:rumor_resolve:${rumor.id.toLowerCase()}:${quest.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_RUMOR') return { applied: false, command, reason: 'Unknown rumor.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_QUEST') return { applied: false, command, reason: 'Unknown quest.' }
+        throw err
+      }
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD RUMOR RESOLVE: rumor_id=${tx.result.rumorId} quest_id=${tx.result.questId}`]
+      }
+    }
+
+    if (parsed.type === 'rumor_quest') {
+      const snapshot = memoryStore.getSnapshot()
+      const rumor = findRumorById(snapshot.world?.rumors || [], parsed.rumorId)
+      if (!rumor) return { applied: false, command, reason: 'Unknown rumor.' }
+      const clock = normalizeWorldClock(snapshot.world?.clock)
+      if (Number(rumor.expires_day || 0) < clock.day) return { applied: false, command, reason: 'Rumor expired.' }
+      const existingSideQuest = normalizeWorldQuests(snapshot.world?.quests)
+        .find(item => item.type === 'rumor_task' && sameText(item.rumor_id, rumor.id, 200) && item.state !== 'cancelled')
+      if (existingSideQuest) return { applied: false, command, reason: 'Rumor already has side quest.' }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const rumorCurrent = findRumorById(memory.world?.rumors || [], rumor.id)
+          if (!rumorCurrent) {
+            throw new AppError({
+              code: 'UNKNOWN_RUMOR',
+              message: `Unknown rumor: ${parsed.rumorId}`,
+              recoverable: true
+            })
+          }
+          const day = ensureWorldClock(memory.world).day
+          if (rumorCurrent.expires_day < day) {
+            throw new AppError({
+              code: 'RUMOR_EXPIRED',
+              message: `Rumor expired: ${rumorCurrent.id}`,
+              recoverable: true
+            })
+          }
+          const existing = normalizeWorldQuests(memory.world?.quests)
+            .find(item => item.type === 'rumor_task' && sameText(item.rumor_id, rumorCurrent.id, 200) && item.state !== 'cancelled')
+          if (existing) {
+            throw new AppError({
+              code: 'RUMOR_QUEST_EXISTS',
+              message: `Rumor side quest already exists: ${rumorCurrent.id}`,
+              recoverable: true
+            })
+          }
+          return createRumorSideQuest(memory, rumorCurrent, { operationId, at: now() })
+        }, { eventId: `${operationId}:rumor_quest:${rumor.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_RUMOR') return { applied: false, command, reason: 'Unknown rumor.' }
+        if (err instanceof AppError && err.code === 'RUMOR_EXPIRED') return { applied: false, command, reason: 'Rumor expired.' }
+        if (err instanceof AppError && err.code === 'RUMOR_QUEST_EXISTS') return { applied: false, command, reason: 'Rumor already has side quest.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD RUMOR QUEST: rumor_id=${tx.result.rumor_id} quest_id=${tx.result.id} reward=${tx.result.reward}`]
+      }
+    }
+
+    if (parsed.type === 'decision_choose') {
+      const snapshot = memoryStore.getSnapshot()
+      const existing = findDecisionById(snapshot.world?.decisions || [], parsed.decisionId)
+      if (!existing) return { applied: false, command, reason: 'Unknown decision.' }
+      if (existing.state !== 'open') return { applied: false, command, reason: 'Decision is not open.' }
+      const option = existing.options.find(item => sameText(item.key, parsed.optionKey, 40))
+      if (!option) return { applied: false, command, reason: 'Unknown option.' }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const decisions = ensureWorldDecisions(memory.world)
+          const idx = decisions.findIndex(item => sameText(item?.id, existing.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_DECISION',
+              message: `Unknown decision: ${parsed.decisionId}`,
+              recoverable: true
+            })
+          }
+          const decision = normalizeDecision(decisions[idx])
+          if (!decision || decision.state !== 'open') {
+            throw new AppError({
+              code: 'DECISION_NOT_OPEN',
+              message: `Decision is not open: ${parsed.decisionId}`,
+              recoverable: true
+            })
+          }
+          const selectedOption = decision.options.find(item => sameText(item.key, parsed.optionKey, 40))
+          if (!selectedOption) {
+            throw new AppError({
+              code: 'UNKNOWN_OPTION',
+              message: `Unknown option: ${parsed.optionKey}`,
+              recoverable: true
+            })
+          }
+          const at = now()
+          decision.state = 'chosen'
+          decision.chosen_key = selectedOption.key
+          decisions[idx] = decision
+          const effectResult = applyDecisionChoiceEffects(memory, decision, selectedOption, {
+            operationId: `${operationId}:decision_choose:${decision.id.toLowerCase()}`,
+            at
+          })
+          const message = `[${decision.town}] MAYOR chose ${selectedOption.key} for ${decision.event_type}.`
+          appendChronicle(memory, {
+            id: `${operationId}:chronicle:decision_choose:${decision.id.toLowerCase()}`,
+            type: 'decision_choose',
+            msg: message,
+            at,
+            town: decision.town,
+            meta: {
+              decision_id: decision.id,
+              option_key: selectedOption.key
+            }
+          })
+          appendNews(memory, {
+            id: `${operationId}:news:decision_choose:${decision.id.toLowerCase()}`,
+            topic: 'world',
+            msg: message,
+            at,
+            town: decision.town,
+            meta: {
+              decision_id: decision.id,
+              option_key: selectedOption.key
+            }
+          })
+          return {
+            id: decision.id,
+            town: decision.town,
+            optionKey: selectedOption.key,
+            effectSummary: effectResult?.summary || []
+          }
+        }, { eventId: `${operationId}:decision_choose:${existing.id.toLowerCase()}:${parsed.optionKey}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_DECISION') return { applied: false, command, reason: 'Unknown decision.' }
+        if (err instanceof AppError && err.code === 'DECISION_NOT_OPEN') return { applied: false, command, reason: 'Decision is not open.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_OPTION') return { applied: false, command, reason: 'Unknown option.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD DECISION CHOOSE: id=${tx.result.id} town=${tx.result.town} option=${tx.result.optionKey} effects=${tx.result.effectSummary.length ? tx.result.effectSummary.join('|') : '-'}`]
+      }
+    }
+
+    if (parsed.type === 'decision_expire') {
+      const snapshot = memoryStore.getSnapshot()
+      const existing = findDecisionById(snapshot.world?.decisions || [], parsed.decisionId)
+      if (!existing) return { applied: false, command, reason: 'Unknown decision.' }
+      if (existing.state === 'expired') return { applied: false, command, reason: 'Decision already expired.' }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const decisions = ensureWorldDecisions(memory.world)
+          const idx = decisions.findIndex(item => sameText(item?.id, existing.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_DECISION',
+              message: `Unknown decision: ${parsed.decisionId}`,
+              recoverable: true
+            })
+          }
+          const decision = normalizeDecision(decisions[idx])
+          if (!decision) {
+            throw new AppError({
+              code: 'UNKNOWN_DECISION',
+              message: `Unknown decision: ${parsed.decisionId}`,
+              recoverable: true
+            })
+          }
+          decision.state = 'expired'
+          delete decision.chosen_key
+          decisions[idx] = decision
+          const at = now()
+          appendChronicle(memory, {
+            id: `${operationId}:chronicle:decision_expire:${decision.id.toLowerCase()}`,
+            type: 'decision_expire',
+            msg: `[${decision.town}] MAYOR decision expired: ${decision.id}`,
+            at,
+            town: decision.town,
+            meta: {
+              decision_id: decision.id
+            }
+          })
+          appendNews(memory, {
+            id: `${operationId}:news:decision_expire:${decision.id.toLowerCase()}`,
+            topic: 'world',
+            msg: `[${decision.town}] MAYOR decision expired: ${decision.id}`,
+            at,
+            town: decision.town,
+            meta: {
+              decision_id: decision.id
+            }
+          })
+          return decision
+        }, { eventId: `${operationId}:decision_expire:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_DECISION') return { applied: false, command, reason: 'Unknown decision.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [`GOD DECISION EXPIRE: id=${tx.result.id} town=${tx.result.town}`]
+      }
+    }
+
     if (parsed.type === 'town_list') {
       const snapshot = memoryStore.getSnapshot()
       const towns = deriveTownsFromMarkers(snapshot.world?.markers || [])
@@ -2161,9 +4882,12 @@ function createGodCommandService(deps) {
       const chronicle = normalizeWorldChronicle(snapshot.world?.chronicle)
       const clock = normalizeWorldClock(snapshot.world?.clock)
       const threat = normalizeWorldThreat(snapshot.world?.threat)
+      const moods = normalizeWorldMoods(snapshot.world?.moods)
       const factions = normalizeWorldStoryFactions(snapshot.world?.factions)
       const limit = Math.max(1, Math.min(200, Number(parsed.limit || 10)))
       const townThreatLevel = Number(threat.byTown[town.townName] || 0)
+      const townMood = normalizeTownMood(moods.byTown[town.townName]) || freshTownMood()
+      const townMoodLabel = deriveDominantMoodLabel(townMood)
       const townFaction = findStoryFactionByTown(factions, town.townName)
       const townFactionName = townFaction ? townFaction.name : '-'
       const townFactionDoctrine = asText(
@@ -2251,30 +4975,65 @@ function createGodCommandService(deps) {
         if (diff !== 0) return diff
         return left.id.localeCompare(right.id)
       }
-      const availableQuestLines = quests
-        .filter(quest => quest.state === 'offered' && sameText(quest.town, town.townName, 80))
+      const isQuestLinkedToTown = (quest) => {
+        if (sameText(quest.town, town.townName, 80)) return true
+        const ownerName = asText(quest.owner, '', 80)
+        if (!ownerName) return false
+        const ownerHomeMarker = asText(snapshot.agents?.[ownerName]?.profile?.job?.home_marker, '', 80)
+        return sameText(ownerHomeMarker, town.marker.name, 80)
+      }
+      const mainAvailableQuestLines = quests
+        .filter(quest => quest.type !== 'rumor_task' && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
         .sort(sortQuests)
         .map(quest => (
-          `GOD TOWN BOARD QUEST AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+          `GOD TOWN BOARD QUEST MAIN AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
-      const activeQuestLines = quests
+      const mainActiveQuestLines = quests
         .filter((quest) => {
+          if (quest.type === 'rumor_task') return false
           if (!QUEST_ACTIVE_STATES.has(quest.state)) return false
-          if (sameText(quest.town, town.townName, 80)) return true
-          const ownerName = asText(quest.owner, '', 80)
-          if (!ownerName) return false
-          const ownerHomeMarker = asText(snapshot.agents?.[ownerName]?.profile?.job?.home_marker, '', 80)
-          return sameText(ownerHomeMarker, town.marker.name, 80)
+          return isQuestLinkedToTown(quest)
         })
         .sort(sortQuests)
         .map(quest => (
-          `GOD TOWN BOARD QUEST ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+          `GOD TOWN BOARD QUEST MAIN ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+        ))
+      const sideAvailableQuestLines = quests
+        .filter(quest => quest.type === 'rumor_task' && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
+        .sort(sortQuests)
+        .map(quest => (
+          `GOD TOWN BOARD QUEST SIDE AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+        ))
+      const sideActiveQuestLines = quests
+        .filter((quest) => {
+          if (quest.type !== 'rumor_task') return false
+          if (!QUEST_ACTIVE_STATES.has(quest.state)) return false
+          return isQuestLinkedToTown(quest)
+        })
+        .sort(sortQuests)
+        .map(quest => (
+          `GOD TOWN BOARD QUEST SIDE ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+        ))
+      const availableQuestLines = [...mainAvailableQuestLines]
+      const activeQuestLines = [...mainActiveQuestLines]
+      const decisions = normalizeWorldDecisions(snapshot.world?.decisions)
+      const openDecisionLines = decisions
+        .filter(decision => decision.state === 'open' && sameText(decision.town, town.townName, 80))
+        .sort((a, b) => {
+          const diff = Number(b.created_at || 0) - Number(a.created_at || 0)
+          if (diff !== 0) return diff
+          return a.id.localeCompare(b.id)
+        })
+        .slice(0, limit)
+        .map(decision => (
+          `GOD TOWN BOARD DECISION OPEN: id=${decision.id} event_type=${decision.event_type} expires_day=${decision.expires_day} prompt=${decision.prompt}`
         ))
 
       const lines = [
         `GOD TOWN BOARD: town=${town.townName} marker=${town.marker.name} x=${town.marker.x} y=${town.marker.y} z=${town.marker.z} population=${population} limit=${limit}`,
         `GOD TOWN BOARD CLOCK: day=${clock.day} phase=${clock.phase} season=${clock.season}`,
         `GOD TOWN BOARD THREAT: town=${town.townName} level=${townThreatLevel}`,
+        `GOD TOWN BOARD MOOD: town=${town.townName} mood=${townMoodLabel} fear=${townMood.fear} unrest=${townMood.unrest} prosperity=${townMood.prosperity}`,
         `GOD TOWN BOARD FACTION: town=${town.townName} name=${townFactionName} doctrine=${townFactionDoctrine} rivals=${townFactionRivals.length ? townFactionRivals.join('|') : '-'}`,
         `GOD TOWN BOARD ROSTER: count=${rosterLines.length}`,
         ...(rosterLines.length > 0 ? rosterLines : ['GOD TOWN BOARD AGENT: (none)']),
@@ -2283,9 +5042,19 @@ function createGodCommandService(deps) {
         `GOD TOWN BOARD OFFERS: count=${offerLines.length}`,
         ...(offerLines.length > 0 ? offerLines : ['GOD TOWN BOARD OFFER: (none)']),
         `GOD TOWN BOARD QUESTS AVAILABLE: count=${availableQuestLines.length}`,
-        ...(availableQuestLines.length > 0 ? availableQuestLines : ['GOD TOWN BOARD QUEST AVAILABLE: (none)']),
+        ...(availableQuestLines.length > 0 ? availableQuestLines.map(line => line.replace('QUEST MAIN AVAILABLE', 'QUEST AVAILABLE')) : ['GOD TOWN BOARD QUEST AVAILABLE: (none)']),
         `GOD TOWN BOARD QUESTS ACTIVE: count=${activeQuestLines.length}`,
-        ...(activeQuestLines.length > 0 ? activeQuestLines : ['GOD TOWN BOARD QUEST ACTIVE: (none)']),
+        ...(activeQuestLines.length > 0 ? activeQuestLines.map(line => line.replace('QUEST MAIN ACTIVE', 'QUEST ACTIVE')) : ['GOD TOWN BOARD QUEST ACTIVE: (none)']),
+        `GOD TOWN BOARD QUESTS MAIN AVAILABLE: count=${mainAvailableQuestLines.length}`,
+        ...(mainAvailableQuestLines.length > 0 ? mainAvailableQuestLines : ['GOD TOWN BOARD QUEST MAIN AVAILABLE: (none)']),
+        `GOD TOWN BOARD QUESTS MAIN ACTIVE: count=${mainActiveQuestLines.length}`,
+        ...(mainActiveQuestLines.length > 0 ? mainActiveQuestLines : ['GOD TOWN BOARD QUEST MAIN ACTIVE: (none)']),
+        `GOD TOWN BOARD QUESTS SIDE AVAILABLE: count=${sideAvailableQuestLines.length}`,
+        ...(sideAvailableQuestLines.length > 0 ? sideAvailableQuestLines : ['GOD TOWN BOARD QUEST SIDE AVAILABLE: (none)']),
+        `GOD TOWN BOARD QUESTS SIDE ACTIVE: count=${sideActiveQuestLines.length}`,
+        ...(sideActiveQuestLines.length > 0 ? sideActiveQuestLines : ['GOD TOWN BOARD QUEST SIDE ACTIVE: (none)']),
+        `GOD TOWN BOARD DECISIONS OPEN: count=${openDecisionLines.length}`,
+        ...(openDecisionLines.length > 0 ? openDecisionLines : ['GOD TOWN BOARD DECISION OPEN: (none)']),
         `GOD TOWN BOARD EVENTS: count=${eventLines.length}`,
         ...(eventLines.length > 0 ? eventLines : ['GOD TOWN BOARD EVENT: (none)'])
       ]
@@ -2448,18 +5217,26 @@ function createGodCommandService(deps) {
       const snapshot = memoryStore.getSnapshot()
       const quest = findQuestById(snapshot.world?.quests || [], parsed.questId)
       if (!quest) return { applied: false, command, reason: 'Unknown quest.' }
-      const objectiveLine = quest.type === 'trade_n'
-        ? `kind=trade_n n=${quest.objective.n} market=${quest.objective.market || '-'}`
-        : `kind=visit_town town=${quest.objective.town}`
-      const progressLine = quest.type === 'trade_n'
-        ? `done=${quest.progress.done}`
-        : `visited=${quest.progress.visited}`
+      let objectiveLine = '-'
+      let progressLine = '-'
+      if (quest.type === 'trade_n') {
+        objectiveLine = `kind=trade_n n=${quest.objective.n} market=${quest.objective.market || '-'}`
+        progressLine = `done=${quest.progress.done}`
+      } else if (quest.type === 'visit_town') {
+        objectiveLine = `kind=visit_town town=${quest.objective.town}`
+        progressLine = `visited=${quest.progress.visited}`
+      } else if (quest.type === 'rumor_task') {
+        objectiveLine = `kind=rumor_task rumor_task=${quest.objective.rumor_task} rumor_id=${quest.objective.rumor_id} n=${quest.objective.n || '-'} town=${quest.objective.town || '-'} market=${quest.objective.market || '-'}`
+        progressLine = typeof quest.progress.done === 'number'
+          ? `done=${quest.progress.done}`
+          : `visited=${quest.progress.visited}`
+      }
       return {
         applied: true,
         command,
         audit: false,
         outputLines: [
-          `GOD QUEST SHOW: id=${quest.id} type=${quest.type} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} reward=${quest.reward}`,
+          `GOD QUEST SHOW: id=${quest.id} type=${quest.type} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} reward=${quest.reward} rumor_id=${quest.rumor_id || '-'}`,
           `GOD QUEST TITLE: ${quest.title}`,
           `GOD QUEST DESC: ${quest.desc}`,
           `GOD QUEST OBJECTIVE: ${objectiveLine}`,
@@ -2484,13 +5261,17 @@ function createGodCommandService(deps) {
         marketName = market.name
       }
       const rawReward = parsed.reward === null ? DEFAULT_TRADE_QUEST_REWARD : parsed.reward
-      const reward = Number(rawReward)
-      if (!Number.isInteger(reward) || reward < 0) return { applied: false, command, reason: 'Invalid reward.' }
+      const baseReward = Number(rawReward)
+      if (!Number.isInteger(baseReward) || baseReward < 0) return { applied: false, command, reason: 'Invalid reward.' }
 
       const tx = await memoryStore.transact((memory) => {
         const quests = ensureWorldQuests(memory.world)
+        const clock = ensureWorldClock(memory.world)
         const at = now()
         const townName = sourceTown.townName
+        const activeEvents = findActiveEventsForTown(memory.world, townName, clock.day)
+        const rewardBonus = sumEventModifier(activeEvents, 'trade_reward_bonus')
+        const reward = Math.max(0, baseReward + rewardBonus)
         const objective = { kind: 'trade_n', n }
         if (marketName) objective.market = marketName
         const flavor = buildQuestFlavor('trade_n', townName, objective)
@@ -2518,7 +5299,8 @@ function createGodCommandService(deps) {
           meta: {
             quest_id: quest.id,
             quest_type: quest.type,
-            reward
+            reward,
+            reward_bonus: rewardBonus
           }
         })
         appendNews(memory, {
@@ -2530,7 +5312,8 @@ function createGodCommandService(deps) {
           meta: {
             quest_id: quest.id,
             quest_type: quest.type,
-            reward
+            reward,
+            reward_bonus: rewardBonus
           }
         })
         return quest
@@ -2554,12 +5337,16 @@ function createGodCommandService(deps) {
       const targetTown = findTownByName(towns, parsed.targetTown)
       if (!sourceTown || !targetTown) return { applied: false, command, reason: 'Unknown town.' }
       const rawReward = parsed.reward === null ? DEFAULT_VISIT_QUEST_REWARD : parsed.reward
-      const reward = Number(rawReward)
-      if (!Number.isInteger(reward) || reward < 0) return { applied: false, command, reason: 'Invalid reward.' }
+      const baseReward = Number(rawReward)
+      if (!Number.isInteger(baseReward) || baseReward < 0) return { applied: false, command, reason: 'Invalid reward.' }
 
       const tx = await memoryStore.transact((memory) => {
         const quests = ensureWorldQuests(memory.world)
+        const clock = ensureWorldClock(memory.world)
         const at = now()
+        const activeEvents = findActiveEventsForTown(memory.world, sourceTown.townName, clock.day)
+        const rewardBonus = sumEventModifier(activeEvents, 'visit_reward_bonus')
+        const reward = Math.max(0, baseReward + rewardBonus)
         const objective = {
           kind: 'visit_town',
           town: targetTown.townName
@@ -2589,7 +5376,8 @@ function createGodCommandService(deps) {
           meta: {
             quest_id: quest.id,
             quest_type: quest.type,
-            reward
+            reward,
+            reward_bonus: rewardBonus
           }
         })
         appendNews(memory, {
@@ -2601,7 +5389,8 @@ function createGodCommandService(deps) {
           meta: {
             quest_id: quest.id,
             quest_type: quest.type,
-            reward
+            reward,
+            reward_bonus: rewardBonus
           }
         })
         return quest
@@ -2739,6 +5528,13 @@ function createGodCommandService(deps) {
             town,
             meta: { quest_id: quest.id }
           })
+          applyTownMoodDelta(memory, {
+            townName: town || '-',
+            delta: { unrest: 2 },
+            at,
+            idPrefix: `${operationId}:quest_cancel:${quest.id.toLowerCase()}`,
+            reason: 'quest_cancel'
+          })
           return quest
         }, { eventId: `${operationId}:quest_cancel:${existing.id.toLowerCase()}` })
       } catch (err) {
@@ -2821,7 +5617,10 @@ function createGodCommandService(deps) {
       const snapshot = memoryStore.getSnapshot()
       const existing = findQuestById(snapshot.world?.quests || [], parsed.questId)
       if (!existing) return { applied: false, command, reason: 'Unknown quest.' }
-      if (existing.type !== 'visit_town') return { applied: false, command, reason: 'Quest is not visit_town.' }
+      const existingRumorTask = asText(existing.objective?.rumor_task, '', 20).toLowerCase()
+      const visitCompatible = existing.type === 'visit_town'
+        || (existing.type === 'rumor_task' && (existingRumorTask === 'rumor_visit' || existingRumorTask === 'rumor_choice'))
+      if (!visitCompatible) return { applied: false, command, reason: 'Quest is not visit_town.' }
       if (!QUEST_ACTIVE_STATES.has(existing.state)) return { applied: false, command, reason: 'Quest cannot be visited from current state.' }
       if (!asText(existing.owner, '', 80)) return { applied: false, command, reason: 'Unknown agent.' }
 
@@ -2838,7 +5637,11 @@ function createGodCommandService(deps) {
             })
           }
           const quest = normalizeQuest(quests[idx])
-          if (!quest || quest.type !== 'visit_town') {
+          const rumorTask = asText(quest?.objective?.rumor_task, '', 20).toLowerCase()
+          const isVisitCompatible = quest
+            && (quest.type === 'visit_town'
+              || (quest.type === 'rumor_task' && (rumorTask === 'rumor_visit' || rumorTask === 'rumor_choice')))
+          if (!isVisitCompatible) {
             throw new AppError({
               code: 'QUEST_TYPE_INVALID',
               message: `Quest is not visit_town: ${parsed.questId}`,
@@ -3781,11 +6584,12 @@ function createGodCommandService(deps) {
           const marketName = asText(marketRecord.name, market.name, 80)
           const town = findTownNameForMarker(memory.world?.markers || [], asText(marketRecord.marker, '', 80) || null)
           const tradeMessage = `TRADE: ${buyerCanonical} bought ${amount} @ ${unitPrice} from ${ownerCanonical} at ${marketName}`
+          const tradeAt = now()
           appendChronicle(memory, {
             id: `${operationId}:chronicle:trade:${currentOffer.offer_id.toLowerCase()}`,
             type: 'trade',
             msg: tradeMessage,
-            at: now(),
+            at: tradeAt,
             town: town || undefined,
             meta: {
               market: marketName,
@@ -3800,7 +6604,7 @@ function createGodCommandService(deps) {
             id: `${operationId}:news:trade:${currentOffer.offer_id.toLowerCase()}`,
             topic: 'trade',
             msg: tradeMessage,
-            at: now(),
+            at: tradeAt,
             town: town || undefined,
             meta: {
               market: marketName,
@@ -3811,12 +6615,22 @@ function createGodCommandService(deps) {
               total
             }
           })
+          applyTownMoodDelta(memory, {
+            townName: town || '-',
+            delta: { prosperity: 1, unrest: -1 },
+            at: tradeAt,
+            idPrefix: `${operationId}:trade:${currentOffer.offer_id.toLowerCase()}`,
+            reason: 'trade'
+          })
           const questCompletions = []
           const quests = ensureWorldQuests(memory.world)
           for (let questIdx = 0; questIdx < quests.length; questIdx += 1) {
             const quest = normalizeQuest(quests[questIdx])
             if (!quest) continue
-            if (quest.type !== 'trade_n') continue
+            const rumorTask = asText(quest.objective?.rumor_task, '', 20).toLowerCase()
+            const isTradeQuest = quest.type === 'trade_n'
+              || (quest.type === 'rumor_task' && rumorTask === 'rumor_trade')
+            if (!isTradeQuest) continue
             if (!QUEST_ACTIVE_STATES.has(quest.state)) continue
             if (!sameText(quest.owner, buyerCanonical, 80)) continue
             const objectiveMarket = asText(quest.objective.market, '', 80)

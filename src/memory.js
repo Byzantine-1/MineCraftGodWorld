@@ -19,7 +19,14 @@ const {
  *     recentUtterances: string[],
  *     lastProcessedTime: number,
  *     profile?: {
- *       rep?: Record<string, number>
+ *       rep?: Record<string, number>,
+ *       traits?: {
+ *         courage: number,
+ *         greed: number,
+ *         faith: number
+ *       },
+ *       titles?: string[],
+ *       rumors_completed?: number
  *     }
  *   }>,
  *   factions: Record<string, {
@@ -48,6 +55,64 @@ const {
  *     threat: {
  *       byTown: Record<string, number>
  *     },
+ *     moods: {
+ *       byTown: Record<string, {
+ *         fear: number,
+ *         unrest: number,
+ *         prosperity: number
+ *       }>
+ *     },
+ *     events: {
+ *       seed: number,
+ *       index: number,
+ *       active: Array<{
+ *         id: string,
+ *         type: 'festival' | 'shortage' | 'omen' | 'patrol' | 'fog' | 'tax_day',
+ *         town: string,
+ *         starts_day: number,
+ *         ends_day: number,
+ *         mods: Record<string, number>
+ *       }>
+ *     },
+ *     rumors: Array<{
+ *       id: string,
+ *       town: string,
+ *       text: string,
+ *       kind: 'grounded' | 'supernatural' | 'political',
+ *       severity: number,
+ *       starts_day: number,
+ *       expires_day: number,
+ *       created_at: number,
+ *       spawned_by_event_id?: string,
+ *       resolved_by_quest_id?: string
+ *     }>,
+ *     decisions: Array<{
+ *       id: string,
+ *       town: string,
+ *       event_id: string,
+ *       event_type: 'festival' | 'shortage' | 'omen' | 'patrol' | 'fog' | 'tax_day',
+ *       prompt: string,
+ *       options: Array<{
+ *         key: string,
+ *         label: string,
+ *         effects: {
+ *           mood?: { fear?: number, unrest?: number, prosperity?: number },
+ *           threat_delta?: number,
+ *           rep_delta?: Record<string, number>,
+ *           rumor_spawn?: {
+ *             kind: 'grounded' | 'supernatural' | 'political',
+ *             severity: number,
+ *             templateKey: string,
+ *             expiresInDays?: number
+ *           }
+ *         }
+ *       }>,
+ *       state: 'open' | 'chosen' | 'expired',
+ *       chosen_key?: string,
+ *       starts_day: number,
+ *       expires_day: number,
+ *       created_at: number
+ *     }>,
  *     markers: Array<{name: string, x: number, y: number, z: number, tag: string, created_at: number}>,
  *     markets: Array<{
  *       name: string,
@@ -86,7 +151,7 @@ const {
  *     }>,
  *     quests: Array<{
  *       id: string,
- *       type: 'trade_n' | 'visit_town',
+ *       type: 'trade_n' | 'visit_town' | 'rumor_task',
  *       state: 'offered' | 'accepted' | 'in_progress' | 'completed' | 'cancelled' | 'failed',
  *       town?: string,
  *       offered_at: string,
@@ -137,12 +202,30 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
 }
 
-const QUEST_TYPES = new Set(['trade_n', 'visit_town'])
+const QUEST_TYPES = new Set(['trade_n', 'visit_town', 'rumor_task'])
+const RUMOR_TASK_KINDS = new Set(['rumor_trade', 'rumor_visit', 'rumor_choice'])
 const QUEST_STATES = new Set(['offered', 'accepted', 'in_progress', 'completed', 'cancelled', 'failed'])
 const CLOCK_PHASES = new Set(['day', 'night'])
 const CLOCK_SEASONS = new Set(['dawn', 'long_night'])
 const STORY_FACTION_NAMES = ['iron_pact', 'veil_church']
 const STORY_FACTION_NAME_SET = new Set(STORY_FACTION_NAMES)
+const WORLD_EVENT_TYPES = new Set(['festival', 'shortage', 'omen', 'patrol', 'fog', 'tax_day'])
+const RUMOR_KINDS = new Set(['grounded', 'supernatural', 'political'])
+const DECISION_STATES = new Set(['open', 'chosen', 'expired'])
+const TRAIT_NAMES = ['courage', 'greed', 'faith']
+const TRAIT_NAME_SET = new Set(TRAIT_NAMES)
+const DEFAULT_AGENT_TRAITS = { courage: 1, greed: 1, faith: 1 }
+const MAX_AGENT_TITLE_LEN = 32
+const MAX_AGENT_TITLE_COUNT = 20
+const WORLD_EVENT_MOD_KEYS = new Set([
+  'fear',
+  'unrest',
+  'prosperity',
+  'trade_reward_bonus',
+  'visit_reward_bonus',
+  'iron_pact_rep_bonus',
+  'veil_church_rep_bonus'
+])
 const STORY_FACTION_DEFAULTS = {
   iron_pact: {
     towns: ['alpha'],
@@ -176,6 +259,51 @@ function normalizeAgentRepShape(repInput) {
 }
 
 /**
+ * @param {unknown} traitsInput
+ */
+function normalizeAgentTraitsShape(traitsInput) {
+  const source = (traitsInput && typeof traitsInput === 'object' && !Array.isArray(traitsInput))
+    ? traitsInput
+    : {}
+  const traits = {}
+  for (const traitName of TRAIT_NAMES) {
+    const value = Number(source[traitName])
+    traits[traitName] = Number.isFinite(value)
+      ? clamp(Math.trunc(value), 0, 3)
+      : DEFAULT_AGENT_TRAITS[traitName]
+  }
+  return traits
+}
+
+/**
+ * @param {unknown} titlesInput
+ */
+function normalizeAgentTitlesShape(titlesInput) {
+  const source = Array.isArray(titlesInput) ? titlesInput : []
+  const titles = []
+  const seen = new Set()
+  for (const rawTitle of source) {
+    const title = asText(rawTitle, '', MAX_AGENT_TITLE_LEN)
+    if (!title) continue
+    const key = title.toLowerCase()
+    if (seen.has(key)) continue
+    seen.add(key)
+    titles.push(title)
+    if (titles.length >= MAX_AGENT_TITLE_COUNT) break
+  }
+  return titles
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeRumorsCompletedShape(value) {
+  const count = Number(value)
+  if (!Number.isInteger(count) || count < 0) return 0
+  return count
+}
+
+/**
  * @param {unknown} agentsInput
  */
 function normalizeAgentsShape(agentsInput) {
@@ -189,11 +317,15 @@ function normalizeAgentsShape(agentsInput) {
       continue
     }
     const next = { ...record }
-    if (next.profile && typeof next.profile === 'object' && !Array.isArray(next.profile)) {
-      const profile = { ...next.profile }
-      profile.rep = normalizeAgentRepShape(profile.rep)
-      next.profile = profile
-    }
+    const profileSource = (next.profile && typeof next.profile === 'object' && !Array.isArray(next.profile))
+      ? next.profile
+      : {}
+    const profile = { ...profileSource }
+    profile.rep = normalizeAgentRepShape(profile.rep)
+    profile.traits = normalizeAgentTraitsShape(profile.traits)
+    profile.titles = normalizeAgentTitlesShape(profile.titles)
+    profile.rumors_completed = normalizeRumorsCompletedShape(profile.rumors_completed)
+    next.profile = profile
     agents[name] = next
   }
   return agents
@@ -320,6 +452,300 @@ function normalizeThreatShape(threatInput) {
     byTown[town] = clamp(Math.trunc(value), 0, 100)
   }
   return { byTown }
+}
+
+/**
+ * @param {unknown} moodInput
+ */
+function normalizeMoodTownShape(moodInput) {
+  if (!moodInput || typeof moodInput !== 'object' || Array.isArray(moodInput)) return null
+  const fear = Number(moodInput.fear)
+  const unrest = Number(moodInput.unrest)
+  const prosperity = Number(moodInput.prosperity)
+  const safeFear = Number.isFinite(fear) ? clamp(Math.floor(fear), 0, 100) : 0
+  const safeUnrest = Number.isFinite(unrest) ? clamp(Math.floor(unrest), 0, 100) : 0
+  const safeProsperity = Number.isFinite(prosperity) ? clamp(Math.floor(prosperity), 0, 100) : 0
+  return {
+    fear: safeFear,
+    unrest: safeUnrest,
+    prosperity: safeProsperity
+  }
+}
+
+/**
+ * @param {unknown} moodsInput
+ */
+function normalizeMoodsShape(moodsInput) {
+  const source = (moodsInput && typeof moodsInput === 'object' && !Array.isArray(moodsInput))
+    ? moodsInput
+    : {}
+  const byTownSource = (source.byTown && typeof source.byTown === 'object' && !Array.isArray(source.byTown))
+    ? source.byTown
+    : {}
+  const byTown = {}
+  for (const [townRaw, moodRaw] of Object.entries(byTownSource)) {
+    const town = asText(townRaw, '', 80)
+    if (!town) continue
+    const mood = normalizeMoodTownShape(moodRaw)
+    if (!mood) continue
+    byTown[town] = mood
+  }
+  return { byTown }
+}
+
+/**
+ * @param {unknown} modsInput
+ */
+function normalizeEventModsShape(modsInput) {
+  if (!modsInput || typeof modsInput !== 'object' || Array.isArray(modsInput)) return {}
+  const mods = {}
+  for (const [keyRaw, valueRaw] of Object.entries(modsInput)) {
+    const key = asText(keyRaw, '', 80)
+    if (!key || !WORLD_EVENT_MOD_KEYS.has(key)) continue
+    const value = Number(valueRaw)
+    if (!Number.isFinite(value)) continue
+    const safeValue = Math.trunc(value)
+    if (safeValue === 0) continue
+    mods[key] = safeValue
+  }
+  return mods
+}
+
+/**
+ * @param {unknown} eventInput
+ */
+function normalizeEventShape(eventInput) {
+  if (!eventInput || typeof eventInput !== 'object' || Array.isArray(eventInput)) return null
+  const id = asText(eventInput.id, '', 200)
+  const type = asText(eventInput.type, '', 40).toLowerCase()
+  const town = asText(eventInput.town, '', 80)
+  const startsDay = Number(eventInput.starts_day)
+  const endsDay = Number(eventInput.ends_day)
+  const mods = normalizeEventModsShape(eventInput.mods)
+  if (!id || !town) return null
+  if (!WORLD_EVENT_TYPES.has(type)) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(endsDay) || endsDay < startsDay) return null
+  return {
+    id,
+    type,
+    town,
+    starts_day: startsDay,
+    ends_day: endsDay,
+    mods
+  }
+}
+
+/**
+ * @param {unknown} eventsInput
+ */
+function normalizeEventsShape(eventsInput) {
+  const source = (eventsInput && typeof eventsInput === 'object' && !Array.isArray(eventsInput))
+    ? eventsInput
+    : {}
+  const seed = Number(source.seed)
+  const index = Number(source.index)
+  const active = (Array.isArray(source.active) ? source.active : [])
+    .map(normalizeEventShape)
+    .filter(Boolean)
+  return {
+    seed: Number.isInteger(seed) ? seed : 1337,
+    index: Number.isInteger(index) && index >= 0 ? index : 0,
+    active
+  }
+}
+
+/**
+ * @param {unknown} rumorInput
+ */
+function normalizeRumorShape(rumorInput) {
+  if (!rumorInput || typeof rumorInput !== 'object' || Array.isArray(rumorInput)) return null
+  const id = asText(rumorInput.id, '', 200)
+  const town = asText(rumorInput.town, '', 80)
+  const text = asText(rumorInput.text, '', 240)
+  const kind = asText(rumorInput.kind, '', 20).toLowerCase()
+  const severity = Number(rumorInput.severity)
+  const startsDay = Number(rumorInput.starts_day)
+  const expiresDay = Number(rumorInput.expires_day)
+  const createdAt = Number(rumorInput.created_at)
+  const spawnedByEventId = asText(rumorInput.spawned_by_event_id, '', 200)
+  const resolvedByQuestId = asText(rumorInput.resolved_by_quest_id, '', 200)
+  if (!id || !town || !text) return null
+  if (!RUMOR_KINDS.has(kind)) return null
+  // Rumor sanitize policy: drop entries with invalid severity instead of coercing.
+  if (!Number.isInteger(severity) || severity < 1 || severity > 3) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(expiresDay) || expiresDay < startsDay) return null
+  if (!Number.isFinite(createdAt) || createdAt < 0) return null
+  const rumor = {
+    id,
+    town,
+    text,
+    kind,
+    severity,
+    starts_day: startsDay,
+    expires_day: expiresDay,
+    created_at: createdAt
+  }
+  if (spawnedByEventId) rumor.spawned_by_event_id = spawnedByEventId
+  if (resolvedByQuestId) rumor.resolved_by_quest_id = resolvedByQuestId
+  return rumor
+}
+
+/**
+ * @param {unknown} rumorsInput
+ */
+function normalizeRumorsShape(rumorsInput) {
+  return (Array.isArray(rumorsInput) ? rumorsInput : [])
+    .map(normalizeRumorShape)
+    .filter(Boolean)
+}
+
+/**
+ * @param {unknown} repDeltaInput
+ */
+function normalizeDecisionRepDelta(repDeltaInput) {
+  if (!repDeltaInput || typeof repDeltaInput !== 'object' || Array.isArray(repDeltaInput)) return null
+  const repDelta = {}
+  for (const [factionRaw, valueRaw] of Object.entries(repDeltaInput)) {
+    const faction = asText(factionRaw, '', 80).toLowerCase()
+    const value = Number(valueRaw)
+    if (!faction || !Number.isInteger(value) || value === 0) continue
+    repDelta[faction] = value
+  }
+  return Object.keys(repDelta).length > 0 ? repDelta : null
+}
+
+/**
+ * @param {unknown} rumorSpawnInput
+ */
+function normalizeDecisionRumorSpawn(rumorSpawnInput) {
+  if (!rumorSpawnInput || typeof rumorSpawnInput !== 'object' || Array.isArray(rumorSpawnInput)) return null
+  const kind = asText(rumorSpawnInput.kind, '', 20).toLowerCase()
+  const severity = Number(rumorSpawnInput.severity)
+  const templateKey = asText(rumorSpawnInput.templateKey, '', 80)
+  const expiresInDays = Number(rumorSpawnInput.expiresInDays)
+  if (!RUMOR_KINDS.has(kind)) return null
+  if (!Number.isInteger(severity) || severity < 1 || severity > 3) return null
+  if (!templateKey) return null
+  const rumorSpawn = {
+    kind,
+    severity,
+    templateKey
+  }
+  if (Number.isInteger(expiresInDays) && expiresInDays >= 0) {
+    rumorSpawn.expiresInDays = expiresInDays
+  }
+  return rumorSpawn
+}
+
+/**
+ * @param {unknown} effectsInput
+ */
+function normalizeDecisionEffects(effectsInput) {
+  if (!effectsInput || typeof effectsInput !== 'object' || Array.isArray(effectsInput)) return null
+  const effects = {}
+
+  const moodSource = (effectsInput.mood && typeof effectsInput.mood === 'object' && !Array.isArray(effectsInput.mood))
+    ? effectsInput.mood
+    : null
+  if (moodSource) {
+    const mood = {}
+    for (const key of ['fear', 'unrest', 'prosperity']) {
+      const value = Number(moodSource[key])
+      if (!Number.isInteger(value) || value === 0) continue
+      mood[key] = value
+    }
+    if (Object.keys(mood).length > 0) effects.mood = mood
+  }
+
+  const threatDelta = Number(effectsInput.threat_delta)
+  if (Number.isInteger(threatDelta) && threatDelta !== 0) {
+    effects.threat_delta = threatDelta
+  }
+
+  const repDelta = normalizeDecisionRepDelta(effectsInput.rep_delta)
+  if (repDelta) effects.rep_delta = repDelta
+
+  const rumorSpawn = normalizeDecisionRumorSpawn(effectsInput.rumor_spawn)
+  if (rumorSpawn) effects.rumor_spawn = rumorSpawn
+
+  return Object.keys(effects).length > 0 ? effects : null
+}
+
+/**
+ * @param {unknown} optionInput
+ */
+function normalizeDecisionOption(optionInput) {
+  if (!optionInput || typeof optionInput !== 'object' || Array.isArray(optionInput)) return null
+  const key = asText(optionInput.key, '', 40).toLowerCase()
+  const label = asText(optionInput.label, '', 120)
+  const effects = normalizeDecisionEffects(optionInput.effects)
+  if (!key || !label || !effects) return null
+  return { key, label, effects }
+}
+
+/**
+ * @param {unknown} decisionInput
+ */
+function normalizeDecisionShape(decisionInput) {
+  if (!decisionInput || typeof decisionInput !== 'object' || Array.isArray(decisionInput)) return null
+  const id = asText(decisionInput.id, '', 200)
+  const town = asText(decisionInput.town, '', 80)
+  const eventId = asText(decisionInput.event_id, '', 200)
+  const eventType = asText(decisionInput.event_type, '', 40).toLowerCase()
+  const prompt = asText(decisionInput.prompt, '', 240)
+  const state = asText(decisionInput.state, '', 20).toLowerCase()
+  const chosenKey = asText(decisionInput.chosen_key, '', 40).toLowerCase()
+  const startsDay = Number(decisionInput.starts_day)
+  const expiresDay = Number(decisionInput.expires_day)
+  const createdAt = Number(decisionInput.created_at)
+  if (!id || !town || !eventId || !prompt) return null
+  if (!WORLD_EVENT_TYPES.has(eventType)) return null
+  if (!DECISION_STATES.has(state)) return null
+  if (!Number.isInteger(startsDay) || startsDay < 1) return null
+  if (!Number.isInteger(expiresDay) || expiresDay < startsDay) return null
+  if (!Number.isFinite(createdAt) || createdAt < 0) return null
+
+  const optionsRaw = Array.isArray(decisionInput.options) ? decisionInput.options : []
+  const options = []
+  const optionKeys = new Set()
+  for (const rawOption of optionsRaw) {
+    const option = normalizeDecisionOption(rawOption)
+    if (!option) continue
+    if (optionKeys.has(option.key)) continue
+    optionKeys.add(option.key)
+    options.push(option)
+    if (options.length >= 3) break
+  }
+  if (options.length < 2) return null
+  if (state === 'chosen') {
+    if (!chosenKey || !optionKeys.has(chosenKey)) return null
+  }
+
+  const decision = {
+    id,
+    town,
+    event_id: eventId,
+    event_type: eventType,
+    prompt,
+    options,
+    state,
+    starts_day: startsDay,
+    expires_day: expiresDay,
+    created_at: createdAt
+  }
+  if (chosenKey) decision.chosen_key = chosenKey
+  return decision
+}
+
+/**
+ * @param {unknown} decisionsInput
+ */
+function normalizeDecisionsShape(decisionsInput) {
+  return (Array.isArray(decisionsInput) ? decisionsInput : [])
+    .map(normalizeDecisionShape)
+    .filter(Boolean)
 }
 
 /**
@@ -497,7 +923,7 @@ function normalizeIsoDateText(value) {
 }
 
 /**
- * @param {'trade_n' | 'visit_town'} type
+ * @param {'trade_n' | 'visit_town' | 'rumor_task'} type
  * @param {unknown} objectiveInput
  * @param {unknown} progressInput
  */
@@ -537,6 +963,43 @@ function normalizeQuestObjectiveAndProgress(type, objectiveInput, progressInput)
     }
   }
 
+  if (type === 'rumor_task') {
+    const objectiveKind = asText(objective.kind, '', 20).toLowerCase()
+    const rumorId = asText(objective.rumor_id, '', 200)
+    const rumorTask = asText(objective.rumor_task, '', 20).toLowerCase()
+    if (objectiveKind !== 'rumor_task') return null
+    if (!rumorId || !RUMOR_TASK_KINDS.has(rumorTask)) return null
+    const normalizedObjective = {
+      kind: 'rumor_task',
+      rumor_id: rumorId,
+      rumor_task: rumorTask
+    }
+    if (rumorTask === 'rumor_trade') {
+      const n = Number(objective.n)
+      const market = asText(objective.market, '', 80)
+      const done = Number(progress.done)
+      if (!Number.isInteger(n) || n < 1) return null
+      if (!Number.isInteger(done) || done < 0) return null
+      normalizedObjective.n = n
+      if (market) normalizedObjective.market = market
+      return {
+        objective: normalizedObjective,
+        progress: { done }
+      }
+    }
+    if (rumorTask === 'rumor_visit' || rumorTask === 'rumor_choice') {
+      const town = asText(objective.town, '', 80)
+      if (!town) return null
+      if (typeof progress.visited !== 'boolean') return null
+      normalizedObjective.town = town
+      return {
+        objective: normalizedObjective,
+        progress: { visited: progress.visited }
+      }
+    }
+    return null
+  }
+
   return null
 }
 
@@ -556,6 +1019,7 @@ function normalizeQuestShape(questInput) {
   const title = asText(questInput.title, '', 120)
   const desc = asText(questInput.desc, '', 120)
   const meta = normalizeFeedMetaShape(questInput.meta)
+  const rumorIdRaw = asText(questInput.rumor_id, '', 200)
 
   if (!id) return null
   if (!QUEST_TYPES.has(type)) return null
@@ -578,6 +1042,10 @@ function normalizeQuestShape(questInput) {
     title,
     desc
   }
+  const objectiveRumorId = asText(objectiveProgress.objective?.rumor_id, '', 200)
+  const rumorId = rumorIdRaw || objectiveRumorId
+  if (type === 'rumor_task' && !rumorId) return null
+  if (rumorId) quest.rumor_id = rumorId
   if (town) quest.town = town
   if (acceptedAt) quest.accepted_at = acceptedAt
   if (owner) quest.owner = owner
@@ -616,6 +1084,10 @@ function freshMemoryShape(input) {
       factions: normalizeWorldFactionsShape(source.world?.factions),
       clock: normalizeClockShape(source.world?.clock),
       threat: normalizeThreatShape(source.world?.threat),
+      moods: normalizeMoodsShape(source.world?.moods),
+      events: normalizeEventsShape(source.world?.events),
+      rumors: normalizeRumorsShape(source.world?.rumors),
+      decisions: normalizeDecisionsShape(source.world?.decisions),
       markers: Array.isArray(source.world?.markers)
         ? source.world.markers
           .filter(item => !!item && typeof item === 'object')
@@ -760,6 +1232,44 @@ function validateMemoryIntegritySnapshot(memory) {
           }
         }
       }
+      if (Object.prototype.hasOwnProperty.call(agent.profile, 'traits') && agent.profile.traits !== undefined) {
+        const traits = agent.profile.traits
+        if (!traits || typeof traits !== 'object' || Array.isArray(traits)) {
+          issues.push(`Agent ${name} has invalid traits shape.`)
+        } else {
+          for (const traitName of TRAIT_NAMES) {
+            const value = Number(traits[traitName])
+            if (!Number.isInteger(value) || value < 0 || value > 3) {
+              issues.push(`Agent ${name} trait ${traitName} must be integer in [0..3].`)
+            }
+          }
+          for (const key of Object.keys(traits)) {
+            if (!TRAIT_NAME_SET.has(key)) {
+              issues.push(`Agent ${name} has unknown trait key: ${key}`)
+            }
+          }
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(agent.profile, 'titles') && agent.profile.titles !== undefined) {
+        const titles = agent.profile.titles
+        if (!Array.isArray(titles)) {
+          issues.push(`Agent ${name} titles must be an array.`)
+        } else {
+          if (titles.length > MAX_AGENT_TITLE_COUNT) {
+            issues.push(`Agent ${name} titles exceeds max count ${MAX_AGENT_TITLE_COUNT}.`)
+          }
+          for (const title of titles) {
+            const safeTitle = asText(title, '', MAX_AGENT_TITLE_LEN)
+            if (!safeTitle) issues.push(`Agent ${name} has invalid title value.`)
+          }
+        }
+      }
+      if (Object.prototype.hasOwnProperty.call(agent.profile, 'rumors_completed') && agent.profile.rumors_completed !== undefined) {
+        const rumorsCompleted = Number(agent.profile.rumors_completed)
+        if (!Number.isInteger(rumorsCompleted) || rumorsCompleted < 0) {
+          issues.push(`Agent ${name} rumors_completed must be integer >= 0.`)
+        }
+      }
     }
   }
 
@@ -800,6 +1310,71 @@ function validateMemoryIntegritySnapshot(memory) {
         if (!Number.isInteger(level) || level < 0 || level > 100) {
           issues.push(`world.threat.byTown[${townName || '?'}] must be integer in [0..100].`)
         }
+      }
+    }
+  }
+  if (!world.moods || typeof world.moods !== 'object' || Array.isArray(world.moods)) {
+    issues.push('world.moods must be an object.')
+  } else {
+    const byTown = world.moods.byTown
+    if (!byTown || typeof byTown !== 'object' || Array.isArray(byTown)) {
+      issues.push('world.moods.byTown must be an object.')
+    } else {
+      for (const [townName, mood] of Object.entries(byTown)) {
+        if (!asText(townName, '', 80)) issues.push('world.moods.byTown contains invalid town name.')
+        if (!mood || typeof mood !== 'object' || Array.isArray(mood)) {
+          issues.push(`world.moods.byTown[${townName || '?'}] must be an object.`)
+          continue
+        }
+        const fear = Number(mood.fear)
+        const unrest = Number(mood.unrest)
+        const prosperity = Number(mood.prosperity)
+        if (!Number.isInteger(fear) || fear < 0 || fear > 100) {
+          issues.push(`world.moods.byTown[${townName || '?'}].fear must be integer in [0..100].`)
+        }
+        if (!Number.isInteger(unrest) || unrest < 0 || unrest > 100) {
+          issues.push(`world.moods.byTown[${townName || '?'}].unrest must be integer in [0..100].`)
+        }
+        if (!Number.isInteger(prosperity) || prosperity < 0 || prosperity > 100) {
+          issues.push(`world.moods.byTown[${townName || '?'}].prosperity must be integer in [0..100].`)
+        }
+      }
+    }
+  }
+  if (!world.events || typeof world.events !== 'object' || Array.isArray(world.events)) {
+    issues.push('world.events must be an object.')
+  } else {
+    if (!Number.isInteger(world.events.seed)) {
+      issues.push('world.events.seed must be an integer.')
+    }
+    if (!Number.isInteger(world.events.index) || world.events.index < 0) {
+      issues.push('world.events.index must be integer >= 0.')
+    }
+    if (!Array.isArray(world.events.active)) {
+      issues.push('world.events.active must be an array.')
+    } else {
+      for (const entry of world.events.active) {
+        if (!normalizeEventShape(entry)) {
+          issues.push('world.events.active contains invalid entry.')
+        }
+      }
+    }
+  }
+  if (!Array.isArray(world.rumors)) {
+    issues.push('world.rumors must be an array.')
+  } else {
+    for (const entry of world.rumors) {
+      if (!normalizeRumorShape(entry)) {
+        issues.push('world.rumors contains invalid rumor entry.')
+      }
+    }
+  }
+  if (!Array.isArray(world.decisions)) {
+    issues.push('world.decisions must be an array.')
+  } else {
+    for (const entry of world.decisions) {
+      if (!normalizeDecisionShape(entry)) {
+        issues.push('world.decisions contains invalid decision entry.')
       }
     }
   }

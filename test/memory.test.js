@@ -353,3 +353,233 @@ test('memory store sanitizes additive clock/threat/faction/rep shapes on load', 
   assert.deepEqual(snapshot.agents.Eli.profile.rep, {})
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
+
+test('memory store defaults additive moods/events fields when missing', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({ world: {} }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+  assert.deepEqual(snapshot.world.moods.byTown, {})
+  assert.equal(snapshot.world.events.seed, 1337)
+  assert.equal(snapshot.world.events.index, 0)
+  assert.deepEqual(snapshot.world.events.active, [])
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive moods/events shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      moods: {
+        byTown: {
+          alpha: { fear: 51.9, unrest: -4, prosperity: 120.2 },
+          beta: { fear: 'bad', unrest: 20.8, prosperity: Infinity },
+          broken: 'invalid'
+        }
+      },
+      events: {
+        seed: 'oops',
+        index: -5,
+        active: [
+          {
+            id: 'e-valid-1',
+            type: 'fog',
+            town: 'alpha',
+            starts_day: 2,
+            ends_day: 2,
+            mods: { fear: 3, visit_reward_bonus: 2, ignored: 7 }
+          },
+          {
+            id: 'e-valid-2',
+            type: 'festival',
+            town: 'beta',
+            starts_day: 1,
+            ends_day: 1,
+            mods: { prosperity: 3.9, trade_reward_bonus: 'x' }
+          },
+          {
+            id: 'e-bad-type',
+            type: 'storm',
+            town: 'alpha',
+            starts_day: 1,
+            ends_day: 1,
+            mods: { fear: 2 }
+          },
+          {
+            id: 'e-bad-window',
+            type: 'omen',
+            town: 'alpha',
+            starts_day: 4,
+            ends_day: 3,
+            mods: { fear: 2 }
+          }
+        ]
+      }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.moods.byTown.alpha, { fear: 51, unrest: 0, prosperity: 100 })
+  assert.deepEqual(snapshot.world.moods.byTown.beta, { fear: 0, unrest: 20, prosperity: 0 })
+  assert.equal(Object.prototype.hasOwnProperty.call(snapshot.world.moods.byTown, 'broken'), false)
+
+  assert.equal(snapshot.world.events.seed, 1337)
+  assert.equal(snapshot.world.events.index, 0)
+  assert.equal(snapshot.world.events.active.length, 2)
+  assert.equal(snapshot.world.events.active[0].id, 'e-valid-1')
+  assert.equal(snapshot.world.events.active[0].mods.fear, 3)
+  assert.equal(snapshot.world.events.active[0].mods.visit_reward_bonus, 2)
+  assert.equal(Object.prototype.hasOwnProperty.call(snapshot.world.events.active[0].mods, 'ignored'), false)
+  assert.equal(snapshot.world.events.active[1].id, 'e-valid-2')
+  assert.equal(snapshot.world.events.active[1].mods.prosperity, 3)
+  assert.equal(Object.prototype.hasOwnProperty.call(snapshot.world.events.active[1].mods, 'trade_reward_bonus'), false)
+
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store defaults additive rumors/decisions and trait/title fields when missing', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    agents: {
+      Mara: { profile: {} }
+    },
+    world: {}
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.rumors, [])
+  assert.deepEqual(snapshot.world.decisions, [])
+  assert.deepEqual(snapshot.agents.Mara.profile.traits, { courage: 1, greed: 1, faith: 1 })
+  assert.deepEqual(snapshot.agents.Mara.profile.titles, [])
+  assert.equal(snapshot.agents.Mara.profile.rumors_completed, 0)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive rumors and decisions shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      rumors: [
+        {
+          id: 'r-valid',
+          town: 'alpha',
+          text: 'Fog carries whispers.',
+          kind: 'supernatural',
+          severity: 2,
+          starts_day: 3,
+          expires_day: 4,
+          created_at: 100
+        },
+        {
+          id: 'r-bad-severity',
+          town: 'alpha',
+          text: 'Bad severity',
+          kind: 'grounded',
+          severity: 9,
+          starts_day: 3,
+          expires_day: 4,
+          created_at: 101
+        },
+        {
+          id: '',
+          town: 'alpha',
+          text: 'Bad id',
+          kind: 'grounded',
+          severity: 1,
+          starts_day: 3,
+          expires_day: 4,
+          created_at: 102
+        }
+      ],
+      decisions: [
+        {
+          id: 'd-valid',
+          town: 'alpha',
+          event_id: 'e1',
+          event_type: 'fog',
+          prompt: 'What now?',
+          options: [
+            { key: 'light_beacons', label: 'Light Beacons', effects: { mood: { fear: -1 } } },
+            { key: 'send_scouts', label: 'Send Scouts', effects: { rumor_spawn: { kind: 'supernatural', severity: 2, templateKey: 'mist_shapes' } } },
+            { key: 'send_scouts', label: 'Duplicate', effects: { mood: { unrest: 1 } } },
+            { key: 'stay_inside', label: 'Stay Inside', effects: { threat_delta: -1 } }
+          ],
+          state: 'open',
+          starts_day: 3,
+          expires_day: 3,
+          created_at: 200
+        },
+        {
+          id: 'd-bad',
+          town: 'alpha',
+          event_id: 'e2',
+          event_type: 'fog',
+          prompt: 'Bad options',
+          options: [
+            { key: 'x', label: 'X', effects: null }
+          ],
+          state: 'open',
+          starts_day: 3,
+          expires_day: 3,
+          created_at: 201
+        }
+      ]
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.equal(snapshot.world.rumors.length, 1)
+  assert.equal(snapshot.world.rumors[0].id, 'r-valid')
+  assert.equal(snapshot.world.decisions.length, 1)
+  assert.equal(snapshot.world.decisions[0].id, 'd-valid')
+  assert.equal(snapshot.world.decisions[0].options.length, 3)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive traits/titles/rumors_completed on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    agents: {
+      Mara: {
+        profile: {
+          traits: {
+            courage: 7,
+            greed: 1.8,
+            faith: -2
+          },
+          titles: [
+            'Pact Friend',
+            '',
+            'Pact Friend',
+            'A very very very very very long title'
+          ],
+          rumors_completed: -4
+        }
+      },
+      Eli: {
+        profile: 'invalid'
+      }
+    },
+    world: {}
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.agents.Mara.profile.traits, { courage: 3, greed: 1, faith: 0 })
+  assert.equal(snapshot.agents.Mara.profile.titles.length, 2)
+  assert.equal(snapshot.agents.Mara.profile.titles[0], 'Pact Friend')
+  assert.equal(snapshot.agents.Mara.profile.rumors_completed, 0)
+
+  assert.deepEqual(snapshot.agents.Eli.profile.traits, { courage: 1, greed: 1, faith: 1 })
+  assert.deepEqual(snapshot.agents.Eli.profile.titles, [])
+  assert.equal(snapshot.agents.Eli.profile.rumors_completed, 0)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})

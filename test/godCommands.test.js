@@ -835,6 +835,7 @@ test('town list and town board are read-only', async () => {
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD: town=alpha')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD MARKETS:')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD OFFERS:')))
+  assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD MOOD: town=alpha')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD EVENTS:')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD AGENT: name=Mara') && line.includes('role=guard') && line.includes('home_marker=alpha_hall') && line.includes('balance=9')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD AGENT: name=Eli') && line.includes('role=none') && line.includes('home_marker=-') && line.includes('assigned_at=-') && line.includes('balance=0')))
@@ -1479,6 +1480,7 @@ test('clock/threat/faction/rep read-only commands do not mutate and town board i
   assert.ok(rep.outputLines.some(line => line.includes('GOD REP: agent=Mara')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD CLOCK:')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD THREAT: town=alpha')))
+  assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD MOOD: town=alpha')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD FACTION: town=alpha')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD AGENT: name=Mara') && line.includes('rep_faction=') && line.includes('rep=')))
 })
@@ -1492,6 +1494,11 @@ test('clock advance is transactional and idempotent with deterministic threat up
     agents,
     command: 'mark add alpha_hall 0 64 0 town:alpha',
     operationId: 'clock-advance-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'event seed 1',
+    operationId: 'clock-advance-seed-events'
   })
 
   const advanceA = await service.applyGodCommand({
@@ -1522,12 +1529,14 @@ test('clock advance is transactional and idempotent with deterministic threat up
   assert.equal(snapshotAfterA.world.clock.day, 1)
   assert.equal(snapshotAfterA.world.clock.phase, 'night')
   assert.equal(snapshotAfterA.world.threat.byTown.alpha, 5)
+  assert.equal(snapshotAfterA.world.moods.byTown.alpha.fear, 3)
 
   assert.deepEqual(snapshotAfterReplay, snapshotAfterA)
 
   assert.equal(snapshotAfterB.world.clock.day, 2)
   assert.equal(snapshotAfterB.world.clock.phase, 'day')
   assert.equal(snapshotAfterB.world.threat.byTown.alpha, 2)
+  assert.equal(snapshotAfterB.world.moods.byTown.alpha.fear, 1)
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
@@ -1720,6 +1729,523 @@ test('clock advance narration hooks are replay-safe', async () => {
   assert.equal(afterReplay.world.news.length, afterAdvance.world.news.length)
 })
 
+test('mood commands are read-only and town board includes mood section', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'mood-readonly-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'threat set alpha 12',
+    operationId: 'mood-readonly-seed-threat'
+  })
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+  const moodList = await service.applyGodCommand({
+    agents,
+    command: 'mood list',
+    operationId: 'mood-readonly-list'
+  })
+  const moodShow = await service.applyGodCommand({
+    agents,
+    command: 'mood alpha',
+    operationId: 'mood-readonly-show'
+  })
+  const townBoard = await service.applyGodCommand({
+    agents,
+    command: 'town board alpha 10',
+    operationId: 'mood-readonly-board'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(moodList.applied, true)
+  assert.equal(moodShow.applied, true)
+  assert.equal(townBoard.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.ok(moodList.outputLines.some(line => line.includes('GOD MOOD TOWN: town=alpha')))
+  assert.ok(moodShow.outputLines.some(line => line.includes('GOD MOOD: town=alpha')))
+  assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD MOOD: town=alpha')))
+})
+
+test('trade updates town mood exactly once under replay', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'mood-trade-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'market add bazaar alpha_hall',
+    operationId: 'mood-trade-seed-market'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'offer add bazaar Mara sell 4 2',
+    operationId: 'mood-trade-seed-offer'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mint Eli 20',
+    operationId: 'mood-trade-seed-balance'
+  })
+
+  const offerId = memoryStore.getSnapshot().world.markets[0].offers[0].offer_id
+  const tradeA = await service.applyGodCommand({
+    agents,
+    command: `trade bazaar ${offerId} Eli 1`,
+    operationId: 'mood-trade-a'
+  })
+  const afterA = memoryStore.getSnapshot()
+  const replayA = await service.applyGodCommand({
+    agents,
+    command: `trade bazaar ${offerId} Eli 1`,
+    operationId: 'mood-trade-a'
+  })
+  const afterReplay = memoryStore.getSnapshot()
+
+  assert.equal(tradeA.applied, true)
+  assert.equal(replayA.applied, false)
+  assert.equal(afterA.world.moods.byTown.alpha.prosperity, 1)
+  assert.equal(afterA.world.moods.byTown.alpha.unrest, 0)
+  assert.deepEqual(afterReplay, afterA)
+
+  const tradeB = await service.applyGodCommand({
+    agents,
+    command: `trade bazaar ${offerId} Eli 1`,
+    operationId: 'mood-trade-b'
+  })
+  const afterB = memoryStore.getSnapshot()
+  assert.equal(tradeB.applied, true)
+  assert.equal(afterB.world.moods.byTown.alpha.prosperity, 2)
+  assert.equal(afterB.world.moods.byTown.alpha.unrest, 0)
+})
+
+test('quest completion updates town mood exactly once under replay', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'mood-quest-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'quest offer alpha trade_n 1 0',
+    operationId: 'mood-quest-offer'
+  })
+  const questId = memoryStore.getSnapshot().world.quests[0].id
+  await service.applyGodCommand({
+    agents,
+    command: `quest accept Mara ${questId}`,
+    operationId: 'mood-quest-accept'
+  })
+  await memoryStore.transact((memory) => {
+    const idx = memory.world.quests.findIndex(item => item.id === questId)
+    memory.world.quests[idx].state = 'in_progress'
+    memory.world.quests[idx].progress = { done: 1 }
+  }, { eventId: 'mood-quest-seed-progress' })
+
+  const completeA = await service.applyGodCommand({
+    agents,
+    command: `quest complete ${questId}`,
+    operationId: 'mood-quest-complete-a'
+  })
+  const afterA = memoryStore.getSnapshot()
+  const replayA = await service.applyGodCommand({
+    agents,
+    command: `quest complete ${questId}`,
+    operationId: 'mood-quest-complete-a'
+  })
+  const afterReplay = memoryStore.getSnapshot()
+
+  assert.equal(completeA.applied, true)
+  assert.equal(replayA.applied, false)
+  assert.equal(afterA.world.moods.byTown.alpha.prosperity, 2)
+  assert.equal(afterA.world.moods.byTown.alpha.fear, 0)
+  assert.equal(afterA.world.moods.byTown.alpha.unrest, 0)
+  assert.deepEqual(afterReplay, afterA)
+})
+
+test('mood narration triggers on threshold/label change and is replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'mood-news-seed-town'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.moods = {
+      byTown: {
+        alpha: { fear: 0, unrest: 24, prosperity: 0 }
+      }
+    }
+  }, { eventId: 'mood-news-seed-levels' })
+  await service.applyGodCommand({
+    agents,
+    command: 'quest offer alpha visit_town alpha 0',
+    operationId: 'mood-news-offer'
+  })
+  const questId = memoryStore.getSnapshot().world.quests[0].id
+
+  const before = memoryStore.getSnapshot()
+  const beforeMoodChronicle = before.world.chronicle.filter(entry => entry.type === 'mood').length
+  const beforeMoodNews = before.world.news.filter(entry => entry.msg.includes('Mood:')).length
+
+  const cancelA = await service.applyGodCommand({
+    agents,
+    command: `quest cancel ${questId}`,
+    operationId: 'mood-news-cancel-a'
+  })
+  assert.equal(cancelA.applied, true)
+  const afterA = memoryStore.getSnapshot()
+  const afterMoodChronicle = afterA.world.chronicle.filter(entry => entry.type === 'mood').length
+  const afterMoodNews = afterA.world.news.filter(entry => entry.msg.includes('Mood:')).length
+  assert.ok(afterMoodChronicle > beforeMoodChronicle)
+  assert.ok(afterMoodNews > beforeMoodNews)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: `quest cancel ${questId}`,
+    operationId: 'mood-news-cancel-a'
+  })
+  assert.equal(replay.applied, false)
+  const afterReplay = memoryStore.getSnapshot()
+  assert.equal(
+    afterReplay.world.chronicle.filter(entry => entry.type === 'mood').length,
+    afterMoodChronicle
+  )
+  assert.equal(
+    afterReplay.world.news.filter(entry => entry.msg.includes('Mood:')).length,
+    afterMoodNews
+  )
+})
+
+test('event read-only commands do not mutate state', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-readonly-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'event-readonly-seed-draw'
+  })
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+  const eventList = await service.applyGodCommand({
+    agents,
+    command: 'event list',
+    operationId: 'event-readonly-list'
+  })
+  const eventAlias = await service.applyGodCommand({
+    agents,
+    command: 'event',
+    operationId: 'event-readonly-alias'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(eventList.applied, true)
+  assert.equal(eventAlias.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+})
+
+test('event seed/draw/clear are transactional and idempotent', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-seed-town'
+  })
+
+  const seedA = await service.applyGodCommand({
+    agents,
+    command: 'event seed 999',
+    operationId: 'event-seed-a'
+  })
+  const seedReplay = await service.applyGodCommand({
+    agents,
+    command: 'event seed 999',
+    operationId: 'event-seed-a'
+  })
+  assert.equal(seedA.applied, true)
+  assert.equal(seedReplay.applied, false)
+
+  const drawA = await service.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'event-draw-a'
+  })
+  const drawReplay = await service.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'event-draw-a'
+  })
+  assert.equal(drawA.applied, true)
+  assert.equal(drawReplay.applied, false)
+  const afterDraw = memoryStore.getSnapshot()
+  assert.equal(afterDraw.world.events.seed, 999)
+  assert.equal(afterDraw.world.events.active.length, 1)
+
+  const eventId = afterDraw.world.events.active[0].id
+  const clearA = await service.applyGodCommand({
+    agents,
+    command: `event clear ${eventId}`,
+    operationId: 'event-clear-a'
+  })
+  const clearReplay = await service.applyGodCommand({
+    agents,
+    command: `event clear ${eventId}`,
+    operationId: 'event-clear-a'
+  })
+  assert.equal(clearA.applied, true)
+  assert.equal(clearReplay.applied, false)
+  assert.equal(memoryStore.getSnapshot().world.events.active.length, 0)
+})
+
+test('clock advance auto-draws exactly one event per nightfall and replay is safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-auto-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'event seed 2026',
+    operationId: 'event-auto-seed'
+  })
+
+  const nightA = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'event-auto-a'
+  })
+  assert.equal(nightA.applied, true)
+  const afterNightA = memoryStore.getSnapshot()
+  assert.equal(afterNightA.world.events.index, 1)
+  assert.equal(afterNightA.world.events.active.length, 1)
+  const firstEventId = afterNightA.world.events.active[0].id
+
+  const replayNightA = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'event-auto-a'
+  })
+  assert.equal(replayNightA.applied, false)
+  const afterReplay = memoryStore.getSnapshot()
+  assert.equal(afterReplay.world.events.index, 1)
+  assert.equal(afterReplay.world.events.active.length, 1)
+
+  await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'event-auto-day'
+  })
+  const afterDay = memoryStore.getSnapshot()
+  assert.equal(afterDay.world.clock.phase, 'day')
+  assert.equal(afterDay.world.events.index, 1)
+
+  await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'event-auto-b'
+  })
+  const afterNightB = memoryStore.getSnapshot()
+  assert.equal(afterNightB.world.clock.phase, 'night')
+  assert.equal(afterNightB.world.events.index, 2)
+  assert.equal(afterNightB.world.events.active.length, 1)
+  assert.notEqual(afterNightB.world.events.active[0].id, firstEventId)
+})
+
+test('event draw applies deterministic mood deltas from the drawn card', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-mood-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'event-mood-draw'
+  })
+  const snapshot = memoryStore.getSnapshot()
+  const event = snapshot.world.events.active[0]
+  const mood = snapshot.world.moods.byTown.alpha
+  const mods = event.mods || {}
+  const clamp = value => Math.max(0, Math.min(100, value))
+  assert.equal(mood.fear, clamp(Number(mods.fear || 0)))
+  assert.equal(mood.unrest, clamp(Number(mods.unrest || 0)))
+  assert.equal(mood.prosperity, clamp(Number(mods.prosperity || 0)))
+})
+
+test('quest offer reward bonus applies under active event and not without event', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-reward-seed-town'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.clock = { day: 3, phase: 'day', season: 'dawn', updated_at: '2026-02-22T00:00:00.000Z' }
+    memory.world.events = {
+      seed: 1337,
+      index: 0,
+      active: [
+        {
+          id: 'e-shortage',
+          type: 'shortage',
+          town: 'alpha',
+          starts_day: 3,
+          ends_day: 3,
+          mods: { unrest: 2, trade_reward_bonus: 2 }
+        }
+      ]
+    }
+  }, { eventId: 'event-reward-seed-state' })
+
+  await service.applyGodCommand({
+    agents,
+    command: 'quest offer alpha trade_n 1',
+    operationId: 'event-reward-offer-bonus'
+  })
+  const withBonus = memoryStore.getSnapshot().world.quests[0]
+  assert.equal(withBonus.reward, 10)
+
+  const controlStore = createStore()
+  const controlService = createGodCommandService({ memoryStore: controlStore })
+  await controlService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-reward-control-town'
+  })
+  await controlService.applyGodCommand({
+    agents,
+    command: 'quest offer alpha trade_n 1',
+    operationId: 'event-reward-control-offer'
+  })
+  const withoutBonus = controlStore.getSnapshot().world.quests[0]
+  assert.equal(withoutBonus.reward, 8)
+})
+
+test('quest completion rep bonus applies under omen/patrol and is replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'event-rep-seed-town'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.clock = { day: 2, phase: 'day', season: 'dawn', updated_at: '2026-02-22T00:00:00.000Z' }
+    memory.world.events = {
+      seed: 1337,
+      index: 0,
+      active: [
+        {
+          id: 'e-omen',
+          type: 'omen',
+          town: 'alpha',
+          starts_day: 2,
+          ends_day: 2,
+          mods: { fear: 2, veil_church_rep_bonus: 1 }
+        },
+        {
+          id: 'e-patrol',
+          type: 'patrol',
+          town: 'alpha',
+          starts_day: 2,
+          ends_day: 2,
+          mods: { fear: -1, iron_pact_rep_bonus: 1 }
+        }
+      ]
+    }
+  }, { eventId: 'event-rep-seed-events' })
+
+  await service.applyGodCommand({
+    agents,
+    command: 'quest offer alpha visit_town alpha 0',
+    operationId: 'event-rep-offer'
+  })
+  const questId = memoryStore.getSnapshot().world.quests[0].id
+  await service.applyGodCommand({
+    agents,
+    command: `quest accept Mara ${questId}`,
+    operationId: 'event-rep-accept'
+  })
+
+  const visitA = await service.applyGodCommand({
+    agents,
+    command: `quest visit ${questId}`,
+    operationId: 'event-rep-visit-a'
+  })
+  assert.equal(visitA.applied, true)
+  const afterA = memoryStore.getSnapshot()
+  assert.equal(afterA.agents.Mara.profile.rep.iron_pact, 1)
+  assert.equal(afterA.agents.Mara.profile.rep.veil_church, 1)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: `quest visit ${questId}`,
+    operationId: 'event-rep-visit-a'
+  })
+  assert.equal(replay.applied, false)
+  const afterReplay = memoryStore.getSnapshot()
+  assert.equal(afterReplay.agents.Mara.profile.rep.iron_pact, 1)
+  assert.equal(afterReplay.agents.Mara.profile.rep.veil_church, 1)
+})
+
 test('job runtime side effects execute only after durable commit', async () => {
   const trace = []
   const state = {
@@ -1840,4 +2366,624 @@ test('marker runtime side effects execute only after durable commit', async () =
 
   assert.equal(result.applied, true)
   assert.deepEqual(trace, ['tx_start', 'tx_commit', 'runtime_mark'])
+})
+
+test('rumor list/show are read-only and do not mutate state', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'rumor-readonly-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha grounded 2 missing_goods 2',
+    operationId: 'rumor-readonly-seed-rumor'
+  })
+  const rumorId = memoryStore.getSnapshot().world.rumors[0].id
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+  const listResult = await service.applyGodCommand({
+    agents,
+    command: 'rumor list alpha 5',
+    operationId: 'rumor-readonly-list'
+  })
+  const showResult = await service.applyGodCommand({
+    agents,
+    command: `rumor show ${rumorId}`,
+    operationId: 'rumor-readonly-show'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(listResult.applied, true)
+  assert.equal(showResult.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.ok(listResult.outputLines.some(line => line.includes(`id=${rumorId}`)))
+  assert.ok(showResult.outputLines.some(line => line.includes(`GOD RUMOR SHOW: id=${rumorId}`)))
+})
+
+test('rumor spawn/resolve/clear are transactional and replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'rumor-tx-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'quest offer alpha visit_town alpha 1',
+    operationId: 'rumor-tx-seed-quest'
+  })
+  const questId = memoryStore.getSnapshot().world.quests[0].id
+
+  const spawnA = await service.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha supernatural 2 mist_shapes 2',
+    operationId: 'rumor-tx-spawn-a'
+  })
+  assert.equal(spawnA.applied, true)
+  const afterSpawn = memoryStore.getSnapshot()
+  assert.equal(afterSpawn.world.rumors.length, 1)
+  const rumorId = afterSpawn.world.rumors[0].id
+
+  const spawnReplay = await service.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha supernatural 2 mist_shapes 2',
+    operationId: 'rumor-tx-spawn-a'
+  })
+  assert.equal(spawnReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterSpawn)
+
+  const resolveA = await service.applyGodCommand({
+    agents,
+    command: `rumor resolve ${rumorId} ${questId}`,
+    operationId: 'rumor-tx-resolve-a'
+  })
+  assert.equal(resolveA.applied, true)
+  const afterResolve = memoryStore.getSnapshot()
+  assert.equal(afterResolve.world.rumors[0].resolved_by_quest_id, questId)
+
+  const resolveReplay = await service.applyGodCommand({
+    agents,
+    command: `rumor resolve ${rumorId} ${questId}`,
+    operationId: 'rumor-tx-resolve-a'
+  })
+  assert.equal(resolveReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterResolve)
+
+  const clearA = await service.applyGodCommand({
+    agents,
+    command: `rumor clear ${rumorId}`,
+    operationId: 'rumor-tx-clear-a'
+  })
+  assert.equal(clearA.applied, true)
+  const afterClear = memoryStore.getSnapshot()
+  assert.equal(afterClear.world.rumors.length, 0)
+
+  const clearReplay = await service.applyGodCommand({
+    agents,
+    command: `rumor clear ${rumorId}`,
+    operationId: 'rumor-tx-clear-a'
+  })
+  assert.equal(clearReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterClear)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('rumor expiry occurs inside clock advance and replay is safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'rumor-expire-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha supernatural 2 mist_shapes 0',
+    operationId: 'rumor-expire-seed-rumor'
+  })
+  assert.equal(memoryStore.getSnapshot().world.rumors.length, 1)
+
+  const advanceA = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'rumor-expire-advance-a'
+  })
+  assert.equal(advanceA.applied, true)
+  const afterAdvance = memoryStore.getSnapshot()
+  assert.equal(afterAdvance.world.clock.day, 2)
+  assert.equal(afterAdvance.world.rumors.length, 0)
+
+  const advanceReplay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'rumor-expire-advance-a'
+  })
+  assert.equal(advanceReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterAdvance)
+})
+
+test('rumor quest creation is transactional/idempotent and binds rumor_id', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'rumor-quest-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha political 2 levy_accusations 2',
+    operationId: 'rumor-quest-seed-rumor'
+  })
+  const rumorId = memoryStore.getSnapshot().world.rumors[0].id
+
+  const createA = await service.applyGodCommand({
+    agents,
+    command: `rumor quest ${rumorId}`,
+    operationId: 'rumor-quest-create-a'
+  })
+  assert.equal(createA.applied, true)
+  const afterCreate = memoryStore.getSnapshot()
+  const sideQuests = afterCreate.world.quests.filter(q => q.type === 'rumor_task' && q.rumor_id === rumorId)
+  assert.equal(sideQuests.length, 1)
+  assert.equal(sideQuests[0].meta.side, true)
+
+  const createReplay = await service.applyGodCommand({
+    agents,
+    command: `rumor quest ${rumorId}`,
+    operationId: 'rumor-quest-create-a'
+  })
+  assert.equal(createReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterCreate)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('town board shows main/side quests and open decisions without mutation', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'board-side-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'quest offer alpha visit_town alpha 2',
+    operationId: 'board-side-seed-main-quest'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha supernatural 2 mist_shapes 2',
+    operationId: 'board-side-seed-rumor'
+  })
+  const rumorId = memoryStore.getSnapshot().world.rumors[0].id
+  await seedService.applyGodCommand({
+    agents,
+    command: `rumor quest ${rumorId}`,
+    operationId: 'board-side-seed-side-quest'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'board-side-seed-event'
+  })
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+  const board = await service.applyGodCommand({
+    agents,
+    command: 'town board alpha 10',
+    operationId: 'board-side-readonly'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(board.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD QUESTS MAIN AVAILABLE:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD QUESTS SIDE AVAILABLE:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD DECISIONS OPEN:')))
+})
+
+test('decision list/show are read-only and do not mutate state', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'decision-readonly-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'decision-readonly-seed-event'
+  })
+  const decisionId = memoryStore.getSnapshot().world.decisions[0].id
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+  const list = await service.applyGodCommand({
+    agents,
+    command: 'decision list alpha',
+    operationId: 'decision-readonly-list'
+  })
+  const show = await service.applyGodCommand({
+    agents,
+    command: `decision show ${decisionId}`,
+    operationId: 'decision-readonly-show'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(list.applied, true)
+  assert.equal(show.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.ok(list.outputLines.some(line => line.includes(`id=${decisionId}`)))
+  assert.ok(show.outputLines.some(line => line.includes(`GOD DECISION SHOW: id=${decisionId}`)))
+})
+
+test('nightfall auto-creates one open decision and replay is safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'decision-auto-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'event seed 777',
+    operationId: 'decision-auto-seed-event'
+  })
+
+  const advanceA = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'decision-auto-night-a'
+  })
+  assert.equal(advanceA.applied, true)
+  const afterAdvanceA = memoryStore.getSnapshot()
+  assert.equal(afterAdvanceA.world.clock.phase, 'night')
+  assert.equal(afterAdvanceA.world.events.active.length, 1)
+  assert.equal(afterAdvanceA.world.decisions.length, 1)
+  assert.equal(afterAdvanceA.world.decisions[0].state, 'open')
+  assert.equal(afterAdvanceA.world.decisions[0].event_id, afterAdvanceA.world.events.active[0].id)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'decision-auto-night-a'
+  })
+  assert.equal(replay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterAdvanceA)
+})
+
+test('decision choose applies effects once and replay is safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'decision-choose-seed-town'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.clock = { day: 3, phase: 'day', season: 'dawn', updated_at: '2026-02-22T00:00:00.000Z' }
+    memory.world.threat = { byTown: { alpha: 10 } }
+    memory.world.moods = { byTown: { alpha: { fear: 0, unrest: 0, prosperity: 0 } } }
+    memory.world.decisions = [
+      {
+        id: 'd_choose_alpha',
+        town: 'alpha',
+        event_id: 'e_choose_alpha',
+        event_type: 'shortage',
+        prompt: 'Storehouses are thinning. What policy will the mayor choose?',
+        options: [
+          { key: 'ration', label: 'Ration Bread', effects: { mood: { unrest: 1, prosperity: -1 }, threat_delta: -1 } },
+          { key: 'free_market', label: 'Free Market', effects: { mood: { prosperity: 2, unrest: 1 }, threat_delta: 1 } }
+        ],
+        state: 'open',
+        starts_day: 3,
+        expires_day: 3,
+        created_at: 1000
+      }
+    ]
+  }, { eventId: 'decision-choose-seed-state' })
+
+  const chooseA = await service.applyGodCommand({
+    agents,
+    command: 'decision choose d_choose_alpha ration',
+    operationId: 'decision-choose-a'
+  })
+  assert.equal(chooseA.applied, true)
+  const afterChoose = memoryStore.getSnapshot()
+  assert.equal(afterChoose.world.decisions[0].state, 'chosen')
+  assert.equal(afterChoose.world.decisions[0].chosen_key, 'ration')
+  assert.equal(afterChoose.world.threat.byTown.alpha, 9)
+  assert.equal(afterChoose.world.moods.byTown.alpha.unrest, 1)
+  assert.equal(afterChoose.world.moods.byTown.alpha.prosperity, 0)
+
+  const chooseReplay = await service.applyGodCommand({
+    agents,
+    command: 'decision choose d_choose_alpha ration',
+    operationId: 'decision-choose-a'
+  })
+  assert.equal(chooseReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterChoose)
+})
+
+test('decision choose can spawn rumor and replay does not duplicate it', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'decision-rumor-seed-town'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.clock = { day: 4, phase: 'night', season: 'dawn', updated_at: '2026-02-22T00:00:00.000Z' }
+    memory.world.decisions = [
+      {
+        id: 'd_rumor_alpha',
+        town: 'alpha',
+        event_id: 'e_rumor_alpha',
+        event_type: 'fog',
+        prompt: 'Fog blankets the roads tonight. Which order stands?',
+        options: [
+          { key: 'send_scouts', label: 'Send Scouts', effects: { mood: { fear: 1 }, rumor_spawn: { kind: 'supernatural', severity: 2, templateKey: 'mist_shapes', expiresInDays: 1 } } },
+          { key: 'stay_inside', label: 'Curfew Bells', effects: { mood: { fear: -1 }, threat_delta: -1 } }
+        ],
+        state: 'open',
+        starts_day: 4,
+        expires_day: 4,
+        created_at: 2000
+      }
+    ]
+  }, { eventId: 'decision-rumor-seed-state' })
+
+  const chooseA = await service.applyGodCommand({
+    agents,
+    command: 'decision choose d_rumor_alpha send_scouts',
+    operationId: 'decision-rumor-choose-a'
+  })
+  assert.equal(chooseA.applied, true)
+  const afterChoose = memoryStore.getSnapshot()
+  assert.equal(afterChoose.world.decisions[0].state, 'chosen')
+  assert.equal(afterChoose.world.rumors.length, 1)
+  const rumorId = afterChoose.world.rumors[0].id
+
+  const chooseReplay = await service.applyGodCommand({
+    agents,
+    command: 'decision choose d_rumor_alpha send_scouts',
+    operationId: 'decision-rumor-choose-a'
+  })
+  assert.equal(chooseReplay.applied, false)
+  const afterReplay = memoryStore.getSnapshot()
+  assert.equal(afterReplay.world.rumors.length, 1)
+  assert.equal(afterReplay.world.rumors[0].id, rumorId)
+})
+
+test('trait/title read-only commands do not mutate state', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const before = memoryStore.getSnapshot()
+  const traitShow = await service.applyGodCommand({
+    agents,
+    command: 'trait Mara',
+    operationId: 'trait-readonly-show'
+  })
+  const titleShow = await service.applyGodCommand({
+    agents,
+    command: 'title Mara',
+    operationId: 'title-readonly-show'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(traitShow.applied, true)
+  assert.equal(titleShow.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.ok(traitShow.outputLines.some(line => line.includes('GOD TRAIT: agent=Mara')))
+  assert.ok(titleShow.outputLines.some(line => line.includes('GOD TITLE: agent=Mara')))
+})
+
+test('trait set and title grant/revoke are transactional and idempotent', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  const traitA = await service.applyGodCommand({
+    agents,
+    command: 'trait set Mara courage 3',
+    operationId: 'trait-set-a'
+  })
+  const traitReplay = await service.applyGodCommand({
+    agents,
+    command: 'trait set Mara courage 3',
+    operationId: 'trait-set-a'
+  })
+  assert.equal(traitA.applied, true)
+  assert.equal(traitReplay.applied, false)
+
+  const grantA = await service.applyGodCommand({
+    agents,
+    command: 'title grant Mara Night Watch',
+    operationId: 'title-grant-a'
+  })
+  const grantReplay = await service.applyGodCommand({
+    agents,
+    command: 'title grant Mara Night Watch',
+    operationId: 'title-grant-a'
+  })
+  assert.equal(grantA.applied, true)
+  assert.equal(grantReplay.applied, false)
+
+  const revokeA = await service.applyGodCommand({
+    agents,
+    command: 'title revoke Mara Night Watch',
+    operationId: 'title-revoke-a'
+  })
+  const revokeReplay = await service.applyGodCommand({
+    agents,
+    command: 'title revoke Mara Night Watch',
+    operationId: 'title-revoke-a'
+  })
+  assert.equal(revokeA.applied, true)
+  assert.equal(revokeReplay.applied, false)
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.equal(snapshot.agents.Mara.profile.traits.courage, 3)
+  assert.equal(snapshot.agents.Mara.profile.titles.includes('Night Watch'), false)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('rep threshold title award is replay-safe and emits title news once', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  const repA = await service.applyGodCommand({
+    agents,
+    command: 'rep add Mara iron_pact 5',
+    operationId: 'rep-title-a'
+  })
+  const repReplay = await service.applyGodCommand({
+    agents,
+    command: 'rep add Mara iron_pact 5',
+    operationId: 'rep-title-a'
+  })
+  assert.equal(repA.applied, true)
+  assert.equal(repReplay.applied, false)
+
+  const afterFirst = memoryStore.getSnapshot()
+  const titles = afterFirst.agents.Mara.profile.titles
+  assert.equal(titles.filter(item => item === 'Pact Friend').length, 1)
+  const titleNewsAfterFirst = afterFirst.world.news
+    .filter(entry => entry.topic === 'title' && entry.meta?.title === 'Pact Friend')
+  assert.equal(titleNewsAfterFirst.length, 1)
+
+  const repB = await service.applyGodCommand({
+    agents,
+    command: 'rep add Mara iron_pact 1',
+    operationId: 'rep-title-b'
+  })
+  assert.equal(repB.applied, true)
+  const afterSecond = memoryStore.getSnapshot()
+  assert.equal(afterSecond.agents.Mara.profile.titles.filter(item => item === 'Pact Friend').length, 1)
+  const titleNewsAfterSecond = afterSecond.world.news
+    .filter(entry => entry.topic === 'title' && entry.meta?.title === 'Pact Friend')
+  assert.equal(titleNewsAfterSecond.length, 1)
+})
+
+test('rumor side-quest completion awards Wanderer once and is replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'wanderer-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'rumor spawn alpha supernatural 2 mist_shapes 2',
+    operationId: 'wanderer-seed-rumor'
+  })
+  const rumorId = memoryStore.getSnapshot().world.rumors[0].id
+  await service.applyGodCommand({
+    agents,
+    command: `rumor quest ${rumorId}`,
+    operationId: 'wanderer-seed-quest'
+  })
+  const questId = memoryStore.getSnapshot().world.quests.find(q => q.type === 'rumor_task').id
+  await service.applyGodCommand({
+    agents,
+    command: `quest accept Mara ${questId}`,
+    operationId: 'wanderer-seed-accept'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'trait set Mara courage 1',
+    operationId: 'wanderer-seed-trait'
+  })
+  await memoryStore.transact((memory) => {
+    memory.agents.Mara.profile.rumors_completed = 2
+  }, { eventId: 'wanderer-seed-progress' })
+
+  const visitA = await service.applyGodCommand({
+    agents,
+    command: `quest visit ${questId}`,
+    operationId: 'wanderer-visit-a'
+  })
+  assert.equal(visitA.applied, true)
+  const afterVisit = memoryStore.getSnapshot()
+  assert.equal(afterVisit.agents.Mara.profile.rumors_completed, 3)
+  assert.equal(afterVisit.agents.Mara.profile.titles.filter(item => item === 'Wanderer').length, 1)
+
+  const visitReplay = await service.applyGodCommand({
+    agents,
+    command: `quest visit ${questId}`,
+    operationId: 'wanderer-visit-a'
+  })
+  assert.equal(visitReplay.applied, false)
+  const afterReplay = memoryStore.getSnapshot()
+  assert.equal(afterReplay.agents.Mara.profile.rumors_completed, 3)
+  assert.equal(afterReplay.agents.Mara.profile.titles.filter(item => item === 'Wanderer').length, 1)
+  const wandererNews = afterReplay.world.news
+    .filter(entry => entry.topic === 'title' && entry.meta?.title === 'Wanderer')
+  assert.equal(wandererNews.length, 1)
 })
