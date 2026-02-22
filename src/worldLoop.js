@@ -4,6 +4,8 @@ const { deriveOperationId } = require('./flowControl')
 const { getObservabilitySnapshot } = require('./runtimeMetrics')
 
 const INTENT_TYPES = new Set(['idle', 'wander', 'follow', 'respond'])
+const JOB_ROLES = new Set(['scout', 'guard', 'builder', 'farmer', 'hauler'])
+const REPETITION_BREAK_LIMIT = 10
 const WANDER_DIRECTIONS = ['north', 'east', 'south', 'west']
 const RESPOND_LINES = [
   'Standing by.',
@@ -35,6 +37,30 @@ function asPositiveInt(value, fallback, min = 1) {
 }
 
 /**
+ * @param {unknown} value
+ * @param {boolean} fallback
+ */
+function asBooleanFlag(value, fallback) {
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') return value !== 0
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase()
+    if (!normalized) return false
+    if (normalized === '1' || normalized === 'true' || normalized === 'yes' || normalized === 'on') return true
+    if (normalized === '0' || normalized === 'false' || normalized === 'no' || normalized === 'off') return false
+  }
+  return fallback
+}
+
+/**
+ * @param {unknown} value
+ */
+function asNumber(value) {
+  const n = Number(value)
+  return Number.isFinite(n) ? n : null
+}
+
+/**
  * @param {string} text
  */
 function stableHash(text) {
@@ -44,6 +70,156 @@ function stableHash(text) {
     hash |= 0
   }
   return Math.abs(hash)
+}
+
+/**
+ * @param {unknown} entry
+ */
+function normalizeMarker(entry) {
+  if (!entry || typeof entry !== 'object') return null
+  const name = asText(entry.name, '', 80)
+  const x = asNumber(entry.x)
+  const y = asNumber(entry.y)
+  const z = asNumber(entry.z)
+  if (!name || x === null || y === null || z === null) return null
+  return { name, x, y, z }
+}
+
+/**
+ * @param {any[]} markers
+ */
+function collectMarkers(markers) {
+  return (Array.isArray(markers) ? markers : [])
+    .map(normalizeMarker)
+    .filter(Boolean)
+    .sort((a, b) => a.name.localeCompare(b.name))
+}
+
+/**
+ * @param {ReturnType<typeof collectMarkers>} markers
+ * @param {string | null} markerName
+ */
+function findMarkerByName(markers, markerName) {
+  const target = asText(markerName, '', 80).toLowerCase()
+  if (!target) return null
+  return markers.find(marker => marker.name.toLowerCase() === target) || null
+}
+
+/**
+ * @param {any} agent
+ */
+function hasPendingChat(agent) {
+  if (!agent || typeof agent !== 'object') return false
+  const direct = [
+    agent.pendingPlayerMessage,
+    agent.pendingChatMessage,
+    agent.pendingMessage
+  ]
+  if (direct.some(msg => asText(msg, '', 240))) return true
+  if (Array.isArray(agent.pendingMessages)) {
+    for (const msg of agent.pendingMessages) {
+      if (asText(msg, '', 240)) return true
+    }
+  }
+  return false
+}
+
+/**
+ * @param {ReturnType<typeof normalizeWorldIntent>} worldIntent
+ * @param {number} tickAt
+ * @param {number} maxEventsPerAgentPerMin
+ */
+function canScheduleOnBudget(worldIntent, tickAt, maxEventsPerAgentPerMin) {
+  const minuteBucket = Math.floor(tickAt / 60000)
+  const eventsInMin = worldIntent.budgets.minute_bucket === minuteBucket
+    ? worldIntent.budgets.events_in_min
+    : 0
+  return eventsInMin < maxEventsPerAgentPerMin
+}
+
+/**
+ * @param {string} agentName
+ * @param {number} tickNumber
+ * @param {string | null} leaderName
+ * @param {ReturnType<typeof normalizeWorldIntent>} worldIntent
+ * @param {Record<string, unknown>} profile
+ * @param {ReturnType<typeof collectMarkers>} markers
+ * @param {Map<string, number>} haulerToggleByAgent
+ */
+function pickJobDrivenIntent(agentName, tickNumber, leaderName, worldIntent, profile, markers, haulerToggleByAgent) {
+  const role = asText(profile?.job?.role, '', 20).toLowerCase()
+  if (!JOB_ROLES.has(role)) return null
+  const agentKey = asText(agentName, '', 80).toLowerCase()
+  const homeMarkerName = asText(profile?.job?.home_marker, '', 80) || null
+  const homeMarker = findMarkerByName(markers, homeMarkerName)
+
+  if (role === 'scout') {
+    if (tickNumber % 6 === 0) return { intent: 'respond', target: null, source: 'job:scout_report' }
+    return { intent: 'wander', target: null, source: 'job:scout_wander' }
+  }
+
+  if (role === 'guard') {
+    if (homeMarker) return { intent: 'wander', target: homeMarker.name, source: 'job:guard_patrol' }
+    if (!worldIntent.is_leader && leaderName && leaderName !== agentName) {
+      return { intent: 'follow', target: leaderName, source: 'job:guard_follow' }
+    }
+    return { intent: 'idle', target: null, source: 'job:guard_hold' }
+  }
+
+  if (role === 'builder') {
+    if (homeMarker) return { intent: 'follow', target: homeMarker.name, source: 'job:builder_marker' }
+    return { intent: 'wander', target: null, source: 'job:builder_roam' }
+  }
+
+  if (role === 'farmer') {
+    if (homeMarker) return { intent: 'idle', target: homeMarker.name, source: 'job:farmer_marker' }
+    return { intent: 'wander', target: null, source: 'job:farmer_roam' }
+  }
+
+  if (role === 'hauler') {
+    if (markers.length >= 2) {
+      const idx = Number(haulerToggleByAgent.get(agentKey) || 0) % 2
+      haulerToggleByAgent.set(agentKey, (idx + 1) % 2)
+      const targetMarker = markers[idx]
+      return { intent: 'follow', target: targetMarker.name, source: 'job:hauler_route' }
+    }
+    return { intent: 'wander', target: null, source: 'job:hauler_roam' }
+  }
+
+  return null
+}
+
+/**
+ * @param {Map<string, {key: string, count: number}>} repetitionByAgent
+ * @param {string} agentName
+ * @param {{intent: string, target: string | null, source: string}} planned
+ */
+function applyRepetitionBreaker(repetitionByAgent, agentName, planned) {
+  const agentKey = asText(agentName, '', 80).toLowerCase()
+  if (!agentKey) return { planned, repetitionCount: 0, broke: false }
+
+  const trackedTarget = asText(planned.target, '', 80) || '-'
+  const key = `${planned.intent}|${trackedTarget}`
+  const current = repetitionByAgent.get(agentKey) || { key: '', count: 0 }
+  const nextCount = current.key === key ? (current.count + 1) : 1
+
+  const canBreak = planned.source !== 'frozen'
+    && planned.source !== 'manual_override'
+    && planned.source !== 'pending_chat'
+    && planned.source !== 'budget_guard'
+
+  if (canBreak && nextCount >= REPETITION_BREAK_LIMIT) {
+    repetitionByAgent.set(agentKey, { key: '', count: 0 })
+    const fallbackIntent = planned.intent === 'wander' ? 'idle' : 'wander'
+    return {
+      planned: { intent: fallbackIntent, target: null, source: 'repetition_breaker' },
+      repetitionCount: 0,
+      broke: true
+    }
+  }
+
+  repetitionByAgent.set(agentKey, { key, count: nextCount })
+  return { planned, repetitionCount: nextCount, broke: false }
 }
 
 /**
@@ -201,10 +377,17 @@ function evaluateBackpressure(memoryStore, observability, previousMetrics, previ
  *   clearIntervalFn?: typeof clearInterval,
  *   maxEventsPerAgentPerMin?: number,
  *   maxEventsPerTick?: number,
+ *   townCrierEnabled?: boolean,
+ *   townCrierIntervalMs?: number,
+ *   townCrierMaxPerTick?: number,
+ *   townCrierRecentWindow?: number,
+ *   townCrierDedupeWindow?: number,
+ *   env?: Record<string, string | undefined>,
  *   runtimeActions?: {
- *     onWander?: (input: {agent: any, direction: string, eventId: string, tickNumber: number}) => Promise<void> | void,
+ *     onWander?: (input: {agent: any, direction: string, eventId: string, tickNumber: number, target?: string | null, source?: string}) => Promise<void> | void,
  *     onFollow?: (input: {agent: any, leaderName: string | null, eventId: string, tickNumber: number}) => Promise<void> | void,
- *     onRespond?: (input: {agent: any, message: string, eventId: string, tickNumber: number}) => Promise<void> | void
+ *     onRespond?: (input: {agent: any, message: string, eventId: string, tickNumber: number}) => Promise<void> | void,
+ *     onNews?: (input: {line: string, id: string, msg: string, town: string | null, eventId: string, tickNumber: number}) => Promise<void> | void
  *   },
  *   getObservabilitySnapshotFn?: () => ReturnType<typeof getObservabilitySnapshot>
  * }} deps
@@ -225,9 +408,34 @@ function createWorldLoop(deps) {
   const setIntervalFn = deps.setIntervalFn || setInterval
   const clearIntervalFn = deps.clearIntervalFn || clearInterval
   const runtimeActions = deps.runtimeActions || {}
+  const env = (deps.env && typeof deps.env === 'object') ? deps.env : process.env
   const observe = typeof deps.getObservabilitySnapshotFn === 'function'
     ? deps.getObservabilitySnapshotFn
     : getObservabilitySnapshot
+  const townCrierEnabled = asBooleanFlag(
+    deps.townCrierEnabled,
+    asBooleanFlag(env.TOWN_CRIER_ENABLED, false)
+  )
+  const townCrierIntervalMs = asPositiveInt(
+    deps.townCrierIntervalMs,
+    asPositiveInt(env.TOWN_CRIER_INTERVAL_MS, 15000, 1),
+    1
+  )
+  const townCrierMaxPerTick = asPositiveInt(
+    deps.townCrierMaxPerTick,
+    asPositiveInt(env.TOWN_CRIER_MAX_PER_TICK, 1, 1),
+    1
+  )
+  const townCrierRecentWindow = asPositiveInt(
+    deps.townCrierRecentWindow,
+    asPositiveInt(env.TOWN_CRIER_RECENT_WINDOW, 25, 1),
+    1
+  )
+  const townCrierDedupeWindow = asPositiveInt(
+    deps.townCrierDedupeWindow,
+    asPositiveInt(env.TOWN_CRIER_DEDUPE_WINDOW, 100, 1),
+    1
+  )
 
   let timer = null
   let running = false
@@ -238,12 +446,97 @@ function createWorldLoop(deps) {
   let reason = 'stopped'
   let tickInFlight = false
   let tickNumber = 0
+  let tickDurationTotalMs = 0
+  let tickDurationCount = 0
+  let tickDurationMaxMs = 0
+  let lastTickDurationMs = 0
   let maxEventsPerTick = asPositiveInt(deps.maxEventsPerTick, 0, 0)
   let maxEventsPerAgentPerMin = asPositiveInt(deps.maxEventsPerAgentPerMin, 10, 1)
   /** @type {Record<string, number> | null} */
   let previousMetrics = null
   /** @type {ReturnType<typeof getObservabilitySnapshot> | null} */
   let previousObservability = null
+  /** @type {Map<string, number>} */
+  const haulerToggleByAgent = new Map()
+  /** @type {Map<string, {key: string, count: number}>} */
+  const repetitionByAgent = new Map()
+  /** @type {Map<string, {intent: string | null, target: string | null, repetitionCount: number}>} */
+  const selectedIntentByAgent = new Map()
+  let intentsSelectedTotal = 0
+  let fallbackBreaksTotal = 0
+  /** @type {string[]} */
+  const townCrierDedupeRing = []
+  const townCrierDedupeSet = new Set()
+  let townCrierLastBroadcastAt = 0
+  let townCrierBroadcastsTotal = 0
+
+  function resetTownCrierRuntimeState() {
+    townCrierDedupeRing.length = 0
+    townCrierDedupeSet.clear()
+    townCrierLastBroadcastAt = 0
+  }
+
+  /**
+   * @param {string} newsId
+   */
+  function rememberTownCrierNewsId(newsId) {
+    townCrierDedupeSet.add(newsId)
+    townCrierDedupeRing.push(newsId)
+    if (townCrierDedupeRing.length > townCrierDedupeWindow) {
+      const evicted = townCrierDedupeRing.shift()
+      if (evicted) townCrierDedupeSet.delete(evicted)
+    }
+  }
+
+  /**
+   * @param {number} tickAt
+   * @param {number} tickNo
+   */
+  async function maybeBroadcastTownCrierNews(tickAt, tickNo) {
+    if (!townCrierEnabled || !running) return 0
+    if ((tickAt - townCrierLastBroadcastAt) < townCrierIntervalMs) return 0
+
+    const snapshot = memoryStore.getSnapshot()
+    const news = Array.isArray(snapshot.world?.news) ? snapshot.world.news : []
+    if (news.length === 0) return 0
+
+    const recent = news.slice(-townCrierRecentWindow)
+    /** @type {Array<{id: string, msg: string, town: string | null}>} */
+    const candidates = []
+    for (let idx = recent.length - 1; idx >= 0 && candidates.length < townCrierMaxPerTick; idx -= 1) {
+      const entry = recent[idx]
+      const id = asText(entry?.id, '', 200)
+      const msg = asText(entry?.msg, '', 240)
+      const town = asText(entry?.town, '', 80) || null
+      if (!id || !msg) continue
+      if (townCrierDedupeSet.has(id)) continue
+      candidates.push({ id, msg, town })
+    }
+
+    if (candidates.length === 0) return 0
+
+    for (const candidate of candidates) {
+      const line = candidate.town
+        ? `[NEWS:${candidate.town}] ${candidate.msg}`
+        : `[NEWS] ${candidate.msg}`
+      if (typeof runtimeActions.onNews === 'function') {
+        await runtimeActions.onNews({
+          line,
+          id: candidate.id,
+          msg: candidate.msg,
+          town: candidate.town,
+          eventId: `town_crier:${candidate.id}`,
+          tickNumber: tickNo
+        })
+      } else {
+        logger.info('town_crier_news', { line, newsId: candidate.id, town: candidate.town })
+      }
+      rememberTownCrierNewsId(candidate.id)
+      townCrierBroadcastsTotal += 1
+    }
+    townCrierLastBroadcastAt = tickAt
+    return candidates.length
+  }
 
   function getOnlineAgents() {
     const agents = Array.isArray(getAgents()) ? getAgents() : []
@@ -284,7 +577,10 @@ function createWorldLoop(deps) {
       }
 
       const intent = INTENT_TYPES.has(input.intent) ? input.intent : 'idle'
-      const target = intent === 'follow' ? (asText(input.target, '', 80) || asText(input.leaderName, '', 80) || null) : null
+      const explicitTarget = asText(input.target, '', 80) || null
+      const target = intent === 'follow'
+        ? (explicitTarget || asText(input.leaderName, '', 80) || null)
+        : explicitTarget
 
       budgets.events_in_min += 1
       worldIntent.intent = intent
@@ -307,12 +603,13 @@ function createWorldLoop(deps) {
    * @param {{
    *   applied: boolean,
    *   agentName: string,
-   *   intent: string,
-   *   target: string | null,
-   *   eventId: string
-   * }} committed
-   * @param {{tickNumber: number, leaderName: string | null}} context
-   */
+ *   intent: string,
+ *   target: string | null,
+ *   source?: string,
+ *   eventId: string
+ * }} committed
+ * @param {{tickNumber: number, leaderName: string | null}} context
+ */
   async function applyRuntimeIntent(agent, committed, context) {
     if (!committed.applied) return
     if (committed.intent === 'idle') return
@@ -320,7 +617,14 @@ function createWorldLoop(deps) {
     if (committed.intent === 'wander') {
       const direction = deterministicDirection(committed.agentName, context.tickNumber, committed.eventId)
       if (typeof runtimeActions.onWander === 'function') {
-        await runtimeActions.onWander({ agent, direction, eventId: committed.eventId, tickNumber: context.tickNumber })
+        await runtimeActions.onWander({
+          agent,
+          direction,
+          eventId: committed.eventId,
+          tickNumber: context.tickNumber,
+          target: asText(committed.target, '', 80) || null,
+          source: asText(committed.source, '', 80)
+        })
       }
       return
     }
@@ -346,6 +650,7 @@ function createWorldLoop(deps) {
    */
   async function runTickOnce() {
     const tickAt = now()
+    const tickStartedAt = now()
     lastTickAt = tickAt
 
     if (tickInFlight) {
@@ -388,6 +693,8 @@ function createWorldLoop(deps) {
         const snapshot = memoryStore.getSnapshot()
         const profile = snapshot.agents?.[agentName]?.profile || {}
         const worldIntent = normalizeWorldIntent(profile)
+        const markers = collectMarkers(snapshot.world?.markers)
+        const budgetAllows = canScheduleOnBudget(worldIntent, tickAt, maxEventsPerAgentPerMin)
 
         /** @type {{intent: string, target: string | null, source: string}} */
         let planned
@@ -397,14 +704,41 @@ function createWorldLoop(deps) {
           planned = {
             intent: worldIntent.intent,
             target: worldIntent.intent === 'follow'
-              ? (asText(worldIntent.intent_target, '', 80) || leaderName)
-              : null,
+              ? (asText(worldIntent.intent_target, '', 80) || leaderName || null)
+              : (asText(worldIntent.intent_target, '', 80) || null),
             source: 'manual_override'
           }
+        } else if (hasPendingChat(agent)) {
+          planned = { intent: 'respond', target: null, source: 'pending_chat' }
+        } else if (!budgetAllows) {
+          planned = { intent: 'idle', target: null, source: 'budget_guard' }
         } else {
-          const deterministic = pickDeterministicIntent(agentName, tickNumber, leaderName)
-          planned = { intent: deterministic.intent, target: deterministic.target, source: 'deterministic' }
+          const jobPlan = pickJobDrivenIntent(
+            agentName,
+            tickNumber,
+            leaderName,
+            worldIntent,
+            profile,
+            markers,
+            haulerToggleByAgent
+          )
+          if (jobPlan) {
+            planned = jobPlan
+          } else {
+            const deterministic = pickDeterministicIntent(agentName, tickNumber, leaderName)
+            planned = { intent: deterministic.intent, target: deterministic.target, source: 'deterministic' }
+          }
         }
+
+        const repetition = applyRepetitionBreaker(repetitionByAgent, agentName, planned)
+        planned = repetition.planned
+        if (repetition.broke) fallbackBreaksTotal += 1
+        intentsSelectedTotal += 1
+        selectedIntentByAgent.set(agentName.toLowerCase(), {
+          intent: planned.intent,
+          target: asText(planned.target, '', 80) || null,
+          repetitionCount: repetition.repetitionCount
+        })
 
         const opId = deriveOperationId(
           ['world_loop', tickNumber, agentName, planned.intent, planned.target || 'none'],
@@ -428,12 +762,21 @@ function createWorldLoop(deps) {
       }
 
       scheduledCount = scheduled
+      await maybeBroadcastTownCrierNews(tickAt, tickNumber)
+      lastTickDurationMs = now() - tickStartedAt
+      tickDurationTotalMs += lastTickDurationMs
+      tickDurationCount += 1
+      tickDurationMaxMs = Math.max(tickDurationMaxMs, lastTickDurationMs)
       return { scheduled, backpressure, reason }
     } catch (err) {
       backpressure = true
       reason = 'tick_error'
       logger.errorWithStack('world_loop_tick_failed', err, { tickNumber })
       scheduledCount = 0
+      lastTickDurationMs = now() - tickStartedAt
+      tickDurationTotalMs += lastTickDurationMs
+      tickDurationCount += 1
+      tickDurationMaxMs = Math.max(tickDurationMaxMs, lastTickDurationMs)
       return { scheduled: 0, backpressure, reason }
     } finally {
       tickInFlight = false
@@ -455,6 +798,7 @@ function createWorldLoop(deps) {
     if (running) return getWorldLoopStatus()
 
     running = true
+    resetTownCrierRuntimeState()
     reason = 'running'
     timer = setIntervalFn(() => {
       void runTickOnce()
@@ -469,6 +813,7 @@ function createWorldLoop(deps) {
       timer = null
     }
     running = false
+    resetTownCrierRuntimeState()
     backpressure = false
     reason = 'stopped'
     return getWorldLoopStatus()
@@ -480,8 +825,38 @@ function createWorldLoop(deps) {
       tickMs,
       lastTickAt,
       scheduledCount,
+      intentsSelectedTotal,
+      fallbackBreaksTotal,
+      tickCount: tickDurationCount,
+      lastTickDurationMs,
+      avgTickDurationMs: tickDurationCount > 0 ? (tickDurationTotalMs / tickDurationCount) : 0,
+      maxTickDurationMs: tickDurationMaxMs,
+      townCrierEnabled,
+      townCrierActive: townCrierEnabled && running,
+      townCrierIntervalMs,
+      townCrierMaxPerTick,
+      townCrierRecentWindow,
+      townCrierDedupeWindow,
+      townCrierDedupeSize: townCrierDedupeRing.length,
+      townCrierBroadcastsTotal,
+      townCrierLastBroadcastAt,
       backpressure,
       reason
+    }
+  }
+
+  /**
+   * @param {string} agentName
+   */
+  function getAgentRuntimeState(agentName) {
+    const key = asText(agentName, '', 80).toLowerCase()
+    if (!key) return { repetitionCount: 0, selectedIntent: null, selectedTarget: null }
+    const selected = selectedIntentByAgent.get(key)
+    const repetition = repetitionByAgent.get(key)
+    return {
+      repetitionCount: Number(selected?.repetitionCount ?? repetition?.count ?? 0),
+      selectedIntent: selected?.intent || null,
+      selectedTarget: selected?.target || null
     }
   }
 
@@ -489,6 +864,7 @@ function createWorldLoop(deps) {
     startWorldLoop,
     stopWorldLoop,
     getWorldLoopStatus,
+    getAgentRuntimeState,
     runTickOnce
   }
 }

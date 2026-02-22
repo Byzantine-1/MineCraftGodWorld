@@ -118,6 +118,9 @@ const worldLoop = createWorldLoop({
     },
     onRespond: ({ agent, message }) => {
       writeLine(`${agent.name}: ${message}`)
+    },
+    onNews: ({ line }) => {
+      writeLine(line)
     }
   }
 })
