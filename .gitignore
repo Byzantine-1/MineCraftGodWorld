@@ -4,3 +4,4 @@ memory.json.lock
 *.tmp
 .env
 coverage/
+playtest-logs/

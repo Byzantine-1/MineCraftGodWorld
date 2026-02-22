@@ -1,0 +1,72 @@
+mara ping 001
+eli ping 002!
+nox ping 003?
+mara   ping   004
+eli route-check alpha_hall 005
+nox punctuation !!! ??? ### 006
+mara punctuation ;;; ::: ,,, 007
+eli punctuation (( )) [[ ]] 008
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 009
+mara mixed alpha-beta_gamma.010
+eli final-check 011
+nox ping 012...
+mara ping 013
+eli ping 014!
+nox ping 015?
+mara   ping   016
+eli route-check alpha_hall 017
+nox punctuation !!! ??? ### 018
+mara punctuation ;;; ::: ,,, 019
+eli punctuation (( )) [[ ]] 020
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 021
+mara mixed alpha-beta_gamma.022
+eli final-check 023
+nox ping 024...
+mara ping 025
+eli ping 026!
+nox ping 027?
+mara   ping   028
+eli route-check alpha_hall 029
+nox punctuation !!! ??? ### 030
+mara punctuation ;;; ::: ,,, 031
+eli punctuation (( )) [[ ]] 032
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 033
+mara mixed alpha-beta_gamma.034
+eli final-check 035
+nox ping 036...
+mara ping 037
+eli ping 038!
+nox ping 039?
+mara   ping   040
+eli route-check alpha_hall 041
+nox punctuation !!! ??? ### 042
+mara punctuation ;;; ::: ,,, 043
+eli punctuation (( )) [[ ]] 044
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 045
+mara mixed alpha-beta_gamma.046
+eli final-check 047
+nox ping 048...
+mara ping 049
+eli ping 050!
+nox ping 051?
+mara   ping   052
+eli route-check alpha_hall 053
+nox punctuation !!! ??? ### 054
+mara punctuation ;;; ::: ,,, 055
+eli punctuation (( )) [[ ]] 056
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 057
+mara mixed alpha-beta_gamma.058
+eli final-check 059
+nox ping 060...
+mara ping 061
+eli ping 062!
+nox ping 063?
+mara   ping   064
+eli route-check alpha_hall 065
+nox punctuation !!! ??? ### 066
+mara punctuation ;;; ::: ,,, 067
+eli punctuation (( )) [[ ]] 068
+nox long xxxxxxxxxxxxxxxxxxxxxxxx 069
+mara mixed alpha-beta_gamma.070
+eli final-check 071
+nox ping 072...

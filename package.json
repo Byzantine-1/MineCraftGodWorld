@@ -1,4 +1,4 @@
-﻿{
+{
   "name": "minecraft-god-mvp",
   "version": "1.0.0",
   "main": "src/index.js",
@@ -11,6 +11,8 @@
     "stress": "node ./scripts/stressTest.js",
     "scale": "node ./scripts/scaleValidation.js",
     "bots": "node ./src/minecraftBridge.js",
+    "playtest:bots": "powershell -ExecutionPolicy Bypass -File ./scripts/playtestBots.ps1",
+    "gen:macro": "node ./scripts/genPlaytestMacro.js",
     "cli": "node ./src/index.js"
   },
   "keywords": [],
@@ -19,7 +21,8 @@
   "description": "",
   "dependencies": {
     "dotenv": "^17.2.4",
-    "mineflayer": "^4.34.0",
+    "minecraft-data": "^3.105.0",
+    "mineflayer": "^4.35.0",
     "mineflayer-pathfinder": "^2.4.5",
     "openai": "^6.18.0"
   }
