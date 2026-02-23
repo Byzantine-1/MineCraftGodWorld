@@ -39,27 +39,27 @@ const EVENT_MOD_KEYS = new Set([
 const EVENT_DECK = ['festival', 'shortage', 'omen', 'patrol', 'fog', 'tax_day']
 const EVENT_TYPE_CONFIG = {
   festival: {
-    title: 'Festival lights warm the market square.',
+    title: 'Festival stalls glow and caravan bells crowd the square.',
     mods: { prosperity: 3, trade_reward_bonus: 1 }
   },
   shortage: {
-    title: 'Storehouses thin and tempers fray.',
+    title: 'Bread shelves run thin and traders race vanishing stock.',
     mods: { unrest: 2, trade_reward_bonus: 2 }
   },
   omen: {
-    title: 'An omen passes over the steeples.',
+    title: 'An omen rides above the steeples and prices turn wary.',
     mods: { fear: 2, veil_church_rep_bonus: 1 }
   },
   patrol: {
-    title: 'Iron patrols sweep the roads.',
+    title: 'Iron patrols sweep caravan lanes and tighten checkpoints.',
     mods: { fear: -1, iron_pact_rep_bonus: 1 }
   },
   fog: {
-    title: 'Thick fog swallows the crossroads.',
+    title: 'Fog eats the crossroads and late caravans miss the bells.',
     mods: { fear: 3, visit_reward_bonus: 2 }
   },
   tax_day: {
-    title: 'Tax day rattles every door.',
+    title: 'Tax ledgers slam shut and stallkeepers hide their coin.',
     mods: { unrest: 2 }
   }
 }
@@ -88,6 +88,14 @@ const RUMOR_TEMPLATE_LIBRARY = {
     dock_counts: {
       day: 'Porters in {town} whisper of carts that arrive half-empty.',
       night: 'Footsteps fade at the docks of {town}; inventories never add up.'
+    },
+    old_well_east: {
+      day: 'An old well east of {town} glints with dropped coin before noon.',
+      night: 'Past the east well of {town}, hush traders swap supplies by lamp.'
+    },
+    ridge_tracks: {
+      day: 'Fresh caravan tracks veer toward the ridge north of {town}; profit may follow.',
+      night: 'Ridge tracks north of {town} end in churned mud and snapped rope.'
     }
   },
   supernatural: {
@@ -98,6 +106,14 @@ const RUMOR_TEMPLATE_LIBRARY = {
     relic_prophecy: {
       day: 'A market elder in {town} mutters that an old relic has awakened.',
       night: 'In {town}, a cracked bell rings alone when no hand is near.'
+    },
+    birch_line_lights: {
+      day: 'Near the birch line west of {town}, blue soot marks a hidden fire ring.',
+      night: 'Blue lights drift near the birch line west of {town}; escorts sell out fast.'
+    },
+    ridge_footsteps: {
+      day: 'Hunters by {town} report prints on the ridge that point nowhere.',
+      night: 'Footsteps circle the ridge above {town}, always one lantern-length away.'
     }
   },
   political: {
@@ -108,18 +124,196 @@ const RUMOR_TEMPLATE_LIBRARY = {
     guild_blame: {
       day: 'Merchants in {town} whisper that guild books hide a second ledger.',
       night: 'In {town}, quiet voices name rivals as traitors to the commons.'
+    },
+    caravan_manifest: {
+      day: 'A torn caravan manifest in {town} points to unpaid crates at the south bridge.',
+      night: 'At the south bridge of {town}, guards argue over missing manifests.'
+    },
+    toll_bridge_books: {
+      day: 'Ledger boys in {town} whisper that toll books were rewritten at dawn.',
+      night: 'Near the toll gate of {town}, ink-stained pages trade hands in the dark.'
     }
   }
 }
 const EVENT_TO_AUTO_RUMOR = {
-  shortage: { kind: 'grounded', templateKey: 'missing_goods', severity: 2, expiresInDays: 2 },
-  fog: { kind: 'supernatural', templateKey: 'mist_shapes', severity: 2, expiresInDays: 2 },
-  omen: { kind: 'supernatural', templateKey: 'relic_prophecy', severity: 3, expiresInDays: 3 },
-  tax_day: { kind: 'political', templateKey: 'levy_accusations', severity: 2, expiresInDays: 2 }
+  shortage: {
+    kind: 'grounded',
+    templateKey: 'missing_goods',
+    templateKeys: ['missing_goods', 'dock_counts', 'old_well_east', 'ridge_tracks'],
+    severity: 2,
+    expiresInDays: 2
+  },
+  fog: {
+    kind: 'supernatural',
+    templateKey: 'mist_shapes',
+    templateKeys: ['mist_shapes', 'birch_line_lights', 'ridge_footsteps'],
+    severity: 2,
+    expiresInDays: 2
+  },
+  omen: {
+    kind: 'supernatural',
+    templateKey: 'relic_prophecy',
+    templateKeys: ['relic_prophecy', 'birch_line_lights'],
+    severity: 3,
+    expiresInDays: 3
+  },
+  tax_day: {
+    kind: 'political',
+    templateKey: 'levy_accusations',
+    templateKeys: ['levy_accusations', 'guild_blame', 'caravan_manifest', 'toll_bridge_books'],
+    severity: 2,
+    expiresInDays: 2
+  }
 }
+const MARKET_GOODS = ['bread', 'iron', 'timber', 'wool', 'lantern_oil', 'herbs']
+const MARKET_GOOD_LABELS = {
+  bread: 'Bread',
+  iron: 'Iron',
+  timber: 'Timber',
+  wool: 'Wool',
+  lantern_oil: 'Lantern Oil',
+  herbs: 'Herbs'
+}
+const EVENT_MARKET_SIGNALS = {
+  festival: { hot: ['wool', 'herbs'], cold: ['iron'] },
+  shortage: { hot: ['bread', 'lantern_oil'], cold: ['wool'] },
+  omen: { hot: ['lantern_oil', 'iron'], cold: ['herbs'] },
+  patrol: { hot: ['iron', 'timber'], cold: ['wool'] },
+  fog: { hot: ['lantern_oil', 'bread'], cold: ['timber'] },
+  tax_day: { hot: ['bread'], cold: ['wool', 'herbs'] }
+}
+const MARKET_DAY_SIGNALS = [
+  { hot: ['timber', 'bread'], cold: ['wool'], tag: 'builders queue at dawn stalls' },
+  { hot: ['iron', 'lantern_oil'], cold: ['herbs'], tag: 'night escorts refill kit packs' },
+  { hot: ['herbs', 'bread'], cold: ['iron'], tag: 'camp kitchens pay for quick stock' },
+  { hot: ['wool', 'herbs'], cold: ['timber'], tag: 'travelers barter for comfort bundles' },
+  { hot: ['iron', 'timber'], cold: ['bread'], tag: 'ridge repairs drain tool benches' },
+  { hot: ['lantern_oil', 'bread'], cold: ['wool'], tag: 'fog watch posts buy short-run goods' }
+]
+const CONTRACT_MAX_PER_TOWN_PER_DAY = 2
+const CONTRACT_REWARD_MIN = 1
+const CONTRACT_REWARD_MAX = 12
+const CONTRACT_TRADE_TEMPLATES = [
+  {
+    id: 'bread_basket',
+    kind: 'contract_supply',
+    title: 'CONTRACT: Bread Basket',
+    good: 'bread',
+    tradeN: 1,
+    rewardBase: 2,
+    dayFlavor: 'Bring warm loaves before noon bells.',
+    nightFlavor: 'Stock bread for night shifts before gates close.'
+  },
+  {
+    id: 'iron_run',
+    kind: 'contract_trade',
+    title: 'CONTRACT: Iron Run',
+    good: 'iron',
+    tradeN: 2,
+    rewardBase: 3,
+    dayFlavor: 'Move iron lots while forge crews are awake.',
+    nightFlavor: 'Move iron under escort; roads are tense.'
+  },
+  {
+    id: 'stone_shipment',
+    kind: 'contract_supply',
+    title: 'CONTRACT: Stone Shipment',
+    good: 'timber',
+    tradeN: 2,
+    rewardBase: 3,
+    dayFlavor: 'Push stone-and-timber loads to active build sites.',
+    nightFlavor: 'Deliver build stock before lantern curfew.'
+  },
+  {
+    id: 'wood_planks',
+    kind: 'contract_supply',
+    title: 'CONTRACT: Wood Planks',
+    good: 'timber',
+    tradeN: 1,
+    rewardBase: 2,
+    dayFlavor: 'Bring planks for scaffolds and roof repairs.',
+    nightFlavor: 'Bring planks early; crews shut down after dusk.'
+  },
+  {
+    id: 'lantern_supply',
+    kind: 'contract_supply',
+    title: 'CONTRACT: Lantern Supply',
+    good: 'lantern_oil',
+    tradeN: 2,
+    rewardBase: 4,
+    dayFlavor: 'Fill lantern stocks for market watch routes.',
+    nightFlavor: 'Top up lamp oil now; dark roads pay best.'
+  },
+  {
+    id: 'coal_run',
+    kind: 'contract_trade',
+    title: 'CONTRACT: Coal Run',
+    good: 'iron',
+    tradeN: 2,
+    rewardBase: 4,
+    dayFlavor: 'Fuel forge lines before caravan dispatch.',
+    nightFlavor: 'Rush fuel lots under guard patrols.'
+  },
+  {
+    id: 'herb_satchel',
+    kind: 'contract_supply',
+    title: 'CONTRACT: Herb Satchel',
+    good: 'herbs',
+    tradeN: 1,
+    rewardBase: 2,
+    dayFlavor: 'Bring herb bundles to cooks and healers.',
+    nightFlavor: 'Bring herbs before fog rolls through alleys.'
+  },
+  {
+    id: 'wool_fair',
+    kind: 'contract_trade',
+    title: 'CONTRACT: Wool Fair',
+    good: 'wool',
+    tradeN: 1,
+    rewardBase: 2,
+    dayFlavor: 'Restock wool stalls before caravan crowds land.',
+    nightFlavor: 'Move wool quickly; festival trade cools after dark.'
+  }
+]
+const CONTRACT_ROUTE_TEMPLATES = [
+  {
+    id: 'scout_run',
+    kind: 'contract_delivery',
+    title: 'CONTRACT: Scout Run',
+    rewardBase: 3,
+    dayFlavor: 'Scout the lane and deliver route papers.',
+    nightFlavor: 'Scout lantern posts and deliver sealed papers.'
+  },
+  {
+    id: 'ridge_route',
+    kind: 'contract_delivery',
+    title: 'CONTRACT: Ridge Route',
+    rewardBase: 4,
+    dayFlavor: 'Run ridge permits before convoy departure.',
+    nightFlavor: 'Run ridge permits with extra caution after dusk.'
+  },
+  {
+    id: 'caravan_relay',
+    kind: 'contract_delivery',
+    title: 'CONTRACT: Caravan Relay',
+    rewardBase: 3,
+    dayFlavor: 'Relay manifests between town gates.',
+    nightFlavor: 'Relay manifests by lantern and avoid blind turns.'
+  },
+  {
+    id: 'lantern_patrol',
+    kind: 'contract_delivery',
+    title: 'CONTRACT: Lantern Patrol',
+    rewardBase: 4,
+    dayFlavor: 'Map safe lantern stops on the route.',
+    nightFlavor: 'Map dark gaps and escort points on the route.'
+  }
+]
+const NIGHT_TROUBLE_LANDMARKS = ['east well', 'north ridge', 'birch line', 'south bridge', 'old toll gate']
+const DECISION_DEPRECATION_NOTE = 'Deprecated in Trader Mode: decisions are no longer generated; use Contracts + Market Pulse.'
 const DECISION_TEMPLATE_BY_EVENT = {
   shortage: {
-    prompt: 'Storehouses are thinning. What policy will the mayor choose?',
+    prompt: 'Storehouses are thinning. Which trader route gets priority?',
     options: [
       { key: 'ration', label: 'Ration Bread', effects: { mood: { unrest: 1, prosperity: -1 }, threat_delta: -1 } },
       { key: 'import', label: 'Hire Caravans', effects: { mood: { prosperity: 1 }, threat_delta: -1, rumor_spawn: { kind: 'grounded', severity: 1, templateKey: 'dock_counts', expiresInDays: 1 } } },
@@ -135,7 +329,7 @@ const DECISION_TEMPLATE_BY_EVENT = {
     ]
   },
   omen: {
-    prompt: 'An omen shadows the steeples. How should the mayor respond?',
+    prompt: 'An omen shadows the steeples. How should traders respond?',
     options: [
       { key: 'heed_omens', label: 'Heed Omens', effects: { mood: { fear: -1 }, rep_delta: { veil_church: 1 }, rumor_spawn: { kind: 'supernatural', severity: 2, templateKey: 'relic_prophecy', expiresInDays: 1 } } },
       { key: 'denounce', label: 'Denounce Fear', effects: { mood: { unrest: 1, fear: -1 }, rep_delta: { veil_church: -1 } } },
@@ -159,7 +353,7 @@ const DECISION_TEMPLATE_BY_EVENT = {
     ]
   },
   tax_day: {
-    prompt: 'Tax ledgers spark unrest. What decree will the mayor sign?',
+    prompt: 'Tax ledgers spark unrest. Which trader plan goes out?',
     options: [
       { key: 'relief', label: 'Grant Relief', effects: { mood: { unrest: -2, prosperity: -1 }, threat_delta: -1 } },
       { key: 'enforce', label: 'Enforce Collections', effects: { mood: { unrest: 1, prosperity: 1 }, threat_delta: 1 } },
@@ -1467,7 +1661,7 @@ function createDecisionForEvent(memory, event, input) {
     created_at: at
   }
   decisions.push(decision)
-  const message = `[${normalizedEvent.town}] MAYOR DECISION: ${decision.prompt}`
+  const message = `[${normalizedEvent.town}] LEGACY DECISION: ${decision.prompt}`
   appendChronicle(memory, {
     id: `${idPrefix}:chronicle:decision_open:${decision.id.toLowerCase()}`,
     type: 'decision_open',
@@ -1535,6 +1729,591 @@ function sumEventModifier(events, key) {
     total += Number(mods[key] || 0)
   }
   return total
+}
+
+/**
+ * @param {number} level
+ */
+function deriveThreatBand(level) {
+  const safe = clamp(Math.trunc(Number(level) || 0), 0, 100)
+  if (safe >= 80) return 'extreme'
+  if (safe >= 55) return 'high'
+  if (safe >= 30) return 'moderate'
+  return 'low'
+}
+
+/**
+ * @param {string} good
+ */
+function toMarketGoodLabel(good) {
+  return MARKET_GOOD_LABELS[good] || good
+}
+
+/**
+ * @param {string} goodLabel
+ */
+function toMarketGoodKey(goodLabel) {
+  const key = asText(goodLabel, '', 40).toLowerCase().replace(/\s+/g, '_')
+  return MARKET_GOODS.includes(key) ? key : ''
+}
+
+/**
+ * @param {number} score
+ */
+function toPulseMultiplierHint(score) {
+  const safe = Number(score || 0)
+  if (safe >= 6) return 'x1.8'
+  if (safe >= 4) return 'x1.5'
+  if (safe >= 2) return 'x1.2'
+  return 'x1.1'
+}
+
+/**
+ * @param {Map<string, {score: number, tags: Set<string>}>} scoreByGood
+ * @param {string} good
+ * @param {number} delta
+ * @param {string} tag
+ */
+function applyMarketSignal(scoreByGood, good, delta, tag) {
+  const safeGood = asText(good, '', 40).toLowerCase()
+  if (!safeGood || !scoreByGood.has(safeGood)) return
+  const entry = scoreByGood.get(safeGood)
+  entry.score += Number(delta || 0)
+  if (tag) entry.tags.add(asText(tag, '', 80))
+}
+
+/**
+ * @param {Set<string>} tags
+ * @param {string} fallback
+ */
+function summarizePulseReason(tags, fallback) {
+  const items = Array.from(tags || [])
+    .map(tag => asText(tag, '', 80))
+    .filter(Boolean)
+    .slice(0, 2)
+  if (items.length === 0) return fallback
+  return items.join(' + ')
+}
+
+/**
+ * @param {'hot' | 'cold'} kind
+ * @param {string} goodLabel
+ * @param {string} reason
+ */
+function toActionablePulseReason(kind, goodLabel, reason) {
+  const safeGoodLabel = asText(goodLabel, 'goods', 40)
+  const safeReason = asText(reason, '', 140)
+  if (kind === 'hot') {
+    return asText(`Bring ${safeGoodLabel} now; ${safeReason || 'stalls are bidding hard'}.`, `Bring ${safeGoodLabel} now.`, 180)
+  }
+  return asText(`Hold ${safeGoodLabel} stock; ${safeReason || 'buyers are thin right now'}.`, `Hold ${safeGoodLabel} stock for now.`, 180)
+}
+
+/**
+ * @param {string} townName
+ * @param {number} day
+ * @param {string} season
+ */
+function pickMarketDaySignal(townName, day, season) {
+  if (!Array.isArray(MARKET_DAY_SIGNALS) || MARKET_DAY_SIGNALS.length === 0) return null
+  const idx = stableHashNumber(`${townName}:${day}:${season}:market_day_signal`) % MARKET_DAY_SIGNALS.length
+  return MARKET_DAY_SIGNALS[idx] || null
+}
+
+/**
+ * @param {number} level
+ */
+function toCaravanTroubleChance(level) {
+  const band = deriveThreatBand(level)
+  if (band === 'extreme') return 60
+  if (band === 'high') return 38
+  if (band === 'moderate') return 18
+  return 6
+}
+
+/**
+ * @param {string} townName
+ * @param {number} level
+ * @param {number} day
+ * @param {string} season
+ */
+function shouldEmitCaravanTrouble(townName, level, day, season) {
+  const chance = toCaravanTroubleChance(level)
+  const roll = stableHashNumber(`${townName}:${day}:${season}:caravan_trouble`) % 100
+  return roll < chance
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function getRouteRisk(townName, world) {
+  const resolvedTown = resolveTownName(world, townName) || asText(townName, '-', 80) || '-'
+  const clock = normalizeWorldClock(world?.clock)
+  const threat = normalizeWorldThreat(world?.threat)
+  const moods = normalizeWorldMoods(world?.moods)
+  const mood = normalizeTownMood(moods.byTown[resolvedTown]) || freshTownMood()
+  const threatLevel = clamp(Math.trunc(Number(threat.byTown[resolvedTown] || 0)), 0, 100)
+  const seasonBonus = clock.season === 'long_night' ? 10 : 0
+  const phaseBonus = clock.phase === 'night' ? 15 : 0
+  const fearWeight = Math.trunc(mood.fear / 2)
+  const score = clamp(threatLevel + fearWeight + seasonBonus + phaseBonus, 0, 100)
+  const label = deriveThreatBand(score)
+
+  const reasons = []
+  if (clock.phase === 'night') reasons.push('avoid ridge lanes after dusk')
+  if (clock.season === 'long_night') reasons.push('carry extra lanterns for long_night roads')
+  if (threatLevel >= 55) reasons.push(`escort demand is high at threat ${threatLevel}`)
+  if (mood.fear >= 40) reasons.push(`fear ${mood.fear} keeps caravans jumpy`)
+  const reason = reasons.length > 0
+    ? reasons.slice(0, 2).join('; ')
+    : `stage guards before departure; threat ${threatLevel} in ${clock.phase}`
+  return {
+    label,
+    reason,
+    nightPenaltyHint: 'Night travel runs one risk tier higher; route through lit markers.'
+  }
+}
+
+/**
+ * @param {string} townName
+ * @param {any} world
+ */
+function getMarketPulse(townName, world) {
+  const resolvedTown = resolveTownName(world, townName) || asText(townName, '-', 80) || '-'
+  const clock = normalizeWorldClock(world?.clock)
+  const moodState = normalizeTownMood(normalizeWorldMoods(world?.moods).byTown[resolvedTown]) || freshTownMood()
+  const moodLabel = deriveDominantMoodLabel(moodState)
+  const threatLevel = clamp(Math.trunc(Number(normalizeWorldThreat(world?.threat).byTown[resolvedTown] || 0)), 0, 100)
+  const activeEvents = findActiveEventsForTown(world, resolvedTown, clock.day)
+  const activeEventType = asText(activeEvents[0]?.type, '', 40).toLowerCase()
+  const scoreByGood = new Map()
+  for (const good of MARKET_GOODS) {
+    scoreByGood.set(good, { score: 0, tags: new Set() })
+  }
+
+  if (moodLabel === 'prosperous') {
+    applyMarketSignal(scoreByGood, 'wool', 2, 'prosperous crowds buy comfort')
+    applyMarketSignal(scoreByGood, 'herbs', 2, 'prosperous kitchens stock flavor')
+    applyMarketSignal(scoreByGood, 'iron', -1, 'less urgency for heavy gear')
+  } else if (moodLabel === 'fearful') {
+    applyMarketSignal(scoreByGood, 'lantern_oil', 2, 'fearful nights demand light')
+    applyMarketSignal(scoreByGood, 'bread', 1, 'households stock basics')
+    applyMarketSignal(scoreByGood, 'wool', -1, 'luxury stalls cool')
+  } else if (moodLabel === 'unrestful') {
+    applyMarketSignal(scoreByGood, 'iron', 2, 'unrest hardens demand for tools')
+    applyMarketSignal(scoreByGood, 'timber', 1, 'repairs and barricades rise')
+    applyMarketSignal(scoreByGood, 'herbs', -1, 'non-essentials slow')
+  } else {
+    applyMarketSignal(scoreByGood, 'bread', 1, 'steady foot traffic keeps staples moving')
+    applyMarketSignal(scoreByGood, 'timber', 1, 'steady crews keep building')
+  }
+
+  const eventSignals = EVENT_MARKET_SIGNALS[activeEventType] || null
+  if (eventSignals) {
+    for (const hotGood of eventSignals.hot || []) {
+      applyMarketSignal(scoreByGood, hotGood, 2, `event:${activeEventType}`)
+    }
+    for (const coldGood of eventSignals.cold || []) {
+      applyMarketSignal(scoreByGood, coldGood, -2, `event:${activeEventType}`)
+    }
+  }
+
+  if (threatLevel >= 70) {
+    applyMarketSignal(scoreByGood, 'iron', 2, 'high threat drives fortification')
+    applyMarketSignal(scoreByGood, 'lantern_oil', 2, 'high threat extends night watches')
+    applyMarketSignal(scoreByGood, 'wool', -1, 'high threat cuts festival trade')
+    applyMarketSignal(scoreByGood, 'herbs', -1, 'high threat constrains foraging')
+  } else if (threatLevel <= 25) {
+    applyMarketSignal(scoreByGood, 'wool', 1, 'safer roads invite market color')
+    applyMarketSignal(scoreByGood, 'herbs', 1, 'safer roads reopen herb routes')
+    applyMarketSignal(scoreByGood, 'iron', -1, 'safer roads reduce emergency demand')
+  }
+
+  if (clock.season === 'long_night') {
+    applyMarketSignal(scoreByGood, 'lantern_oil', 1, 'long_night consumes lamp stocks')
+    applyMarketSignal(scoreByGood, 'timber', 1, 'long_night needs extra fuel')
+  }
+  if (clock.phase === 'night') {
+    applyMarketSignal(scoreByGood, 'lantern_oil', 1, 'night routes run by lantern')
+    applyMarketSignal(scoreByGood, 'bread', 1, 'night shifts stock quick meals')
+  }
+  const daySignal = pickMarketDaySignal(resolvedTown, clock.day, clock.season)
+  if (daySignal) {
+    for (const hotGood of daySignal.hot || []) {
+      applyMarketSignal(scoreByGood, hotGood, 1, daySignal.tag)
+    }
+    for (const coldGood of daySignal.cold || []) {
+      applyMarketSignal(scoreByGood, coldGood, -1, daySignal.tag)
+    }
+  }
+
+  const ranked = Array.from(scoreByGood.entries())
+    .map(([good, entry]) => ({ good, score: Number(entry.score || 0), tags: entry.tags }))
+    .sort((left, right) => {
+      const diff = right.score - left.score
+      if (diff !== 0) return diff
+      return left.good.localeCompare(right.good)
+    })
+  const hotCandidates = ranked.filter(entry => entry.score >= 1)
+  const coldCandidates = ranked.slice().reverse().filter(entry => entry.score <= -1)
+  const hotPicked = (hotCandidates.length > 0 ? hotCandidates : ranked.slice(0, 1)).slice(0, 3)
+  const hotSet = new Set(hotPicked.map(entry => entry.good))
+  const coldPicked = (coldCandidates.length > 0
+    ? coldCandidates.filter(entry => !hotSet.has(entry.good))
+    : ranked.slice().reverse().filter(entry => !hotSet.has(entry.good)).slice(0, 1))
+    .slice(0, 3)
+
+  const hot = hotPicked.map(entry => ({
+    good: toMarketGoodLabel(entry.good),
+    reason: toActionablePulseReason('hot', toMarketGoodLabel(entry.good), summarizePulseReason(entry.tags, 'tight stalls and fast turnover')),
+    multiplierHint: toPulseMultiplierHint(entry.score)
+  }))
+  const cold = coldPicked.map(entry => ({
+    good: toMarketGoodLabel(entry.good),
+    reason: toActionablePulseReason('cold', toMarketGoodLabel(entry.good), summarizePulseReason(entry.tags, 'slow shelves and soft bids'))
+  }))
+  const risk = getRouteRisk(resolvedTown, world)
+
+  return { hot, cold, risk }
+}
+
+/**
+ * @param {string} townName
+ * @param {any} world
+ */
+function getTraderTip(townName, world) {
+  const pulse = getMarketPulse(townName, world)
+  const hot = asText(pulse.hot[0]?.good, 'Bread', 40)
+  const cold = asText(pulse.cold[0]?.good, 'Wool', 40)
+  if (pulse.risk.label === 'extreme' || pulse.risk.label === 'high') {
+    return `Move ${hot} in daylight; avoid long routes with ${cold} after dusk.`
+  }
+  if (pulse.risk.label === 'moderate') {
+    return `Run short loops: sell ${hot}, buy ${cold} low before nightfall.`
+  }
+  return `Press the market: flip ${cold} into ${hot} while roads stay calm.`
+}
+
+/**
+ * @param {any} quest
+ */
+function isContractQuest(quest) {
+  const normalized = normalizeQuest(quest)
+  if (!normalized) return false
+  if (normalized.type !== 'trade_n' && normalized.type !== 'visit_town') return false
+  return normalized.meta?.contract === true
+}
+
+/**
+ * @param {any[]} quests
+ * @param {string} questId
+ */
+function findContractQuestById(quests, questId) {
+  const quest = findQuestById(quests || [], questId)
+  if (!quest) return null
+  return isContractQuest(quest) ? quest : null
+}
+
+/**
+ * @param {any} snapshot
+ * @param {unknown[]} runtimeAgents
+ */
+function resolveDefaultContractOwner(snapshot, runtimeAgents) {
+  const runtimeNames = (Array.isArray(runtimeAgents) ? runtimeAgents : [])
+    .map(agent => asText(agent?.name, '', 80))
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b))
+  if (runtimeNames.length === 0) {
+    return Object.keys(snapshot?.agents || {})
+      .map(name => asText(name, '', 80))
+      .filter(Boolean)
+      .sort((a, b) => a.localeCompare(b))[0] || ''
+  }
+  const mara = runtimeNames.find(name => sameText(name, 'Mara', 80))
+  return mara || runtimeNames[0]
+}
+
+/**
+ * @param {any[]} towns
+ * @param {string} townName
+ * @param {number} day
+ */
+function pickContractRouteTarget(towns, townName, day) {
+  const others = (towns || [])
+    .map(town => asText(town?.townName, '', 80))
+    .filter(name => name && !sameText(name, townName, 80))
+    .sort((a, b) => a.localeCompare(b))
+  if (others.length === 0) return ''
+  const idx = stableHashNumber(`${townName}:${day}:route`) % others.length
+  return others[idx]
+}
+
+/**
+ * @param {{id: string}[]} templates
+ * @param {string} key
+ */
+function pickContractTemplate(templates, key) {
+  const source = (Array.isArray(templates) ? templates : [])
+    .slice()
+    .sort((a, b) => asText(a?.id, '', 80).localeCompare(asText(b?.id, '', 80)))
+  if (source.length === 0) return null
+  const idx = stableHashNumber(key) % source.length
+  return source[idx] || null
+}
+
+/**
+ * @param {string} phase
+ * @param {{dayFlavor: string, nightFlavor: string}} template
+ */
+function toContractFlavor(phase, template) {
+  if (phase === 'night') return asText(template?.nightFlavor, '', 120)
+  return asText(template?.dayFlavor, '', 120)
+}
+
+/**
+ * @param {string} townName
+ * @param {number} day
+ * @param {number} slot
+ * @param {string} riskLabel
+ * @param {string} hotGood
+ */
+function pickTradeContractTemplate(townName, day, slot, riskLabel, hotGood) {
+  const safeHotGood = asText(hotGood, '', 40)
+  const hotPool = CONTRACT_TRADE_TEMPLATES.filter(template => sameText(template.good, safeHotGood, 40))
+  const pool = hotPool.length > 0 ? hotPool : CONTRACT_TRADE_TEMPLATES
+  return pickContractTemplate(pool, `${townName}:${day}:${slot}:${riskLabel}:${safeHotGood}:trade_template`)
+}
+
+/**
+ * @param {string} townName
+ * @param {number} day
+ * @param {number} slot
+ * @param {string} riskLabel
+ */
+function pickRouteContractTemplate(townName, day, slot, riskLabel) {
+  return pickContractTemplate(CONTRACT_ROUTE_TEMPLATES, `${townName}:${day}:${slot}:${riskLabel}:route_template`)
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {{townName: string, marker: any}[]} towns
+ * @param {number} day
+ * @param {number} slot
+ */
+function buildContractDraft(world, townName, towns, day, slot) {
+  const pulse = getMarketPulse(townName, world)
+  const risk = getRouteRisk(townName, world)
+  const clock = normalizeWorldClock(world?.clock)
+  const hotGoodLabel = asText(pulse.hot[0]?.good, 'Bread', 40)
+  const hotGoodKey = toMarketGoodKey(hotGoodLabel) || 'bread'
+  const markets = normalizeWorldMarkets(world?.markets)
+  const town = findTownByName(towns, townName)
+  const marketName = markets
+    .filter(market => sameText(market.marker, town?.marker?.name, 80))
+    .sort((a, b) => a.name.localeCompare(b.name))[0]?.name || ''
+
+  const riskBonus = risk.label === 'extreme'
+    ? 4
+    : risk.label === 'high'
+      ? 3
+      : risk.label === 'moderate'
+        ? 2
+        : 1
+
+  const tradeTemplate = pickTradeContractTemplate(townName, day, slot, risk.label, hotGoodKey) || CONTRACT_TRADE_TEMPLATES[0]
+  const tradeNBase = Number.isInteger(tradeTemplate.tradeN) ? tradeTemplate.tradeN : 1
+  const tradeN = clamp(tradeNBase, 1, 3)
+  const tradeFlavor = toContractFlavor(clock.phase, tradeTemplate)
+
+  if (slot === 0) {
+    const desc = marketName
+      ? `${tradeFlavor} Close ${tradeN} lot${tradeN === 1 ? '' : 's'} at ${marketName}.`
+      : `${tradeFlavor} Close ${tradeN} lot${tradeN === 1 ? '' : 's'} for ${townName}.`
+    return {
+      kind: asText(tradeTemplate.kind, 'contract_supply', 40),
+      type: 'trade_n',
+      reward: clamp(Number(tradeTemplate.rewardBase || 2) + riskBonus + (tradeN - 1), CONTRACT_REWARD_MIN, CONTRACT_REWARD_MAX),
+      objective: {
+        kind: 'trade_n',
+        n: tradeN,
+        ...(marketName ? { market: marketName } : {})
+      },
+      progress: { done: 0 },
+      title: asText(tradeTemplate.title, 'CONTRACT: Supply Run', 120),
+      desc,
+      risk,
+      hotGood: toMarketGoodLabel(hotGoodKey)
+    }
+  }
+
+  const routeTown = pickContractRouteTarget(towns, townName, day)
+  if (routeTown) {
+    const routeTemplate = pickRouteContractTemplate(townName, day, slot, risk.label) || CONTRACT_ROUTE_TEMPLATES[0]
+    const routeFlavor = toContractFlavor(clock.phase, routeTemplate)
+    return {
+      kind: asText(routeTemplate.kind, 'contract_delivery', 40),
+      type: 'visit_town',
+      reward: clamp(Number(routeTemplate.rewardBase || 3) + riskBonus, CONTRACT_REWARD_MIN, CONTRACT_REWARD_MAX),
+      objective: { kind: 'visit_town', town: routeTown },
+      progress: { visited: false },
+      title: asText(routeTemplate.title, 'CONTRACT: Caravan Route', 120),
+      desc: `${routeFlavor} Run from ${townName} to ${routeTown}.`,
+      risk,
+      hotGood: toMarketGoodLabel(hotGoodKey)
+    }
+  }
+
+  const fallbackTemplate = pickTradeContractTemplate(townName, day, slot + 1, risk.label, hotGoodKey) || CONTRACT_TRADE_TEMPLATES[0]
+  const fallbackFlavor = toContractFlavor(clock.phase, fallbackTemplate)
+  return {
+    kind: asText(fallbackTemplate.kind, 'contract_supply', 40),
+    type: 'trade_n',
+    reward: clamp(Number(fallbackTemplate.rewardBase || 2) + riskBonus, CONTRACT_REWARD_MIN, CONTRACT_REWARD_MAX),
+    objective: { kind: 'trade_n', n: 1, ...(marketName ? { market: marketName } : {}) },
+    progress: { done: 0 },
+    title: asText(fallbackTemplate.title, 'CONTRACT: Quartermaster Call', 120),
+    desc: `${fallbackFlavor} Secure one lot for ${townName}.`,
+    risk,
+    hotGood: toMarketGoodLabel(hotGoodKey)
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, idPrefix: string, tickIdx: number, at: number, towns: {townName: string}[]}} input
+ */
+function emitNightCaravanTrouble(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  const threat = ensureWorldThreat(memory.world)
+  const towns = (Array.isArray(input?.towns) ? input.towns : [])
+    .map((entry) => asText(entry?.townName, '', 80))
+    .filter(Boolean)
+    .map((townName) => ({
+      townName,
+      level: clamp(Math.trunc(Number(threat.byTown[townName] || 0)), 0, 100)
+    }))
+    .sort((a, b) => {
+      const diff = b.level - a.level
+      if (diff !== 0) return diff
+      return a.townName.localeCompare(b.townName)
+    })
+
+  for (const row of towns) {
+    if (!shouldEmitCaravanTrouble(row.townName, row.level, clock.day, clock.season)) continue
+    const risk = getRouteRisk(row.townName, memory.world)
+    const landmarkIdx = stableHashNumber(`${row.townName}:${clock.day}:${clock.season}:landmark`) % NIGHT_TROUBLE_LANDMARKS.length
+    const landmark = NIGHT_TROUBLE_LANDMARKS[landmarkIdx] || 'outer road'
+    const message = `[${row.townName}] Night report: caravan trouble near the ${landmark}. Risk ${risk.label}; keep to lit routes.`
+    const townKey = row.townName.toLowerCase()
+    appendChronicle(memory, {
+      id: `${input.idPrefix}:chronicle:night_warning:${input.tickIdx}:${townKey}`,
+      type: 'trade',
+      msg: message,
+      at: input.at,
+      town: row.townName,
+      meta: {
+        day: clock.day,
+        level: row.level,
+        risk: risk.label
+      }
+    })
+    appendNews(memory, {
+      id: `${input.idPrefix}:news:night_warning:${input.tickIdx}:${townKey}`,
+      topic: 'trade',
+      msg: message,
+      at: input.at,
+      town: row.townName,
+      meta: {
+        day: clock.day,
+        level: row.level,
+        risk: risk.label
+      }
+    })
+    return row.townName
+  }
+  return ''
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, idPrefix: string, day: number, at: number}} input
+ */
+function generateDailyContracts(memory, input) {
+  const world = memory.world
+  const quests = ensureWorldQuests(world)
+  const towns = deriveTownsFromMarkers(world?.markers || [])
+  const clock = ensureWorldClock(world)
+  const created = []
+
+  for (const town of towns) {
+    const townName = town.townName
+    const existingToday = quests.filter((quest) => {
+      if (!isContractQuest(quest)) return false
+      if (!sameText(quest.town, townName, 80)) return false
+      const dayValue = Number(quest.meta?.contract_day || 0)
+      return dayValue === input.day
+    })
+    const desired = 1 + (stableHashNumber(`${townName}:${input.day}:${clock.season}`) % CONTRACT_MAX_PER_TOWN_PER_DAY)
+    const missing = Math.max(0, Math.min(CONTRACT_MAX_PER_TOWN_PER_DAY, desired) - existingToday.length)
+    if (missing <= 0) continue
+
+    for (let slot = 0; slot < missing; slot += 1) {
+      const draft = buildContractDraft(world, townName, towns, input.day, slot)
+      const at = Number(input.at || Date.now())
+      const questId = createQuestId(quests, `${input.operationId}:contract:${townName}:${input.day}:${slot}`, townName, draft.type, at + slot)
+      const quest = {
+        id: questId,
+        type: draft.type,
+        state: 'offered',
+        town: townName,
+        offered_at: new Date(at).toISOString(),
+        objective: draft.objective,
+        progress: draft.progress,
+        reward: draft.reward,
+        title: draft.title,
+        desc: asText(`${draft.desc} Risk: ${draft.risk.label}.`, 'Contract posted.', 120),
+        meta: {
+          contract: true,
+          kind: draft.kind,
+          contract_day: input.day,
+          risk: draft.risk.label,
+          risk_note: draft.risk.reason,
+          pulse_hot: draft.hotGood,
+          season: clock.season
+        }
+      }
+      quests.push(quest)
+      created.push(quest)
+      const message = `[${townName}] CONTRACT POSTED: ${quest.title} (reward ${quest.reward} emeralds).`
+      appendChronicle(memory, {
+        id: `${input.idPrefix}:chronicle:contract_offer:${quest.id.toLowerCase()}`,
+        type: 'contract',
+        msg: message,
+        at,
+        town: townName,
+        meta: {
+          quest_id: quest.id,
+          kind: draft.kind,
+          risk: draft.risk.label
+        }
+      })
+      appendNews(memory, {
+        id: `${input.idPrefix}:news:contract_offer:${quest.id.toLowerCase()}`,
+        topic: 'trade',
+        msg: message,
+        at,
+        town: townName,
+        meta: {
+          quest_id: quest.id,
+          kind: draft.kind,
+          risk: draft.risk.label
+        }
+      })
+    }
+  }
+  return created
 }
 
 /**
@@ -1638,6 +2417,27 @@ function summarizeEventMods(mods) {
 }
 
 /**
+ * @param {any} event
+ * @param {{templateKey?: string, templateKeys?: string[]}} autoRumorConfig
+ */
+function pickAutoRumorTemplateKey(event, autoRumorConfig) {
+  const list = []
+  const primary = asText(autoRumorConfig?.templateKey, '', 80)
+  if (primary) list.push(primary)
+  for (const key of (Array.isArray(autoRumorConfig?.templateKeys) ? autoRumorConfig.templateKeys : [])) {
+    const safe = asText(key, '', 80)
+    if (!safe) continue
+    if (list.some(item => sameText(item, safe, 80))) continue
+    list.push(safe)
+  }
+  if (list.length === 0) return ''
+  const safeEvent = normalizeWorldEvent(event)
+  if (!safeEvent) return list[0]
+  const idx = stableHashNumber(`${safeEvent.id}:${safeEvent.town}:${safeEvent.starts_day}:auto_rumor`) % list.length
+  return list[idx] || list[0]
+}
+
+/**
  * @param {any} memory
  * @param {{
  *   operationId: string,
@@ -1736,23 +2536,73 @@ function drawAndApplyWorldEvent(memory, input) {
     idPrefix: `${input.idPrefix}:event_mood:${eventId.toLowerCase()}`,
     reason: `event:${event.type}`
   })
+  const pulseAfterDraw = getMarketPulse(townName, memory.world)
+  const pulseMessage = `[${townName}] MARKET PULSE SHIFT: hot ${asText(pulseAfterDraw.hot[0]?.good, 'Bread', 40)} / cold ${asText(pulseAfterDraw.cold[0]?.good, 'Wool', 40)}.`
+  appendChronicle(memory, {
+    id: `${input.idPrefix}:chronicle:pulse_shift:${eventId.toLowerCase()}`,
+    type: 'trade',
+    msg: pulseMessage,
+    at,
+    town: townName,
+    meta: {
+      event_id: event.id,
+      event_type: event.type
+    }
+  })
+  appendNews(memory, {
+    id: `${input.idPrefix}:news:pulse_shift:${eventId.toLowerCase()}`,
+    topic: 'trade',
+    msg: pulseMessage,
+    at,
+    town: townName,
+    meta: {
+      event_id: event.id,
+      event_type: event.type
+    }
+  })
+
+  let spawnedRumor = null
   const autoRumorConfig = EVENT_TO_AUTO_RUMOR[event.type]
   if (autoRumorConfig) {
-    spawnWorldRumor(memory, {
-      townName,
-      kind: autoRumorConfig.kind,
-      severity: autoRumorConfig.severity,
-      templateKey: autoRumorConfig.templateKey,
-      expiresInDays: autoRumorConfig.expiresInDays,
+    const templateKey = pickAutoRumorTemplateKey(event, autoRumorConfig)
+    if (templateKey) {
+      spawnedRumor = spawnWorldRumor(memory, {
+        townName,
+        kind: autoRumorConfig.kind,
+        severity: autoRumorConfig.severity,
+        templateKey,
+        expiresInDays: autoRumorConfig.expiresInDays,
+        at,
+        idPrefix: `${input.idPrefix}:event_rumor:${eventId.toLowerCase()}`,
+        spawnedByEventId: event.id
+      })
+    }
+  }
+  if (spawnedRumor) {
+    const leadMessage = `[${townName}] LEAD SURFACED: ${spawnedRumor.text}`
+    appendChronicle(memory, {
+      id: `${input.idPrefix}:chronicle:lead_surface:${eventId.toLowerCase()}`,
+      type: 'rumor',
+      msg: leadMessage,
       at,
-      idPrefix: `${input.idPrefix}:event_rumor:${eventId.toLowerCase()}`,
-      spawnedByEventId: event.id
+      town: townName,
+      meta: {
+        event_id: event.id,
+        rumor_id: spawnedRumor.id
+      }
+    })
+    appendNews(memory, {
+      id: `${input.idPrefix}:news:lead_surface:${eventId.toLowerCase()}`,
+      topic: 'rumor',
+      msg: leadMessage,
+      at,
+      town: townName,
+      meta: {
+        event_id: event.id,
+        rumor_id: spawnedRumor.id
+      }
     })
   }
-  createDecisionForEvent(memory, event, {
-    at,
-    idPrefix: `${input.idPrefix}:event_decision:${eventId.toLowerCase()}`
-  })
   return event
 }
 
@@ -2037,12 +2887,19 @@ function findQuestById(quests, questId) {
  * @param {string} text
  */
 function shortStableHash(text) {
+  return stableHashNumber(text).toString(36)
+}
+
+/**
+ * @param {string} text
+ */
+function stableHashNumber(text) {
   let hash = 0
   for (let i = 0; i < text.length; i += 1) {
     hash = ((hash << 5) - hash) + text.charCodeAt(i)
     hash |= 0
   }
-  return Math.abs(hash).toString(36)
+  return Math.abs(hash)
 }
 
 /**
@@ -3031,27 +3888,27 @@ function parseGodCommand(rawCommand) {
   if (head === 'decision') {
     const action = asText(words[1], '', 20).toLowerCase()
     if (action === 'list') {
-      if (words.length > 3) return { type: 'invalid', reason: 'Usage: god decision list [town]' }
+      if (words.length > 3) return { type: 'invalid', reason: `Usage: god decision list [town]. ${DECISION_DEPRECATION_NOTE}` }
       const townName = asText(words[2], '', 80) || null
       return { type: 'decision_list', townName }
     }
     if (action === 'show') {
       const decisionId = asText(words[2], '', 200)
-      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god decision show <decisionId>' }
+      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: `Usage: god decision show <decisionId>. ${DECISION_DEPRECATION_NOTE}` }
       return { type: 'decision_show', decisionId }
     }
     if (action === 'choose') {
       const decisionId = asText(words[2], '', 200)
       const optionKey = asText(words[3], '', 40).toLowerCase()
-      if (!decisionId || !optionKey || words.length !== 4) return { type: 'invalid', reason: 'Usage: god decision choose <decisionId> <optionKey>' }
+      if (!decisionId || !optionKey || words.length !== 4) return { type: 'invalid', reason: `Usage: god decision choose <decisionId> <optionKey>. ${DECISION_DEPRECATION_NOTE}` }
       return { type: 'decision_choose', decisionId, optionKey }
     }
     if (action === 'expire') {
       const decisionId = asText(words[2], '', 200)
-      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god decision expire <decisionId>' }
+      if (!decisionId || words.length !== 3) return { type: 'invalid', reason: `Usage: god decision expire <decisionId>. ${DECISION_DEPRECATION_NOTE}` }
       return { type: 'decision_expire', decisionId }
     }
-    return { type: 'invalid', reason: 'Usage: god decision list [town] | god decision show <decisionId> | god decision choose <decisionId> <optionKey> | god decision expire <decisionId>' }
+    return { type: 'invalid', reason: `Usage: god decision list [town] | god decision show <decisionId> | god decision choose <decisionId> <optionKey> | god decision expire <decisionId>. ${DECISION_DEPRECATION_NOTE}` }
   }
 
   if (head === 'trait') {
@@ -3229,6 +4086,13 @@ function parseGodCommand(rawCommand) {
   if (head === 'market') {
     const action = asText(words[1], '', 20).toLowerCase()
     if (action === 'list' && words.length === 2) return { type: 'market_list' }
+    if (action === 'pulse') {
+      if (words.length !== 3) return { type: 'invalid', reason: 'Usage: god market pulse <townName|world>' }
+      if (sameText(words[2], 'world', 20)) return { type: 'market_pulse_world' }
+      const townName = asText(words[2], '', 80)
+      if (!townName) return { type: 'invalid', reason: 'Usage: god market pulse <townName|world>' }
+      return { type: 'market_pulse_town', townName }
+    }
     if (action === 'add') {
       const name = asText(words[2], '', 80)
       const marker = asText(words.slice(3).join(' '), '', 80) || null
@@ -3240,7 +4104,7 @@ function parseGodCommand(rawCommand) {
       if (!name || words.length !== 3) return { type: 'invalid', reason: 'Usage: god market remove <marketName>' }
       return { type: 'market_remove', name }
     }
-    return { type: 'invalid', reason: 'Usage: god market add <marketName> [marker] | god market remove <marketName> | god market list' }
+    return { type: 'invalid', reason: 'Usage: god market add <marketName> [marker] | god market remove <marketName> | god market list | god market pulse <townName|world>' }
   }
 
   if (head === 'offer') {
@@ -3281,6 +4145,40 @@ function parseGodCommand(rawCommand) {
       return { type: 'invalid', reason: 'Usage: god trade <marketName> <offer_id> <buyer> <amount>' }
     }
     return { type: 'market_trade', marketName, offerId, buyer, amount }
+  }
+
+  if (head === 'contract') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'list') {
+      if (words.length > 3) return { type: 'invalid', reason: 'Usage: god contract list [townName]' }
+      const townName = asText(words[2], '', 80) || null
+      return { type: 'contract_list', townName }
+    }
+    if (action === 'show') {
+      const questId = asText(words[2], '', 200)
+      if (!questId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god contract show <questId>' }
+      return { type: 'contract_show', questId }
+    }
+    if (action === 'accept') {
+      if (words.length === 3) {
+        const questId = asText(words[2], '', 200)
+        if (!questId) return { type: 'invalid', reason: 'Usage: god contract accept <questId> | god contract accept <agent> <questId>' }
+        return { type: 'contract_accept', questId, agentName: null, autoAssign: true }
+      }
+      if (words.length === 4) {
+        const agentName = asText(words[2], '', 80)
+        const questId = asText(words[3], '', 200)
+        if (!agentName || !questId) return { type: 'invalid', reason: 'Usage: god contract accept <questId> | god contract accept <agent> <questId>' }
+        return { type: 'contract_accept', questId, agentName, autoAssign: false }
+      }
+      return { type: 'invalid', reason: 'Usage: god contract accept <questId> | god contract accept <agent> <questId>' }
+    }
+    if (action === 'complete') {
+      const questId = asText(words[2], '', 200)
+      if (!questId || words.length !== 3) return { type: 'invalid', reason: 'Usage: god contract complete <questId>' }
+      return { type: 'contract_complete', questId }
+    }
+    return { type: 'invalid', reason: 'Usage: god contract list [townName] | god contract show <questId> | god contract accept <questId> | god contract accept <agent> <questId> | god contract complete <questId>' }
   }
 
   if (head === 'say') {
@@ -3992,13 +4890,22 @@ function createGodCommandService(deps) {
           return a.id.localeCompare(b.id)
         })
       if (decisions.length === 0) {
-        return { applied: true, command, audit: false, outputLines: [`GOD DECISION LIST: town=${townFilter || '-'} (none)`] }
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [
+            `GOD DECISION DEPRECATED: ${DECISION_DEPRECATION_NOTE}`,
+            `GOD DECISION LIST: town=${townFilter || '-'} (none)`
+          ]
+        }
       }
       return {
         applied: true,
         command,
         audit: false,
         outputLines: [
+          `GOD DECISION DEPRECATED: ${DECISION_DEPRECATION_NOTE}`,
           `GOD DECISION LIST: town=${townFilter || '-'} count=${decisions.length}`,
           ...decisions.map(decision => (
             `GOD DECISION: id=${decision.id} town=${decision.town} event_id=${decision.event_id} event_type=${decision.event_type} state=${decision.state} chosen_key=${decision.chosen_key || '-'} expires_day=${decision.expires_day}`
@@ -4016,6 +4923,7 @@ function createGodCommandService(deps) {
         command,
         audit: false,
         outputLines: [
+          `GOD DECISION DEPRECATED: ${DECISION_DEPRECATION_NOTE}`,
           `GOD DECISION SHOW: id=${decision.id} town=${decision.town} event_id=${decision.event_id} event_type=${decision.event_type} state=${decision.state} chosen_key=${decision.chosen_key || '-'}`,
           `GOD DECISION PROMPT: ${decision.prompt}`,
           ...decision.options.map(option => (
@@ -4097,8 +5005,8 @@ function createGodCommandService(deps) {
             id: `${operationId}:news:clock_advance:tick:${tickIdx}`,
             topic: 'world',
             msg: nextPhase === 'night'
-              ? 'Night settles over the realm.'
-              : 'Dawn returns to the realm.',
+              ? 'Lanterns flare as caravans pull off dark roads.'
+              : 'Dawn opens the stalls and caravan bells return.',
             at,
             meta: {
               day: clock.day,
@@ -4115,8 +5023,8 @@ function createGodCommandService(deps) {
               : clamp(Math.trunc(current - rates.dayFall), 0, 100)
             threat.byTown[townName] = nextLevel
             const message = nextPhase === 'night'
-              ? `[${townName}] Night falls. Threat rises to ${nextLevel}.`
-              : `[${townName}] Dawn breaks. Threat falls to ${nextLevel}.`
+              ? `[${townName}] Night routes darken. Route risk climbs to ${nextLevel}.`
+              : `[${townName}] Dawn trade resumes. Route risk eases to ${nextLevel}.`
             const townKey = townName.toLowerCase()
             appendChronicle(memory, {
               id: `${operationId}:chronicle:clock_advance:${tickIdx}:${townKey}`,
@@ -4148,7 +5056,22 @@ function createGodCommandService(deps) {
               reason: 'clock_advance'
             })
           }
+          if (nextPhase === 'day') {
+            generateDailyContracts(memory, {
+              operationId,
+              idPrefix: `${operationId}:clock_advance:${tickIdx}:contracts`,
+              day: clock.day,
+              at
+            })
+          }
           if (nextPhase === 'night') {
+            emitNightCaravanTrouble(memory, {
+              operationId,
+              idPrefix: `${operationId}:clock_advance:${tickIdx}:night_warning`,
+              tickIdx,
+              at,
+              towns
+            })
             drawAndApplyWorldEvent(memory, {
               operationId,
               idPrefix: `${operationId}:clock_advance:${tickIdx}:nightfall`,
@@ -4737,7 +5660,7 @@ function createGodCommandService(deps) {
             operationId: `${operationId}:decision_choose:${decision.id.toLowerCase()}`,
             at
           })
-          const message = `[${decision.town}] MAYOR chose ${selectedOption.key} for ${decision.event_type}.`
+          const message = `[${decision.town}] LEGACY DECISION chose ${selectedOption.key} for ${decision.event_type}.`
           appendChronicle(memory, {
             id: `${operationId}:chronicle:decision_choose:${decision.id.toLowerCase()}`,
             type: 'decision_choose',
@@ -4815,7 +5738,7 @@ function createGodCommandService(deps) {
           appendChronicle(memory, {
             id: `${operationId}:chronicle:decision_expire:${decision.id.toLowerCase()}`,
             type: 'decision_expire',
-            msg: `[${decision.town}] MAYOR decision expired: ${decision.id}`,
+            msg: `[${decision.town}] LEGACY decision expired: ${decision.id}`,
             at,
             town: decision.town,
             meta: {
@@ -4825,7 +5748,7 @@ function createGodCommandService(deps) {
           appendNews(memory, {
             id: `${operationId}:news:decision_expire:${decision.id.toLowerCase()}`,
             topic: 'world',
-            msg: `[${decision.town}] MAYOR decision expired: ${decision.id}`,
+            msg: `[${decision.town}] LEGACY decision expired: ${decision.id}`,
             at,
             town: decision.town,
             meta: {
@@ -4983,13 +5906,14 @@ function createGodCommandService(deps) {
         return sameText(ownerHomeMarker, town.marker.name, 80)
       }
       const mainAvailableQuestLines = quests
-        .filter(quest => quest.type !== 'rumor_task' && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
+        .filter(quest => !isContractQuest(quest) && quest.type !== 'rumor_task' && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
         .sort(sortQuests)
         .map(quest => (
           `GOD TOWN BOARD QUEST MAIN AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
       const mainActiveQuestLines = quests
         .filter((quest) => {
+          if (isContractQuest(quest)) return false
           if (quest.type === 'rumor_task') return false
           if (!QUEST_ACTIVE_STATES.has(quest.state)) return false
           return isQuestLinkedToTown(quest)
@@ -4998,13 +5922,29 @@ function createGodCommandService(deps) {
         .map(quest => (
           `GOD TOWN BOARD QUEST MAIN ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
-      const sideAvailableQuestLines = quests
+      const contractAvailableQuestLines = quests
+        .filter((quest) => isContractQuest(quest) && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
+        .sort(sortQuests)
+        .map(quest => (
+          `GOD TOWN BOARD CONTRACT AVAILABLE: id=${quest.id} kind=${asText(quest.meta?.kind, 'contract', 40)} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} risk=${asText(quest.meta?.risk, '-', 20)} title=${quest.title}`
+        ))
+      const contractActiveQuestLines = quests
+        .filter((quest) => {
+          if (!isContractQuest(quest)) return false
+          if (!QUEST_ACTIVE_STATES.has(quest.state)) return false
+          return isQuestLinkedToTown(quest)
+        })
+        .sort(sortQuests)
+        .map(quest => (
+          `GOD TOWN BOARD CONTRACT ACTIVE: id=${quest.id} kind=${asText(quest.meta?.kind, 'contract', 40)} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} risk=${asText(quest.meta?.risk, '-', 20)} title=${quest.title}`
+        ))
+      const rumorLeadQuestAvailableLines = quests
         .filter(quest => quest.type === 'rumor_task' && quest.state === 'offered' && sameText(quest.town, town.townName, 80))
         .sort(sortQuests)
         .map(quest => (
-          `GOD TOWN BOARD QUEST SIDE AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+          `GOD TOWN BOARD RUMOR LEAD QUEST AVAILABLE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
-      const sideActiveQuestLines = quests
+      const rumorLeadQuestActiveLines = quests
         .filter((quest) => {
           if (quest.type !== 'rumor_task') return false
           if (!QUEST_ACTIVE_STATES.has(quest.state)) return false
@@ -5012,35 +5952,45 @@ function createGodCommandService(deps) {
         })
         .sort(sortQuests)
         .map(quest => (
-          `GOD TOWN BOARD QUEST SIDE ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+          `GOD TOWN BOARD RUMOR LEAD QUEST ACTIVE: id=${quest.id} type=${quest.type} state=${quest.state} owner=${quest.owner || '-'} rumor_id=${quest.rumor_id || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
-      const availableQuestLines = [...mainAvailableQuestLines]
-      const activeQuestLines = [...mainActiveQuestLines]
-      const decisions = normalizeWorldDecisions(snapshot.world?.decisions)
-      const openDecisionLines = decisions
-        .filter(decision => decision.state === 'open' && sameText(decision.town, town.townName, 80))
+      const rumorLeadLines = normalizeWorldRumors(snapshot.world?.rumors)
+        .filter((rumor) => sameText(rumor.town, town.townName, 80) && Number(rumor.expires_day || 0) >= clock.day)
         .sort((a, b) => {
           const diff = Number(b.created_at || 0) - Number(a.created_at || 0)
           if (diff !== 0) return diff
           return a.id.localeCompare(b.id)
         })
         .slice(0, limit)
-        .map(decision => (
-          `GOD TOWN BOARD DECISION OPEN: id=${decision.id} event_type=${decision.event_type} expires_day=${decision.expires_day} prompt=${decision.prompt}`
+        .map((rumor) => (
+          `GOD TOWN BOARD RUMOR LEAD: id=${rumor.id} kind=${rumor.kind} severity=${rumor.severity} expires_day=${rumor.expires_day} text=${rumor.text}`
         ))
+      const availableQuestLines = [...mainAvailableQuestLines]
+      const activeQuestLines = [...mainActiveQuestLines]
+      const pulse = getMarketPulse(town.townName, snapshot.world)
+      const routeRisk = getRouteRisk(town.townName, snapshot.world)
+      const traderTip = getTraderTip(town.townName, snapshot.world)
 
       const lines = [
         `GOD TOWN BOARD: town=${town.townName} marker=${town.marker.name} x=${town.marker.x} y=${town.marker.y} z=${town.marker.z} population=${population} limit=${limit}`,
+        ...pulse.hot.map(item => `GOD TOWN BOARD MARKET PULSE HOT: good=${item.good} hint=${item.multiplierHint} reason=${item.reason}`),
+        ...pulse.cold.map(item => `GOD TOWN BOARD MARKET PULSE COLD: good=${item.good} reason=${item.reason}`),
+        `GOD TOWN BOARD ROUTE RISK: label=${routeRisk.label} reason=${routeRisk.reason} note=${routeRisk.nightPenaltyHint}`,
+        `GOD TOWN BOARD TRADER TIP: ${traderTip}`,
+        `GOD TOWN BOARD CONTRACTS AVAILABLE: count=${contractAvailableQuestLines.length}`,
+        ...(contractAvailableQuestLines.length > 0 ? contractAvailableQuestLines : ['GOD TOWN BOARD CONTRACT AVAILABLE: (none)']),
+        `GOD TOWN BOARD CONTRACTS ACTIVE: count=${contractActiveQuestLines.length}`,
+        ...(contractActiveQuestLines.length > 0 ? contractActiveQuestLines : ['GOD TOWN BOARD CONTRACT ACTIVE: (none)']),
+        `GOD TOWN BOARD RUMOR LEAD QUESTS AVAILABLE: count=${rumorLeadQuestAvailableLines.length}`,
+        ...(rumorLeadQuestAvailableLines.length > 0 ? rumorLeadQuestAvailableLines : ['GOD TOWN BOARD RUMOR LEAD QUEST AVAILABLE: (none)']),
+        `GOD TOWN BOARD RUMOR LEAD QUESTS ACTIVE: count=${rumorLeadQuestActiveLines.length}`,
+        ...(rumorLeadQuestActiveLines.length > 0 ? rumorLeadQuestActiveLines : ['GOD TOWN BOARD RUMOR LEAD QUEST ACTIVE: (none)']),
+        `GOD TOWN BOARD RUMOR LEADS: count=${rumorLeadLines.length}`,
+        ...(rumorLeadLines.length > 0 ? rumorLeadLines : ['GOD TOWN BOARD RUMOR LEAD: (none)']),
         `GOD TOWN BOARD CLOCK: day=${clock.day} phase=${clock.phase} season=${clock.season}`,
         `GOD TOWN BOARD THREAT: town=${town.townName} level=${townThreatLevel}`,
         `GOD TOWN BOARD MOOD: town=${town.townName} mood=${townMoodLabel} fear=${townMood.fear} unrest=${townMood.unrest} prosperity=${townMood.prosperity}`,
         `GOD TOWN BOARD FACTION: town=${town.townName} name=${townFactionName} doctrine=${townFactionDoctrine} rivals=${townFactionRivals.length ? townFactionRivals.join('|') : '-'}`,
-        `GOD TOWN BOARD ROSTER: count=${rosterLines.length}`,
-        ...(rosterLines.length > 0 ? rosterLines : ['GOD TOWN BOARD AGENT: (none)']),
-        `GOD TOWN BOARD MARKETS: count=${marketLines.length}`,
-        ...(marketLines.length > 0 ? marketLines : ['GOD TOWN BOARD MARKET: (none)']),
-        `GOD TOWN BOARD OFFERS: count=${offerLines.length}`,
-        ...(offerLines.length > 0 ? offerLines : ['GOD TOWN BOARD OFFER: (none)']),
         `GOD TOWN BOARD QUESTS AVAILABLE: count=${availableQuestLines.length}`,
         ...(availableQuestLines.length > 0 ? availableQuestLines.map(line => line.replace('QUEST MAIN AVAILABLE', 'QUEST AVAILABLE')) : ['GOD TOWN BOARD QUEST AVAILABLE: (none)']),
         `GOD TOWN BOARD QUESTS ACTIVE: count=${activeQuestLines.length}`,
@@ -5049,12 +5999,12 @@ function createGodCommandService(deps) {
         ...(mainAvailableQuestLines.length > 0 ? mainAvailableQuestLines : ['GOD TOWN BOARD QUEST MAIN AVAILABLE: (none)']),
         `GOD TOWN BOARD QUESTS MAIN ACTIVE: count=${mainActiveQuestLines.length}`,
         ...(mainActiveQuestLines.length > 0 ? mainActiveQuestLines : ['GOD TOWN BOARD QUEST MAIN ACTIVE: (none)']),
-        `GOD TOWN BOARD QUESTS SIDE AVAILABLE: count=${sideAvailableQuestLines.length}`,
-        ...(sideAvailableQuestLines.length > 0 ? sideAvailableQuestLines : ['GOD TOWN BOARD QUEST SIDE AVAILABLE: (none)']),
-        `GOD TOWN BOARD QUESTS SIDE ACTIVE: count=${sideActiveQuestLines.length}`,
-        ...(sideActiveQuestLines.length > 0 ? sideActiveQuestLines : ['GOD TOWN BOARD QUEST SIDE ACTIVE: (none)']),
-        `GOD TOWN BOARD DECISIONS OPEN: count=${openDecisionLines.length}`,
-        ...(openDecisionLines.length > 0 ? openDecisionLines : ['GOD TOWN BOARD DECISION OPEN: (none)']),
+        `GOD TOWN BOARD ROSTER: count=${rosterLines.length}`,
+        ...(rosterLines.length > 0 ? rosterLines : ['GOD TOWN BOARD AGENT: (none)']),
+        `GOD TOWN BOARD MARKETS: count=${marketLines.length}`,
+        ...(marketLines.length > 0 ? marketLines : ['GOD TOWN BOARD MARKET: (none)']),
+        `GOD TOWN BOARD OFFERS: count=${offerLines.length}`,
+        ...(offerLines.length > 0 ? offerLines : ['GOD TOWN BOARD OFFER: (none)']),
         `GOD TOWN BOARD EVENTS: count=${eventLines.length}`,
         ...(eventLines.length > 0 ? eventLines : ['GOD TOWN BOARD EVENT: (none)'])
       ]
@@ -5176,6 +6126,117 @@ function createGodCommandService(deps) {
         audit: true,
         outputLines: [
           `GOD CHRONICLE ADD: type=${tx.result.eventType} town=${tx.result.town || '-'} at=${tx.result.at} msg=${tx.result.message}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'contract_list') {
+      const snapshot = memoryStore.getSnapshot()
+      const towns = deriveTownsFromMarkers(snapshot.world?.markers || [])
+      const townFilter = parsed.townName ? findTownByName(towns, parsed.townName) : null
+      if (parsed.townName && !townFilter) return { applied: false, command, reason: 'Unknown town.' }
+      const contracts = normalizeWorldQuests(snapshot.world?.quests)
+        .filter((quest) => {
+          if (!isContractQuest(quest)) return false
+          return !townFilter || sameText(quest.town, townFilter.townName, 80)
+        })
+        .sort((a, b) => {
+          const diff = Date.parse(b.offered_at) - Date.parse(a.offered_at)
+          if (diff !== 0) return diff
+          return a.id.localeCompare(b.id)
+        })
+      if (contracts.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [`GOD CONTRACT LIST: town=${townFilter ? townFilter.townName : '-'} (none)`]
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD CONTRACT LIST: town=${townFilter ? townFilter.townName : '-'} count=${contracts.length}`,
+          ...contracts.map((quest) => (
+            `GOD CONTRACT: id=${quest.id} kind=${asText(quest.meta?.kind, 'contract', 40)} type=${quest.type} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} risk=${asText(quest.meta?.risk, '-', 20)} title=${quest.title}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'contract_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const quest = findContractQuestById(snapshot.world?.quests || [], parsed.questId)
+      if (!quest) return { applied: false, command, reason: 'Unknown contract.' }
+      let objectiveLine = '-'
+      let progressLine = '-'
+      if (quest.type === 'trade_n') {
+        objectiveLine = `kind=trade_n n=${quest.objective.n} market=${quest.objective.market || '-'}`
+        progressLine = `done=${quest.progress.done}`
+      } else if (quest.type === 'visit_town') {
+        objectiveLine = `kind=visit_town town=${quest.objective.town}`
+        progressLine = `visited=${quest.progress.visited}`
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD CONTRACT SHOW: id=${quest.id} kind=${asText(quest.meta?.kind, 'contract', 40)} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} reward=${quest.reward}`,
+          `GOD CONTRACT TITLE: ${quest.title}`,
+          `GOD CONTRACT DESC: ${quest.desc}`,
+          `GOD CONTRACT OBJECTIVE: ${objectiveLine}`,
+          `GOD CONTRACT PROGRESS: ${progressLine}`,
+          `GOD CONTRACT RISK: label=${asText(quest.meta?.risk, '-', 20)} note=${asText(quest.meta?.risk_note, '-', 160)}`,
+          `GOD CONTRACT TIMES: offered_at=${quest.offered_at} accepted_at=${quest.accepted_at || '-'}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'contract_accept') {
+      const snapshot = memoryStore.getSnapshot()
+      const contract = findContractQuestById(snapshot.world?.quests || [], parsed.questId)
+      if (!contract) return { applied: false, command, reason: 'Unknown contract.' }
+      const ownerName = parsed.autoAssign
+        ? resolveDefaultContractOwner(snapshot, runtimeAgents)
+        : resolveKnownAgentName(snapshot, runtimeAgents, parsed.agentName)
+      if (!ownerName) return { applied: false, command, reason: 'Unknown agent.' }
+      const delegated = await applyGodCommand({
+        agents: runtimeAgents,
+        command: `quest accept ${ownerName} ${contract.id}`,
+        operationId: `${operationId}:contract_accept`
+      })
+      if (!delegated.applied) return { applied: false, command, reason: delegated.reason }
+      const appliedQuest = findQuestById(memoryStore.getSnapshot().world?.quests || [], contract.id)
+      return {
+        applied: true,
+        command,
+        audit: delegated.audit,
+        outputLines: [
+          `GOD CONTRACT ACCEPTED: id=${contract.id} owner=${appliedQuest?.owner || ownerName} state=${appliedQuest?.state || '-'}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'contract_complete') {
+      const snapshot = memoryStore.getSnapshot()
+      const contract = findContractQuestById(snapshot.world?.quests || [], parsed.questId)
+      if (!contract) return { applied: false, command, reason: 'Unknown contract.' }
+      const delegated = await applyGodCommand({
+        agents: runtimeAgents,
+        command: `quest complete ${contract.id}`,
+        operationId: `${operationId}:contract_complete`
+      })
+      if (!delegated.applied) return { applied: false, command, reason: delegated.reason }
+      const appliedQuest = findQuestById(memoryStore.getSnapshot().world?.quests || [], contract.id)
+      return {
+        applied: true,
+        command,
+        audit: delegated.audit,
+        outputLines: [
+          `GOD CONTRACT COMPLETED: id=${contract.id} owner=${appliedQuest?.owner || '-'} reward=${appliedQuest?.reward || 0}`
         ]
       }
     }
@@ -6086,6 +7147,52 @@ function createGodCommandService(deps) {
         command,
         audit: false,
         outputLines: lines
+      }
+    }
+
+    if (parsed.type === 'market_pulse_town') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const pulse = getMarketPulse(townName, snapshot.world)
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD MARKET PULSE: town=${townName}`,
+          ...pulse.hot.map(item => `GOD MARKET PULSE HOT: good=${item.good} hint=${item.multiplierHint} reason=${item.reason}`),
+          ...pulse.cold.map(item => `GOD MARKET PULSE COLD: good=${item.good} reason=${item.reason}`),
+          `GOD MARKET PULSE RISK: label=${pulse.risk.label} reason=${pulse.risk.reason} note=${pulse.risk.nightPenaltyHint}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'market_pulse_world') {
+      const snapshot = memoryStore.getSnapshot()
+      const towns = deriveTownNamesForEvents(snapshot.world)
+      const clock = normalizeWorldClock(snapshot.world?.clock)
+      if (towns.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: ['GOD MARKET PULSE WORLD: (none)']
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD MARKET PULSE WORLD: count=${towns.length} day=${clock.day} phase=${clock.phase} season=${clock.season}`,
+          ...towns.map((townName) => {
+            const pulse = getMarketPulse(townName, snapshot.world)
+            const hotSummary = pulse.hot.map(item => item.good).slice(0, 2).join('|') || '-'
+            const coldSummary = pulse.cold.map(item => item.good).slice(0, 2).join('|') || '-'
+            return `GOD MARKET PULSE TOWN: town=${townName} hot=${hotSummary} cold=${coldSummary} risk=${pulse.risk.label}`
+          })
+        ]
       }
     }
 

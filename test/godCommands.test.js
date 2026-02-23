@@ -1716,7 +1716,7 @@ test('clock advance narration hooks are replay-safe', async () => {
   assert.ok(afterAdvance.world.news.length > beforeNews)
   assert.ok(afterAdvance.world.chronicle.some(entry => entry.type === 'clock'))
   assert.ok(afterAdvance.world.chronicle.some(entry => entry.type === 'threat'))
-  assert.ok(afterAdvance.world.news.some(entry => entry.topic === 'world' && entry.msg.includes('Night falls')))
+  assert.ok(afterAdvance.world.news.some(entry => entry.topic === 'world' && entry.msg.includes('Lanterns flare')))
 
   const replay = await service.applyGodCommand({
     agents,
@@ -2559,7 +2559,7 @@ test('rumor quest creation is transactional/idempotent and binds rumor_id', asyn
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
-test('town board shows main/side quests and open decisions without mutation', async () => {
+test('town board shows Trader sections without mutation', async () => {
   const memoryStore = createStore()
   const seedService = createGodCommandService({ memoryStore })
   const agents = createAgents()
@@ -2611,8 +2611,11 @@ test('town board shows main/side quests and open decisions without mutation', as
   assert.equal(txCalls, 0)
   assert.deepEqual(after, before)
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD QUESTS MAIN AVAILABLE:')))
-  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD QUESTS SIDE AVAILABLE:')))
-  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD DECISIONS OPEN:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD MARKET PULSE HOT:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD ROUTE RISK:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD CONTRACTS AVAILABLE:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD RUMOR LEADS:')))
+  assert.equal(board.outputLines.some(line => line.includes('GOD TOWN BOARD DECISION OPEN:')), false)
 })
 
 test('decision list/show are read-only and do not mutate state', async () => {
@@ -2625,11 +2628,25 @@ test('decision list/show are read-only and do not mutate state', async () => {
     command: 'mark add alpha_hall 0 64 0 town:alpha',
     operationId: 'decision-readonly-seed-town'
   })
-  await seedService.applyGodCommand({
-    agents,
-    command: 'event draw alpha',
-    operationId: 'decision-readonly-seed-event'
-  })
+  await memoryStore.transact((memory) => {
+    memory.world.decisions = [
+      {
+        id: 'd_readonly_alpha',
+        town: 'alpha',
+        event_id: 'e_readonly_alpha',
+        event_type: 'shortage',
+        prompt: 'Legacy decision from an old save.',
+        options: [
+          { key: 'ration', label: 'Ration', effects: { mood: { unrest: 1 } } },
+          { key: 'import', label: 'Import', effects: { mood: { prosperity: 1 } } }
+        ],
+        state: 'open',
+        starts_day: 1,
+        expires_day: 10,
+        created_at: 1000
+      }
+    ]
+  }, { eventId: 'decision-readonly-seed-state' })
   const decisionId = memoryStore.getSnapshot().world.decisions[0].id
 
   let txCalls = 0
@@ -2657,11 +2674,12 @@ test('decision list/show are read-only and do not mutate state', async () => {
   assert.equal(show.applied, true)
   assert.equal(txCalls, 0)
   assert.deepEqual(after, before)
+  assert.ok(list.outputLines.some(line => line.includes('GOD DECISION DEPRECATED:')))
   assert.ok(list.outputLines.some(line => line.includes(`id=${decisionId}`)))
   assert.ok(show.outputLines.some(line => line.includes(`GOD DECISION SHOW: id=${decisionId}`)))
 })
 
-test('nightfall auto-creates one open decision and replay is safe', async () => {
+test('nightfall does not auto-create decisions and replay is safe', async () => {
   const memoryStore = createStore()
   const service = createGodCommandService({ memoryStore })
   const agents = createAgents()
@@ -2676,6 +2694,26 @@ test('nightfall auto-creates one open decision and replay is safe', async () => 
     command: 'event seed 777',
     operationId: 'decision-auto-seed-event'
   })
+  await memoryStore.transact((memory) => {
+    memory.world.decisions = [
+      {
+        id: 'd_legacy_alpha',
+        town: 'alpha',
+        event_id: 'e_legacy_alpha',
+        event_type: 'festival',
+        prompt: 'Legacy saved decision.',
+        options: [
+          { key: 'hold_feast', label: 'Hold Feast', effects: { mood: { prosperity: 1 } } },
+          { key: 'fund_music', label: 'Fund Music', effects: { mood: { fear: -1 } } }
+        ],
+        state: 'open',
+        starts_day: 1,
+        expires_day: 99,
+        created_at: 2000
+      }
+    ]
+  }, { eventId: 'decision-auto-seed-legacy' })
+  const beforeDecisions = memoryStore.getSnapshot().world.decisions
 
   const advanceA = await service.applyGodCommand({
     agents,
@@ -2686,9 +2724,7 @@ test('nightfall auto-creates one open decision and replay is safe', async () => 
   const afterAdvanceA = memoryStore.getSnapshot()
   assert.equal(afterAdvanceA.world.clock.phase, 'night')
   assert.equal(afterAdvanceA.world.events.active.length, 1)
-  assert.equal(afterAdvanceA.world.decisions.length, 1)
-  assert.equal(afterAdvanceA.world.decisions[0].state, 'open')
-  assert.equal(afterAdvanceA.world.decisions[0].event_id, afterAdvanceA.world.events.active[0].id)
+  assert.deepEqual(afterAdvanceA.world.decisions, beforeDecisions)
 
   const replay = await service.applyGodCommand({
     agents,
@@ -2697,6 +2733,233 @@ test('nightfall auto-creates one open decision and replay is safe', async () => 
   })
   assert.equal(replay.applied, false)
   assert.deepEqual(memoryStore.getSnapshot(), afterAdvanceA)
+})
+
+test('market pulse commands are deterministic and read-only', async () => {
+  const memoryStore = createStore()
+  const seedService = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await seedService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'pulse-seed-town'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'threat set alpha 63',
+    operationId: 'pulse-seed-threat'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'clock season long_night',
+    operationId: 'pulse-seed-season'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'event seed 777',
+    operationId: 'pulse-seed-event'
+  })
+  await seedService.applyGodCommand({
+    agents,
+    command: 'event draw alpha',
+    operationId: 'pulse-seed-event-draw'
+  })
+
+  let txCalls = 0
+  const originalTransact = memoryStore.transact.bind(memoryStore)
+  memoryStore.transact = async (...args) => {
+    txCalls += 1
+    return originalTransact(...args)
+  }
+
+  const service = createGodCommandService({ memoryStore })
+  const before = memoryStore.getSnapshot()
+
+  const pulseTownA = await service.applyGodCommand({
+    agents,
+    command: 'market pulse alpha',
+    operationId: 'pulse-town-a'
+  })
+  const pulseTownB = await service.applyGodCommand({
+    agents,
+    command: 'market pulse alpha',
+    operationId: 'pulse-town-b'
+  })
+  const pulseWorld = await service.applyGodCommand({
+    agents,
+    command: 'market pulse world',
+    operationId: 'pulse-world-a'
+  })
+  const after = memoryStore.getSnapshot()
+
+  assert.equal(pulseTownA.applied, true)
+  assert.equal(pulseTownB.applied, true)
+  assert.equal(pulseWorld.applied, true)
+  assert.equal(txCalls, 0)
+  assert.deepEqual(after, before)
+  assert.deepEqual(pulseTownA.outputLines, pulseTownB.outputLines)
+  assert.ok(pulseTownA.outputLines.some(line => line.includes('GOD MARKET PULSE HOT:')))
+  assert.ok(pulseTownA.outputLines.some(line => line.includes('GOD MARKET PULSE COLD:')))
+  assert.ok(pulseTownA.outputLines.some(line => line.includes('GOD MARKET PULSE RISK:')))
+  assert.ok(pulseWorld.outputLines.some(line => line.includes('GOD MARKET PULSE WORLD:')))
+  assert.ok(pulseWorld.outputLines.some(line => line.includes('GOD MARKET PULSE TOWN: town=alpha')))
+})
+
+test('daily contract generation is bounded per town and replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'contract-gen-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_hall 100 64 0 town:beta',
+    operationId: 'contract-gen-seed-beta'
+  })
+
+  const advance = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'contract-gen-day2'
+  })
+  assert.equal(advance.applied, true)
+
+  const afterAdvance = memoryStore.getSnapshot()
+  const day2Contracts = afterAdvance.world.quests
+    .filter(quest => quest?.meta?.contract === true && Number(quest.meta?.contract_day || 0) === 2)
+  assert.ok(day2Contracts.length >= 2)
+  assert.ok(day2Contracts.length <= 4)
+
+  const byTown = new Map()
+  for (const contract of day2Contracts) {
+    const town = String(contract.town || '').toLowerCase()
+    if (!town) continue
+    byTown.set(town, Number(byTown.get(town) || 0) + 1)
+    assert.equal(contract.state, 'offered')
+  }
+  assert.ok(byTown.has('alpha'))
+  assert.ok(byTown.has('beta'))
+  assert.ok(Number(byTown.get('alpha')) >= 1 && Number(byTown.get('alpha')) <= 2)
+  assert.ok(Number(byTown.get('beta')) >= 1 && Number(byTown.get('beta')) <= 2)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'contract-gen-day2'
+  })
+  assert.equal(replay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterAdvance)
+})
+
+test('contract accept/complete delegates to quest flow and rewards once', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'contract-flow-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'market add bazaar alpha_hall',
+    operationId: 'contract-flow-seed-market'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mint Mara 50',
+    operationId: 'contract-flow-seed-mint-mara'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mint Eli 50',
+    operationId: 'contract-flow-seed-mint-eli'
+  })
+
+  const offerAdd = await service.applyGodCommand({
+    agents,
+    command: 'offer add bazaar Eli sell 5 1',
+    operationId: 'contract-flow-seed-offer'
+  })
+  assert.equal(offerAdd.applied, true)
+  const offerAddedLine = offerAdd.outputLines.find(line => line.includes('GOD OFFER ADDED:')) || ''
+  const offerMatch = offerAddedLine.match(/id=([^\s]+)/i)
+  assert.ok(offerMatch)
+  const offerId = offerMatch[1]
+
+  await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'contract-flow-day2'
+  })
+
+  const offeredContracts = memoryStore.getSnapshot().world.quests
+    .filter(quest => quest?.meta?.contract === true && quest.state === 'offered' && quest.type === 'trade_n')
+  assert.ok(offeredContracts.length >= 1)
+  const contract = offeredContracts[0]
+  const contractId = contract.id
+  const tradeTarget = Math.max(1, Number(contract.objective?.n || 1))
+
+  const acceptA = await service.applyGodCommand({
+    agents,
+    command: `contract accept Mara ${contractId}`,
+    operationId: 'contract-flow-accept-a'
+  })
+  assert.equal(acceptA.applied, true)
+  assert.ok(acceptA.outputLines.some(line => line.includes(`id=${contractId}`)))
+
+  const afterAccept = memoryStore.getSnapshot()
+  const accepted = afterAccept.world.quests.find(quest => quest.id === contractId)
+  assert.equal(accepted.owner, 'Mara')
+  assert.ok(accepted.state === 'accepted' || accepted.state === 'in_progress')
+
+  const maraBeforeTrades = Number(afterAccept.world.economy.ledger.Mara || 0)
+
+  for (let idx = 0; idx < tradeTarget; idx += 1) {
+    const tradeResult = await service.applyGodCommand({
+      agents,
+      command: `trade bazaar ${offerId} Mara 1`,
+      operationId: `contract-flow-trade-${idx + 1}`
+    })
+    assert.equal(tradeResult.applied, true)
+  }
+
+  const tradeReplay = await service.applyGodCommand({
+    agents,
+    command: `trade bazaar ${offerId} Mara 1`,
+    operationId: `contract-flow-trade-${tradeTarget}`
+  })
+  assert.equal(tradeReplay.applied, false)
+
+  const afterTrades = memoryStore.getSnapshot()
+  const completed = afterTrades.world.quests.find(quest => quest.id === contractId)
+  assert.equal(completed.state, 'completed')
+  const maraAfterTrades = Number(afterTrades.world.economy.ledger.Mara || 0)
+  const expectedAfterTrades = maraBeforeTrades - tradeTarget + Number(completed.reward || 0)
+  assert.equal(maraAfterTrades, expectedAfterTrades)
+
+  const completeA = await service.applyGodCommand({
+    agents,
+    command: `contract complete ${contractId}`,
+    operationId: 'contract-flow-complete-a'
+  })
+  assert.equal(completeA.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterTrades)
+
+  const completeAgain = await service.applyGodCommand({
+    agents,
+    command: `contract complete ${contractId}`,
+    operationId: 'contract-flow-complete-b'
+  })
+  assert.equal(completeAgain.applied, false)
+  const afterCompleteAgain = memoryStore.getSnapshot()
+  assert.equal(Number(afterCompleteAgain.world.economy.ledger.Mara || 0), maraAfterTrades)
 })
 
 test('decision choose applies effects once and replay is safe', async () => {

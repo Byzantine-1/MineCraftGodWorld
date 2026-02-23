@@ -90,13 +90,6 @@ async function runDeterministicScenario() {
   await apply('event seed 777', 'op-07')
   await apply('event draw alpha', 'op-08')
 
-  const decisionId = memoryStore.getSnapshot().world.decisions[0]?.id
-  assert.ok(decisionId)
-  const decisionShow = await apply(`decision show ${decisionId}`, 'op-09')
-  const optionKey = parseOutputValue(decisionShow.outputLines, /GOD DECISION OPTION:\s*key=([^\s]+)/i)
-  assert.ok(optionKey)
-  await apply(`decision choose ${decisionId} ${optionKey}`, 'op-10')
-
   await apply('rumor spawn alpha supernatural 2 mist_shapes 2', 'op-11')
   const rumorId = memoryStore.getSnapshot().world.rumors[0]?.id
   assert.ok(rumorId)

@@ -1,0 +1,22 @@
+# In-Game Smoke Macro (12 lines)
+# Minecraft chat section (paste in batches of 10-20 lines):
+mara ping 001
+eli ping 002!
+mara ping 003?
+eli   ping   004
+mara route-check alpha_hall 005
+eli punctuation !!! ??? ### 006
+mara punctuation ;;; ::: ,,, 007
+eli punctuation (( )) [[ ]] 008
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 009
+eli mixed alpha-beta_gamma.010
+mara spacing   and-tabs-like   011
+eli route risk-check dusk 012
+
+# Optional CLI follow-up (run in node src/index.js, not Minecraft chat):
+# Replace <town> and <contract_id> first.
+god contract list <town>
+god contract show <contract_id>
+god contract accept Mara <contract_id>
+god quest show <contract_id>
+god balance Mara

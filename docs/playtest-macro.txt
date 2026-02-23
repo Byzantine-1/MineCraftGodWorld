@@ -1,72 +1,94 @@
+# In-Game Soak Macro (84 lines)
+# Minecraft chat section (paste in batches of 10-20 lines):
 mara ping 001
 eli ping 002!
-nox ping 003?
-mara   ping   004
-eli route-check alpha_hall 005
-nox punctuation !!! ??? ### 006
+mara ping 003?
+eli   ping   004
+mara route-check alpha_hall 005
+eli punctuation !!! ??? ### 006
 mara punctuation ;;; ::: ,,, 007
 eli punctuation (( )) [[ ]] 008
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 009
-mara mixed alpha-beta_gamma.010
-eli final-check 011
-nox ping 012...
-mara ping 013
-eli ping 014!
-nox ping 015?
-mara   ping   016
-eli route-check alpha_hall 017
-nox punctuation !!! ??? ### 018
-mara punctuation ;;; ::: ,,, 019
-eli punctuation (( )) [[ ]] 020
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 021
-mara mixed alpha-beta_gamma.022
-eli final-check 023
-nox ping 024...
-mara ping 025
-eli ping 026!
-nox ping 027?
-mara   ping   028
-eli route-check alpha_hall 029
-nox punctuation !!! ??? ### 030
-mara punctuation ;;; ::: ,,, 031
-eli punctuation (( )) [[ ]] 032
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 033
-mara mixed alpha-beta_gamma.034
-eli final-check 035
-nox ping 036...
-mara ping 037
-eli ping 038!
-nox ping 039?
-mara   ping   040
-eli route-check alpha_hall 041
-nox punctuation !!! ??? ### 042
-mara punctuation ;;; ::: ,,, 043
-eli punctuation (( )) [[ ]] 044
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 045
-mara mixed alpha-beta_gamma.046
-eli final-check 047
-nox ping 048...
-mara ping 049
-eli ping 050!
-nox ping 051?
-mara   ping   052
-eli route-check alpha_hall 053
-nox punctuation !!! ??? ### 054
-mara punctuation ;;; ::: ,,, 055
-eli punctuation (( )) [[ ]] 056
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 057
-mara mixed alpha-beta_gamma.058
-eli final-check 059
-nox ping 060...
-mara ping 061
-eli ping 062!
-nox ping 063?
-mara   ping   064
-eli route-check alpha_hall 065
-nox punctuation !!! ??? ### 066
-mara punctuation ;;; ::: ,,, 067
-eli punctuation (( )) [[ ]] 068
-nox long xxxxxxxxxxxxxxxxxxxxxxxx 069
-mara mixed alpha-beta_gamma.070
-eli final-check 071
-nox ping 072...
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 009
+eli mixed alpha-beta_gamma.010
+mara spacing   and-tabs-like   011
+eli route risk-check dusk 012
+mara final-check 013
+eli ping 014...
+mara ping 015
+eli ping 016!
+mara ping 017?
+eli   ping   018
+mara route-check alpha_hall 019
+eli punctuation !!! ??? ### 020
+mara punctuation ;;; ::: ,,, 021
+eli punctuation (( )) [[ ]] 022
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 023
+eli mixed alpha-beta_gamma.024
+mara spacing   and-tabs-like   025
+eli route risk-check dusk 026
+mara final-check 027
+eli ping 028...
+mara ping 029
+eli ping 030!
+mara ping 031?
+eli   ping   032
+mara route-check alpha_hall 033
+eli punctuation !!! ??? ### 034
+mara punctuation ;;; ::: ,,, 035
+eli punctuation (( )) [[ ]] 036
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 037
+eli mixed alpha-beta_gamma.038
+mara spacing   and-tabs-like   039
+eli route risk-check dusk 040
+mara final-check 041
+eli ping 042...
+mara ping 043
+eli ping 044!
+mara ping 045?
+eli   ping   046
+mara route-check alpha_hall 047
+eli punctuation !!! ??? ### 048
+mara punctuation ;;; ::: ,,, 049
+eli punctuation (( )) [[ ]] 050
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 051
+eli mixed alpha-beta_gamma.052
+mara spacing   and-tabs-like   053
+eli route risk-check dusk 054
+mara final-check 055
+eli ping 056...
+mara ping 057
+eli ping 058!
+mara ping 059?
+eli   ping   060
+mara route-check alpha_hall 061
+eli punctuation !!! ??? ### 062
+mara punctuation ;;; ::: ,,, 063
+eli punctuation (( )) [[ ]] 064
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 065
+eli mixed alpha-beta_gamma.066
+mara spacing   and-tabs-like   067
+eli route risk-check dusk 068
+mara final-check 069
+eli ping 070...
+mara ping 071
+eli ping 072!
+mara ping 073?
+eli   ping   074
+mara route-check alpha_hall 075
+eli punctuation !!! ??? ### 076
+mara punctuation ;;; ::: ,,, 077
+eli punctuation (( )) [[ ]] 078
+mara long xxxxxxxxxxxxxxxxxxxxxxxx 079
+eli mixed alpha-beta_gamma.080
+mara spacing   and-tabs-like   081
+eli route risk-check dusk 082
+mara final-check 083
+eli ping 084...
+
+# Optional CLI follow-up (run in node src/index.js, not Minecraft chat):
+# Replace <town> and <contract_id> first.
+god contract list <town>
+god contract show <contract_id>
+god contract accept Mara <contract_id>
+god quest show <contract_id>
+god balance Mara
