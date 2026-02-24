@@ -14,6 +14,9 @@ This repository is the engine layer only. It focuses on deterministic behavior, 
   - town board, chronicle, news
   - clock/seasons/threat/factions/rep
   - moods and deterministic event deck
+  - mayor-gated major missions with per-town crier queue
+  - deterministic nether global shocks with bounded ledger/modifiers
+  - townsfolk-driven side quests with deterministic dedupe/linkage
   - rumors, mayor decisions, side quests
   - traits and titles
 - Runtime Town Crier (optional, default off) that reads durable news and broadcasts runtime-only.
@@ -57,10 +60,43 @@ god decision list alpha
 god decision choose <decision_id> <option_key>
 
 god rumor list alpha
+god mayor talk alpha
+god mayor accept alpha
+god mission status alpha
+god mission advance alpha
+god mission complete alpha
+god nether status
+god nether tick 3
+god townsfolk talk alpha gate_warden
+
 god town board alpha 10
 god news tail 10
 god chronicle tail 10
 ```
+
+Major mission failure path:
+
+```text
+god mission fail alpha route collapsed
+```
+
+## Durable State Location
+
+- Durable state file used by CLI: `src/memory.json`
+- Major mission state keys:
+  - `world.majorMissions[]`
+  - `world.towns.<town>.activeMajorMissionId`
+  - `world.towns.<town>.majorMissionCooldownUntilDay`
+  - `world.towns.<town>.crierQueue[]`
+- Nether + townsfolk additive keys:
+  - `world.nether.eventLedger[]`
+  - `world.nether.modifiers`
+  - `world.nether.deckState`
+  - `world.nether.lastTickDay`
+  - `world.quests[].origin`
+  - `world.quests[].townId`
+  - `world.quests[].npcKey`
+  - `world.quests[].supportsMajorMissionId`
 
 ## Test And Validation
 

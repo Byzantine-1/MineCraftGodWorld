@@ -84,7 +84,82 @@ god trait Mara
 god town board alpha 10
 ```
 
-## 7) Town Crier Verification (Optional, Runtime-Only)
+## 7) Major Mission Verification (Mayor Gate + Crier)
+
+```text
+god mayor talk alpha
+god mayor accept alpha
+god mission status alpha
+god mission advance alpha
+god mission complete alpha
+god mission fail alpha route collapsed
+god town board alpha 10
+god news tail 10
+god chronicle tail 10
+```
+
+Expected outputs include lines like:
+
+- `GOD MAYOR TALK: town=alpha ...`
+- `GOD MAYOR ACCEPT: town=alpha ...`
+- `GOD MISSION STATUS: town=alpha ...`
+- `GOD TOWN BOARD MAJOR MISSION ACTIVE: ...` or `... TEASER: ...`
+
+Durable state changes are in `src/memory.json` under:
+
+- `world.majorMissions[]`
+- `world.towns.<town>.activeMajorMissionId`
+- `world.towns.<town>.majorMissionCooldownUntilDay`
+- `world.towns.<town>.crierQueue[]`
+
+## 8) Nether + Townsfolk Verification (Phase 2)
+
+```text
+god nether status
+god nether tick
+god nether status
+god town board alpha 10
+god news tail 10
+god chronicle tail 10
+
+god townsfolk talk alpha gate_warden
+god townsfolk talk alpha gate_warden
+god quest list alpha
+god quest show <quest_id>
+```
+
+Expected outputs include lines like:
+
+- `GOD NETHER STATUS: seed=... cursor=... last_tick_day=...`
+- `GOD NETHER TICK: n_days=... applied_events=...`
+- `GOD TOWN BOARD NETHER PULSE: longNight=... omen=... scarcity=... threat=...`
+- `GOD TOWN BOARD SIDE QUESTS TOP: count=...`
+- `GOD TOWNSFOLK TALK: town=alpha ... status=created|existing ...`
+- `GOD QUEST: ... origin=townsfolk ...`
+
+Durable state changes are in `src/memory.json` under:
+
+- `world.nether.eventLedger[]` (bounded)
+- `world.nether.modifiers`
+- `world.nether.deckState`
+- `world.nether.lastTickDay`
+- `world.towns.<town>.crierQueue[]` (`nether_event` entries, bounded)
+- `world.quests[]` townsfolk additive fields:
+  - `origin: "townsfolk"`
+  - `townId`
+  - `npcKey`
+  - `supportsMajorMissionId` (when linked)
+
+Replay/idempotency check:
+
+```text
+god nether tick 5
+god nether tick 5   # same operation replay path should not duplicate durable effects
+```
+
+In harness/integration paths where the same operation/event id is retried, duplicate re-application should be a durable no-op.
+
+## 9) Town Crier Verification (Optional, Runtime-Only)
 
 Start a new shell before `npm run cli`:
 
@@ -111,7 +186,7 @@ Expected:
 
 Disable by clearing env vars and restarting CLI.
 
-## 8) Release Gate Checklist
+## 10) Release Gate Checklist
 
 Before merge/release:
 

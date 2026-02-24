@@ -11,6 +11,7 @@ const RUMOR_TASK_KINDS = new Set(['rumor_trade', 'rumor_visit', 'rumor_choice'])
 const QUEST_STATES = new Set(['offered', 'accepted', 'in_progress', 'completed', 'cancelled', 'failed'])
 const QUEST_ACTIVE_STATES = new Set(['accepted', 'in_progress'])
 const QUEST_CANCELABLE_STATES = new Set(['offered', 'accepted', 'in_progress'])
+const MAJOR_MISSION_STATUSES = new Set(['teased', 'briefed', 'active', 'completed', 'failed'])
 const DEFAULT_TRADE_QUEST_REWARD = 8
 const DEFAULT_VISIT_QUEST_REWARD = 5
 const RUMOR_KIND_SET = new Set(['grounded', 'supernatural', 'political'])
@@ -193,6 +194,45 @@ const MARKET_DAY_SIGNALS = [
 const CONTRACT_MAX_PER_TOWN_PER_DAY = 2
 const CONTRACT_REWARD_MIN = 1
 const CONTRACT_REWARD_MAX = 12
+const MAJOR_MISSION_PHASE_START = 1
+const MAJOR_MISSION_PHASE_MAX = 3
+const MAJOR_MISSION_COOLDOWN_DAYS = 2
+const MAJOR_MISSION_MAX_PAYLOAD_KEYS = 12
+const TOWN_CRIER_QUEUE_MAX_ENTRIES = 40
+const MAX_TOWNSFOLK_QUESTS_PER_TOWN = 24
+const MAX_NETHER_EVENT_LEDGER_ENTRIES = 120
+const MAX_NETHER_EVENT_PAYLOAD_KEYS = 10
+const NETHER_MAX_EVENTS_PER_DAY = 2
+const NETHER_MODIFIER_KEYS = ['longNight', 'omen', 'scarcity', 'threat']
+const NETHER_EVENT_TYPE_ORDER = [
+  'CALM_BEFORE_STORM',
+  'LONG_NIGHT',
+  'OMEN',
+  'SCARCITY',
+  'THREAT_SURGE'
+]
+const NETHER_EVENT_CONFIG = {
+  LONG_NIGHT: {
+    deltas: { longNight: 1, threat: 1 },
+    headline: 'The Nether sky lingers and every route feels one watch longer.'
+  },
+  OMEN: {
+    deltas: { omen: 1, threat: 1 },
+    headline: 'Ash-sign omens spread and town sentries tighten gate checks.'
+  },
+  SCARCITY: {
+    deltas: { scarcity: 1, threat: 1 },
+    headline: 'Nether shortages ripple into caravan ledgers and ration chatter.'
+  },
+  THREAT_SURGE: {
+    deltas: { threat: 2 },
+    headline: 'A surge from below rattles road posts and convoy discipline.'
+  },
+  CALM_BEFORE_STORM: {
+    deltas: { longNight: -1, omen: -1, scarcity: -1, threat: -1 },
+    headline: 'For one day the roads breathe easier before the next storm.'
+  }
+}
 const CONTRACT_TRADE_TEMPLATES = [
   {
     id: 'bread_basket',
@@ -311,6 +351,41 @@ const CONTRACT_ROUTE_TEMPLATES = [
 ]
 const NIGHT_TROUBLE_LANDMARKS = ['east well', 'north ridge', 'birch line', 'south bridge', 'old toll gate']
 const DECISION_DEPRECATION_NOTE = 'Deprecated in Trader Mode: decisions are no longer generated; use Contracts + Market Pulse.'
+const MAJOR_MISSION_TEMPLATES = [
+  {
+    id: 'iron_convoy',
+    title: 'Iron Convoy',
+    teaser: 'Quartermasters whisper that an iron convoy needs a guard.',
+    briefing: 'Escort the iron convoy through exposed roads before losses mount.',
+    phaseNotes: [
+      'Muster escorts at the gate.',
+      'Secure the ridge route.',
+      'Deliver the convoy to town stores.'
+    ]
+  },
+  {
+    id: 'fog_watch',
+    title: 'Fog Watch',
+    teaser: 'Lantern wardens ask for a fog-watch charter tonight.',
+    briefing: 'Light and hold watch posts before fog cuts the caravan lanes.',
+    phaseNotes: [
+      'Set lantern posts along the main road.',
+      'Hold escort relays through the fog belt.',
+      'Sweep and reopen the lane network.'
+    ]
+  },
+  {
+    id: 'ledger_reckoning',
+    title: 'Ledger Reckoning',
+    teaser: 'The mayor seeks hands for a tariff-ledger reckoning.',
+    briefing: 'Stabilize trade books and recover missing manifests before unrest rises.',
+    phaseNotes: [
+      'Collect disputed manifests.',
+      'Cross-check toll and dock ledgers.',
+      'Publish reconciled totals to calm markets.'
+    ]
+  }
+]
 const DECISION_TEMPLATE_BY_EVENT = {
   shortage: {
     prompt: 'Storehouses are thinning. Which trader route gets priority?',
@@ -2809,7 +2884,11 @@ function normalizeQuest(entry) {
   const id = asText(entry.id, '', 200)
   const type = asText(entry.type, '', 20).toLowerCase()
   const state = asText(entry.state, '', 20).toLowerCase()
+  const origin = asText(entry.origin, '', 40).toLowerCase()
   const town = asText(entry.town, '', 80)
+  const townId = asText(entry.townId, '', 80)
+  const npcKey = asText(entry.npcKey, '', 80)
+  const supportsMajorMissionId = asText(entry.supportsMajorMissionId, '', 200)
   const offeredAt = normalizeIsoDate(entry.offered_at)
   const acceptedAt = normalizeIsoDate(entry.accepted_at)
   const owner = asText(entry.owner, '', 80)
@@ -2844,7 +2923,11 @@ function normalizeQuest(entry) {
   const rumorId = rumorIdRaw || objectiveRumorId
   if (type === 'rumor_task' && !rumorId) return null
   if (rumorId) quest.rumor_id = rumorId
+  if (origin) quest.origin = origin
   if (town) quest.town = town
+  if (townId) quest.townId = townId
+  if (npcKey) quest.npcKey = npcKey
+  if (supportsMajorMissionId) quest.supportsMajorMissionId = supportsMajorMissionId
   if (acceptedAt) quest.accepted_at = acceptedAt
   if (owner) quest.owner = owner
   if (meta) quest.meta = meta
@@ -2861,10 +2944,74 @@ function normalizeWorldQuests(questsInput) {
 }
 
 /**
+ * @param {any} quest
+ */
+function isTownsfolkQuest(quest) {
+  const normalized = normalizeQuest(quest)
+  if (!normalized) return false
+  return asText(normalized.origin, '', 40).toLowerCase() === 'townsfolk'
+}
+
+/**
+ * @param {any} quest
+ */
+function asQuestOfferedAtMs(quest) {
+  const offeredAt = normalizeIsoDate(quest?.offered_at)
+  const atMs = Date.parse(offeredAt)
+  if (Number.isFinite(atMs)) return atMs
+  return 0
+}
+
+/**
+ * @param {any} quest
+ */
+function isQuestActiveForHistory(quest) {
+  const state = asText(quest?.state, '', 20).toLowerCase()
+  return state === 'accepted' || state === 'in_progress'
+}
+
+/**
+ * @param {any[]} quests
+ */
+function boundTownsfolkQuestHistory(quests) {
+  const normalized = (Array.isArray(quests) ? quests : [])
+    .map(normalizeQuest)
+    .filter(Boolean)
+  const byTown = new Map()
+  for (const quest of normalized) {
+    if (!isTownsfolkQuest(quest)) continue
+    const townKey = asText(quest.townId || quest.town, '', 80).toLowerCase()
+    if (!townKey) continue
+    if (!byTown.has(townKey)) byTown.set(townKey, [])
+    byTown.get(townKey).push(quest)
+  }
+  const dropIds = new Set()
+  for (const questsForTown of byTown.values()) {
+    if (questsForTown.length <= MAX_TOWNSFOLK_QUESTS_PER_TOWN) continue
+    const active = questsForTown
+      .filter(isQuestActiveForHistory)
+      .sort((left, right) => asQuestOfferedAtMs(right) - asQuestOfferedAtMs(left) || left.id.localeCompare(right.id))
+    const inactive = questsForTown
+      .filter(quest => !isQuestActiveForHistory(quest))
+      .sort((left, right) => asQuestOfferedAtMs(right) - asQuestOfferedAtMs(left) || left.id.localeCompare(right.id))
+    const keep = new Set()
+    for (const quest of [...active, ...inactive]) {
+      if (keep.size >= MAX_TOWNSFOLK_QUESTS_PER_TOWN) break
+      keep.add(quest.id.toLowerCase())
+    }
+    for (const quest of questsForTown) {
+      if (!keep.has(quest.id.toLowerCase())) dropIds.add(quest.id.toLowerCase())
+    }
+  }
+  if (dropIds.size === 0) return normalized
+  return normalized.filter(quest => !dropIds.has(quest.id.toLowerCase()))
+}
+
+/**
  * @param {any} world
  */
 function ensureWorldQuests(world) {
-  world.quests = normalizeWorldQuests(world.quests)
+  world.quests = boundTownsfolkQuestHistory(normalizeWorldQuests(world.quests))
   return world.quests
 }
 
@@ -2925,6 +3072,1066 @@ function createQuestId(quests, operationId, townName, type, atMs) {
     suffix += 1
   }
   return asText(`${base}-${shortStableHash(`${base}:fallback`)}`, base, 200)
+}
+
+/**
+ * @param {unknown} npcInput
+ */
+function normalizeNpcKey(npcInput) {
+  const name = asText(npcInput, '', 80).toLowerCase()
+  if (!name) return ''
+  const key = name
+    .replace(/[^a-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+  return asText(key, 'townsfolk', 80)
+}
+
+/**
+ * @param {number} day
+ * @param {number} seed
+ * @param {string} townName
+ * @param {string} npcKey
+ */
+function deterministicQuestIso(day, seed, townName, npcKey) {
+  const safeDay = Math.max(1, Math.trunc(Number(day) || 1))
+  const offsetMs = stableHashNumber(`${seed}:${townName}:${npcKey}:${safeDay}:quest_iso`) % 86400000
+  const baseEpochMs = Date.parse('2026-01-01T00:00:00.000Z')
+  return new Date(baseEpochMs + ((safeDay - 1) * 86400000) + offsetMs).toISOString()
+}
+
+/**
+ * @param {number} seed
+ * @param {string} townName
+ * @param {string} npcKey
+ * @param {number} day
+ */
+function createTownsfolkQuestId(seed, townName, npcKey, day) {
+  const hashBase = shortStableHash(`${seed}:${townName}:${npcKey}:${day}:townsfolk`)
+  return asText(`sq_${hashBase}_${Math.max(0, day).toString(36)}`, `sq_${hashBase}`, 200)
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {string} npcName
+ */
+function buildTownsfolkQuestDraft(world, townName, npcName) {
+  const clock = normalizeWorldClock(world?.clock)
+  const day = Math.max(1, Number(clock.day || 1))
+  const seed = deriveNetherSeed(world)
+  const npcKey = normalizeNpcKey(npcName)
+  const questId = createTownsfolkQuestId(seed, townName, npcKey, day)
+  const towns = deriveTownsFromMarkers(world?.markers || [])
+  const mode = stableHashNumber(`${seed}:${townName}:${npcKey}:${day}:mode`) % 2
+  const reward = 2 + (stableHashNumber(`${seed}:${townName}:${npcKey}:${day}:reward`) % 4)
+  const offeredAt = deterministicQuestIso(day, seed, townName, npcKey)
+  const offeredLabel = asText(npcName, npcKey, 80)
+  const missionView = getTownMajorMissionView(world, townName)
+  const activeMission = normalizeMajorMission(missionView?.activeMission)
+  const supportsMajorMissionId = activeMission ? activeMission.id : ''
+
+  if (mode === 0 || towns.length < 2) {
+    const n = 1 + (stableHashNumber(`${seed}:${townName}:${npcKey}:${day}:trade_n`) % 2)
+    const market = normalizeWorldMarkets(world?.markets)
+      .filter(item => {
+        const markerTown = findTownNameForMarker(world?.markers || [], asText(item?.marker, '', 80))
+        return sameText(markerTown, townName, 80)
+      })
+      .sort((a, b) => a.name.localeCompare(b.name))[0]?.name || ''
+    const objective = { kind: 'trade_n', n }
+    if (market) objective.market = market
+    return {
+      id: questId,
+      type: 'trade_n',
+      state: 'offered',
+      origin: 'townsfolk',
+      town: townName,
+      townId: townName,
+      npcKey,
+      offered_at: offeredAt,
+      objective,
+      progress: { done: 0 },
+      reward,
+      title: asText(`SIDE: ${offeredLabel} needs supplies`, 'SIDE: Townsfolk Supply Ask', 120),
+      desc: asText(`[${townName}] ${offeredLabel} asks for ${n} quick trade lot${n === 1 ? '' : 's'}.`, 'Townsfolk request posted.', 120),
+      ...(supportsMajorMissionId ? { supportsMajorMissionId } : {}),
+      meta: {
+        side: true,
+        townsfolk: true,
+        npc: offeredLabel,
+        day,
+        seed
+      }
+    }
+  }
+
+  const targetTown = pickContractRouteTarget(towns, townName, day) || townName
+  return {
+    id: questId,
+    type: 'visit_town',
+    state: 'offered',
+    origin: 'townsfolk',
+    town: townName,
+    townId: townName,
+    npcKey,
+    offered_at: offeredAt,
+    objective: { kind: 'visit_town', town: targetTown },
+    progress: { visited: false },
+    reward,
+    title: asText(`SIDE: ${offeredLabel} seeks a courier`, 'SIDE: Townsfolk Courier Ask', 120),
+    desc: asText(`[${townName}] ${offeredLabel} needs word carried to ${targetTown}.`, 'Townsfolk courier request posted.', 120),
+    ...(supportsMajorMissionId ? { supportsMajorMissionId } : {}),
+    meta: {
+      side: true,
+      townsfolk: true,
+      npc: offeredLabel,
+      day,
+      seed
+    }
+  }
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeMajorMissionPayloadValue(value) {
+  if (value === null) return null
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    return Math.trunc(value)
+  }
+  if (typeof value === 'string') {
+    const text = asText(value, '', 120)
+    return text || null
+  }
+  return null
+}
+
+/**
+ * @param {unknown} payloadInput
+ * @param {number} [maxKeys]
+ */
+function normalizeMajorMissionPayload(payloadInput, maxKeys) {
+  if (!payloadInput || typeof payloadInput !== 'object' || Array.isArray(payloadInput)) return {}
+  const payload = {}
+  const limit = Number.isInteger(maxKeys) && maxKeys > 0 ? maxKeys : MAJOR_MISSION_MAX_PAYLOAD_KEYS
+  let used = 0
+  for (const [keyRaw, valueRaw] of Object.entries(payloadInput)) {
+    if (used >= limit) break
+    const key = asText(keyRaw, '', 40)
+    if (!key) continue
+    const value = normalizeMajorMissionPayloadValue(valueRaw)
+    if (value === null) continue
+    payload[key] = value
+    used += 1
+  }
+  return payload
+}
+
+/**
+ * @param {unknown} valueInput
+ */
+function normalizeNetherModifierValue(valueInput) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return 0
+  return clamp(Math.trunc(value), -9, 9)
+}
+
+/**
+ * @param {unknown} modifiersInput
+ */
+function normalizeNetherModifiers(modifiersInput) {
+  const source = (modifiersInput && typeof modifiersInput === 'object' && !Array.isArray(modifiersInput))
+    ? modifiersInput
+    : {}
+  return {
+    longNight: normalizeNetherModifierValue(source.longNight),
+    omen: normalizeNetherModifierValue(source.omen),
+    scarcity: normalizeNetherModifierValue(source.scarcity),
+    threat: normalizeNetherModifierValue(source.threat)
+  }
+}
+
+/**
+ * @param {unknown} deckStateInput
+ * @param {number} fallbackSeed
+ */
+function normalizeNetherDeckState(deckStateInput, fallbackSeed) {
+  const source = (deckStateInput && typeof deckStateInput === 'object' && !Array.isArray(deckStateInput))
+    ? deckStateInput
+    : {}
+  const seed = Number(source.seed)
+  const cursor = Number(source.cursor)
+  return {
+    seed: Number.isInteger(seed) ? seed : fallbackSeed,
+    cursor: Number.isInteger(cursor) && cursor >= 0 ? cursor : 0
+  }
+}
+
+/**
+ * @param {unknown} ledgerEntryInput
+ */
+function normalizeNetherLedgerEntry(ledgerEntryInput) {
+  if (!ledgerEntryInput || typeof ledgerEntryInput !== 'object' || Array.isArray(ledgerEntryInput)) return null
+  const id = asText(ledgerEntryInput.id, '', 200)
+  const day = Number(ledgerEntryInput.day)
+  const typeRaw = asText(ledgerEntryInput.type, '', 40).toUpperCase()
+  const type = NETHER_EVENT_TYPE_ORDER.includes(typeRaw) ? typeRaw : ''
+  if (!id || !Number.isInteger(day) || day < 1 || !type) return null
+  return {
+    id,
+    day,
+    type,
+    payload: normalizeMajorMissionPayload(ledgerEntryInput.payload, MAX_NETHER_EVENT_PAYLOAD_KEYS),
+    applied: ledgerEntryInput.applied !== false
+  }
+}
+
+/**
+ * @param {unknown} ledgerInput
+ */
+function normalizeNetherLedger(ledgerInput) {
+  const ledger = (Array.isArray(ledgerInput) ? ledgerInput : [])
+    .map(normalizeNetherLedgerEntry)
+    .filter(Boolean)
+  if (ledger.length > MAX_NETHER_EVENT_LEDGER_ENTRIES) {
+    return ledger.slice(-MAX_NETHER_EVENT_LEDGER_ENTRIES)
+  }
+  return ledger
+}
+
+/**
+ * @param {any} world
+ */
+function deriveNetherSeed(world) {
+  const seed = Number(world?.events?.seed)
+  if (Number.isInteger(seed)) return seed
+  return 1337
+}
+
+/**
+ * @param {unknown} netherInput
+ * @param {number} fallbackSeed
+ */
+function normalizeNetherState(netherInput, fallbackSeed) {
+  const source = (netherInput && typeof netherInput === 'object' && !Array.isArray(netherInput))
+    ? netherInput
+    : {}
+  const safeSeed = Number.isInteger(fallbackSeed) ? fallbackSeed : 1337
+  const lastTickDay = Number(source.lastTickDay)
+  const nether = {
+    eventLedger: normalizeNetherLedger(source.eventLedger),
+    modifiers: normalizeNetherModifiers(source.modifiers),
+    deckState: normalizeNetherDeckState(source.deckState, safeSeed),
+    lastTickDay: Number.isInteger(lastTickDay) && lastTickDay >= 0 ? lastTickDay : 0
+  }
+  if (nether.lastTickDay > 0) return nether
+  let maxDay = 0
+  for (const entry of nether.eventLedger) {
+    if (entry.day > maxDay) maxDay = entry.day
+  }
+  nether.lastTickDay = maxDay
+  return nether
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldNether(world) {
+  world.nether = normalizeNetherState(world.nether, deriveNetherSeed(world))
+  return world.nether
+}
+
+/**
+ * @param {any} world
+ */
+function listKnownTownNames(world) {
+  const byTown = buildTownNameIndex(world)
+  return Array.from(byTown.values()).sort((a, b) => a.localeCompare(b))
+}
+
+/**
+ * @param {any} nether
+ * @param {number} day
+ */
+function drawNetherEventCount(nether, day) {
+  const seed = Number(nether?.deckState?.seed || 1337)
+  const cursor = Number(nether?.deckState?.cursor || 0)
+  const raw = stableHashNumber(`${seed}:${day}:${cursor}:nether_count`)
+  return raw % (NETHER_MAX_EVENTS_PER_DAY + 1)
+}
+
+/**
+ * @param {any} nether
+ * @param {number} day
+ * @param {number} drawIndex
+ */
+function drawNetherEventType(nether, day, drawIndex) {
+  const seed = Number(nether?.deckState?.seed || 1337)
+  const cursor = Number(nether?.deckState?.cursor || 0)
+  const idx = stableHashNumber(`${seed}:${day}:${cursor}:${drawIndex}:nether_type`) % NETHER_EVENT_TYPE_ORDER.length
+  return NETHER_EVENT_TYPE_ORDER[idx] || NETHER_EVENT_TYPE_ORDER[0]
+}
+
+/**
+ * @param {any[]} ledger
+ * @param {string} id
+ */
+function hasNetherLedgerEntry(ledger, id) {
+  const target = asText(id, '', 200).toLowerCase()
+  if (!target) return false
+  return (Array.isArray(ledger) ? ledger : [])
+    .some(entry => asText(entry?.id, '', 200).toLowerCase() === target)
+}
+
+/**
+ * @param {number} day
+ * @param {string} type
+ * @param {number} seed
+ * @param {number} cursor
+ */
+function createNetherEventId(day, type, seed, cursor) {
+  const hash = shortStableHash(`${seed}:${day}:${type}:${cursor}:nether_event`)
+  return asText(`ne_${hash}_${Math.max(0, day).toString(36)}`, `ne_${hash}`, 200)
+}
+
+/**
+ * @param {any} modifiers
+ * @param {Record<string, number>} deltas
+ */
+function applyNetherModifierDeltas(modifiers, deltas) {
+  const next = normalizeNetherModifiers(modifiers)
+  for (const key of NETHER_MODIFIER_KEYS) {
+    const delta = Number(deltas?.[key] || 0)
+    if (!Number.isFinite(delta) || delta === 0) continue
+    next[key] = clamp(Math.trunc(next[key] + delta), -9, 9)
+  }
+  return next
+}
+
+/**
+ * @param {any} nether
+ */
+function formatNetherModifierSummary(nether) {
+  const modifiers = normalizeNetherModifiers(nether?.modifiers)
+  return `longNight=${modifiers.longNight} omen=${modifiers.omen} scarcity=${modifiers.scarcity} threat=${modifiers.threat}`
+}
+
+/**
+ * @param {any} netherEvent
+ */
+function buildNetherHeadline(netherEvent) {
+  const type = asText(netherEvent?.type, '', 40).toUpperCase()
+  const config = NETHER_EVENT_CONFIG[type] || NETHER_EVENT_CONFIG.OMEN
+  const day = Number(netherEvent?.day || 0)
+  return asText(`[WORLD] NETHER ${type} day=${day}: ${config.headline}`, `[WORLD] NETHER ${type}.`, 240)
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   event: any,
+ *   idPrefix: string,
+ *   at: number
+ * }} input
+ */
+function appendNetherAnnouncements(memory, input) {
+  const event = normalizeNetherLedgerEntry(input?.event)
+  if (!event) return
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  if (!idPrefix) return
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : 0
+  const nether = ensureWorldNether(memory.world)
+  const headline = buildNetherHeadline(event)
+  const modifiersText = formatNetherModifierSummary(nether)
+  const message = asText(`${headline} ${modifiersText}`, headline, 240)
+  const towns = listKnownTownNames(memory.world)
+  for (const townName of towns) {
+    appendTownCrier(memory, {
+      townName,
+      at,
+      idPrefix: `${idPrefix}:town:${townName.toLowerCase()}`,
+      type: 'nether_event',
+      message
+    })
+  }
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:nether:${event.id.toLowerCase()}`,
+    type: 'nether',
+    msg: message,
+    at,
+    meta: {
+      event_id: event.id,
+      event_type: event.type,
+      day: event.day,
+      ...normalizeNetherModifiers(nether.modifiers)
+    }
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:nether:${event.id.toLowerCase()}`,
+    topic: 'world',
+    msg: message,
+    at,
+    meta: {
+      event_id: event.id,
+      event_type: event.type,
+      day: event.day,
+      ...normalizeNetherModifiers(nether.modifiers)
+    }
+  })
+}
+
+/**
+ * @param {any} memory
+ * @param {{day: number, idPrefix: string, at: number}} input
+ */
+function tickNetherForDay(memory, input) {
+  const day = Number(input?.day)
+  if (!Number.isInteger(day) || day < 1) return []
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  if (!idPrefix) return []
+  const nether = ensureWorldNether(memory.world)
+  if (day <= Number(nether.lastTickDay || 0)) return []
+
+  const drawCount = drawNetherEventCount(nether, day)
+  const applied = []
+  for (let drawIdx = 0; drawIdx < drawCount; drawIdx += 1) {
+    const seed = Number(nether.deckState.seed || 1337)
+    const cursor = Number(nether.deckState.cursor || 0)
+    const type = drawNetherEventType(nether, day, drawIdx)
+    const eventId = createNetherEventId(day, type, seed, cursor)
+    nether.deckState.cursor = cursor + 1
+    if (hasNetherLedgerEntry(nether.eventLedger, eventId)) continue
+    const config = NETHER_EVENT_CONFIG[type] || NETHER_EVENT_CONFIG.OMEN
+    const deltas = config.deltas || {}
+    nether.modifiers = applyNetherModifierDeltas(nether.modifiers, deltas)
+    const entry = normalizeNetherLedgerEntry({
+      id: eventId,
+      day,
+      type,
+      payload: {
+        cursor,
+        ...deltas
+      },
+      applied: true
+    })
+    if (!entry) continue
+    appendBounded(nether.eventLedger, entry, MAX_NETHER_EVENT_LEDGER_ENTRIES)
+    appendNetherAnnouncements(memory, {
+      event: entry,
+      idPrefix: `${idPrefix}:event:${eventId.toLowerCase()}`,
+      at: Number(input?.at || 0)
+    })
+    applied.push(entry)
+  }
+  nether.lastTickDay = day
+  return applied
+}
+
+/**
+ * @param {any} memory
+ * @param {{nDays: number, idPrefix: string, at: number}} input
+ */
+function advanceNetherByDays(memory, input) {
+  const nether = ensureWorldNether(memory.world)
+  const nDays = clamp(Math.trunc(Number(input?.nDays || 1)), 1, 1000)
+  let day = Number(nether.lastTickDay || 0)
+  const applied = []
+  for (let idx = 0; idx < nDays; idx += 1) {
+    day += 1
+    const entries = tickNetherForDay(memory, {
+      day,
+      at: input.at,
+      idPrefix: `${input.idPrefix}:day:${day}`
+    })
+    for (const entry of entries) applied.push(entry)
+  }
+  return {
+    lastTickDay: nether.lastTickDay,
+    applied
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{targetDay: number, idPrefix: string, at: number}} input
+ */
+function advanceNetherToDay(memory, input) {
+  const nether = ensureWorldNether(memory.world)
+  const targetDay = Math.max(0, Math.trunc(Number(input?.targetDay || 0)))
+  if (targetDay <= Number(nether.lastTickDay || 0)) {
+    return { lastTickDay: nether.lastTickDay, applied: [] }
+  }
+  const applied = []
+  for (let day = Number(nether.lastTickDay || 0) + 1; day <= targetDay; day += 1) {
+    const entries = tickNetherForDay(memory, {
+      day,
+      at: input.at,
+      idPrefix: `${input.idPrefix}:day:${day}`
+    })
+    for (const entry of entries) applied.push(entry)
+  }
+  return {
+    lastTickDay: nether.lastTickDay,
+    applied
+  }
+}
+
+/**
+ * @param {unknown} missionInput
+ */
+function normalizeMajorMission(missionInput) {
+  if (!missionInput || typeof missionInput !== 'object' || Array.isArray(missionInput)) return null
+  const id = asText(missionInput.id, '', 200)
+  const townId = asText(missionInput.townId, '', 80)
+  const templateId = asText(missionInput.templateId, '', 80).toLowerCase()
+  const status = asText(missionInput.status, '', 20).toLowerCase()
+  const issuedAtDay = Number(missionInput.issuedAtDay)
+  const acceptedAtDayRaw = Number(missionInput.acceptedAtDay)
+  const phaseRaw = missionInput.phase
+
+  if (!id || !townId || !templateId || !MAJOR_MISSION_STATUSES.has(status)) return null
+  if (!Number.isInteger(issuedAtDay) || issuedAtDay < 1) return null
+  if (!Number.isInteger(acceptedAtDayRaw) || acceptedAtDayRaw < 0) return null
+
+  let phase = null
+  if (Number.isInteger(phaseRaw) && phaseRaw >= 0) {
+    phase = phaseRaw
+  } else {
+    const phaseText = asText(phaseRaw, '', 40)
+    if (phaseText) phase = phaseText
+  }
+  if (phase === null) return null
+
+  return {
+    id,
+    townId,
+    templateId,
+    status,
+    phase,
+    issuedAtDay,
+    acceptedAtDay: acceptedAtDayRaw,
+    stakes: normalizeMajorMissionPayload(missionInput.stakes),
+    progress: normalizeMajorMissionPayload(missionInput.progress)
+  }
+}
+
+/**
+ * @param {unknown} missionsInput
+ */
+function normalizeWorldMajorMissions(missionsInput) {
+  return (Array.isArray(missionsInput) ? missionsInput : [])
+    .map(normalizeMajorMission)
+    .filter(Boolean)
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldMajorMissions(world) {
+  world.majorMissions = normalizeWorldMajorMissions(world.majorMissions)
+  return world.majorMissions
+}
+
+/**
+ * @param {unknown} crierEntryInput
+ */
+function normalizeTownCrierEntry(crierEntryInput) {
+  if (!crierEntryInput || typeof crierEntryInput !== 'object' || Array.isArray(crierEntryInput)) return null
+  const id = asText(crierEntryInput.id, '', 200)
+  const day = Number(crierEntryInput.day)
+  const type = asText(crierEntryInput.type, '', 40).toLowerCase()
+  const message = asText(crierEntryInput.message, '', 240)
+  const missionId = asText(crierEntryInput.missionId, '', 200)
+  if (!id || !Number.isInteger(day) || day < 0 || !type || !message) return null
+  const entry = { id, day, type, message }
+  if (missionId) entry.missionId = missionId
+  return entry
+}
+
+/**
+ * @param {unknown} queueInput
+ */
+function normalizeTownCrierQueue(queueInput) {
+  const queue = (Array.isArray(queueInput) ? queueInput : [])
+    .map(normalizeTownCrierEntry)
+    .filter(Boolean)
+  if (queue.length > TOWN_CRIER_QUEUE_MAX_ENTRIES) {
+    return queue.slice(-TOWN_CRIER_QUEUE_MAX_ENTRIES)
+  }
+  return queue
+}
+
+/**
+ * @param {unknown} townInput
+ */
+function normalizeTownMissionState(townInput) {
+  const source = (townInput && typeof townInput === 'object' && !Array.isArray(townInput))
+    ? townInput
+    : {}
+  const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
+  const cooldown = Number(source.majorMissionCooldownUntilDay)
+  return {
+    activeMajorMissionId,
+    majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
+    crierQueue: normalizeTownCrierQueue(source.crierQueue)
+  }
+}
+
+/**
+ * @param {unknown} townsInput
+ */
+function normalizeWorldTownMissionStates(townsInput) {
+  const source = (townsInput && typeof townsInput === 'object' && !Array.isArray(townsInput))
+    ? townsInput
+    : {}
+  const towns = {}
+  for (const [townRaw, townState] of Object.entries(source)) {
+    const townName = asText(townRaw, '', 80)
+    if (!townName) continue
+    towns[townName] = normalizeTownMissionState(townState)
+  }
+  return towns
+}
+
+/**
+ * @param {any} world
+ */
+function deriveTownNamesForMissionState(world) {
+  const names = new Map()
+  const addTownName = (townRaw) => {
+    const townName = asText(townRaw, '', 80)
+    if (!townName) return
+    const key = townName.toLowerCase()
+    if (!names.has(key)) names.set(key, townName)
+  }
+
+  for (const townName of deriveTownNamesForEvents(world)) addTownName(townName)
+  for (const townName of Object.keys(normalizeWorldTownMissionStates(world?.towns))) addTownName(townName)
+  for (const mission of normalizeWorldMajorMissions(world?.majorMissions)) addTownName(mission.townId)
+  for (const faction of Object.values(normalizeWorldStoryFactions(world?.factions))) {
+    for (const townName of normalizeStoryTownNames(faction?.towns)) addTownName(townName)
+  }
+  return Array.from(names.values()).sort((a, b) => a.localeCompare(b))
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldTownMissionStates(world) {
+  world.towns = normalizeWorldTownMissionStates(world.towns)
+  for (const townName of deriveTownNamesForMissionState(world)) {
+    if (!Object.prototype.hasOwnProperty.call(world.towns, townName)) {
+      world.towns[townName] = normalizeTownMissionState(null)
+    }
+  }
+  return world.towns
+}
+
+/**
+ * @param {any} world
+ */
+function enforceMajorMissionTownExclusivity(world) {
+  const missions = ensureWorldMajorMissions(world)
+  const towns = ensureWorldTownMissionStates(world)
+  const activeByTown = new Map()
+
+  for (let idx = 0; idx < missions.length; idx += 1) {
+    const mission = normalizeMajorMission(missions[idx])
+    if (!mission) continue
+    if (mission.status === 'active') {
+      const key = mission.townId.toLowerCase()
+      if (activeByTown.has(key)) {
+        mission.status = 'briefed'
+      } else {
+        activeByTown.set(key, { townName: mission.townId, missionId: mission.id })
+      }
+    }
+    missions[idx] = mission
+  }
+
+  for (const townName of Object.keys(towns)) {
+    towns[townName].activeMajorMissionId = null
+    towns[townName].crierQueue = normalizeTownCrierQueue(towns[townName].crierQueue)
+    const cooldown = Number(towns[townName].majorMissionCooldownUntilDay)
+    towns[townName].majorMissionCooldownUntilDay = Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0
+  }
+  for (const { townName, missionId } of activeByTown.values()) {
+    const canonicalTown = resolveTownName(world, townName) || townName
+    if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
+      towns[canonicalTown] = normalizeTownMissionState(null)
+    }
+    towns[canonicalTown].activeMajorMissionId = missionId
+  }
+}
+
+/**
+ * @param {any[]} missions
+ * @param {string} missionId
+ */
+function findMajorMissionById(missions, missionId) {
+  const target = asText(missionId, '', 200).toLowerCase()
+  if (!target) return null
+  for (const entry of missions || []) {
+    const mission = normalizeMajorMission(entry)
+    if (!mission) continue
+    if (mission.id.toLowerCase() === target) return mission
+  }
+  return null
+}
+
+/**
+ * @param {any[]} missions
+ * @param {string} townName
+ */
+function listMajorMissionsForTown(missions, townName) {
+  return (missions || [])
+    .map(normalizeMajorMission)
+    .filter(Boolean)
+    .filter(mission => sameText(mission.townId, townName, 80))
+    .sort((left, right) => {
+      const dayDiff = Number(right.issuedAtDay || 0) - Number(left.issuedAtDay || 0)
+      if (dayDiff !== 0) return dayDiff
+      return left.id.localeCompare(right.id)
+    })
+}
+
+/**
+ * @param {string} templateId
+ */
+function findMajorMissionTemplateById(templateId) {
+  const safeTemplateId = asText(templateId, '', 80).toLowerCase()
+  return MAJOR_MISSION_TEMPLATES.find(template => template.id === safeTemplateId) || null
+}
+
+/**
+ * @param {any} mission
+ */
+function getMajorMissionPhaseNote(mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const phase = Number(normalized.phase)
+  if (!Number.isInteger(phase) || phase < 1) return ''
+  const note = template?.phaseNotes?.[phase - 1]
+  return asText(note, '', 160)
+}
+
+/**
+ * @param {any} mission
+ */
+function formatMajorMissionStakes(mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return 'risk=- hot=- weak=- threat=-'
+  const risk = asText(normalized.stakes?.risk, '-', 40) || '-'
+  const hot = asText(normalized.stakes?.hotGood, '-', 40) || '-'
+  const weak = asText(normalized.stakes?.weakGood, '-', 40) || '-'
+  const threat = Number(normalized.stakes?.threat)
+  const threatText = Number.isInteger(threat) ? String(threat) : '-'
+  return `risk=${risk} hot=${hot} weak=${weak} threat=${threatText}`
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function getTownMajorMissionView(world, townName) {
+  const canonicalTown = resolveTownName(world, townName)
+  if (!canonicalTown) return null
+  enforceMajorMissionTownExclusivity(world)
+  const missions = ensureWorldMajorMissions(world)
+  const towns = ensureWorldTownMissionStates(world)
+  const clock = ensureWorldClock(world)
+  const townState = towns[canonicalTown] || normalizeTownMissionState(null)
+  const missionsByTown = listMajorMissionsForTown(missions, canonicalTown)
+
+  let activeMission = null
+  if (townState.activeMajorMissionId) {
+    activeMission = findMajorMissionById(missionsByTown, townState.activeMajorMissionId)
+  }
+  if (!activeMission) {
+    activeMission = missionsByTown.find(mission => mission.status === 'active') || null
+  }
+  const availableMission = missionsByTown.find(mission => (
+    mission.status === 'briefed' || mission.status === 'teased'
+  )) || null
+
+  return {
+    townName: canonicalTown,
+    day: clock.day,
+    townState,
+    activeMission,
+    availableMission,
+    missionsByTown
+  }
+}
+
+/**
+ * @param {any[]} missions
+ * @param {string} townName
+ * @param {number} day
+ * @param {string} templateId
+ * @param {number} serial
+ */
+function createMajorMissionId(missions, townName, day, templateId, serial) {
+  const hashBase = shortStableHash(`${townName}:${day}:${templateId}:${serial}:major_mission`)
+  const base = asText(`mm_${hashBase}_${Math.max(0, day).toString(36)}`, `mm_${hashBase}`, 200)
+  const used = new Set((missions || [])
+    .map(entry => asText(entry?.id, '', 200).toLowerCase())
+    .filter(Boolean))
+  if (!used.has(base.toLowerCase())) return base
+  let suffix = 2
+  while (suffix < 10000) {
+    const candidate = asText(`${base}-${suffix}`, base, 200)
+    if (!used.has(candidate.toLowerCase())) return candidate
+    suffix += 1
+  }
+  return asText(`${base}-${shortStableHash(`${base}:fallback`)}`, base, 200)
+}
+
+/**
+ * @param {string} townName
+ * @param {number} day
+ * @param {string} season
+ * @param {number} serial
+ */
+function pickMajorMissionTemplate(townName, day, season, serial) {
+  const templates = MAJOR_MISSION_TEMPLATES.slice()
+    .sort((left, right) => left.id.localeCompare(right.id))
+  if (templates.length === 0) return null
+  const idx = stableHashNumber(`${townName}:${day}:${season}:${serial}:major_template`) % templates.length
+  return templates[idx] || templates[0]
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function buildMajorMissionStakes(world, townName) {
+  const pulse = getMarketPulse(townName, world)
+  const risk = getRouteRisk(townName, world)
+  const threat = clamp(
+    Math.trunc(Number(normalizeWorldThreat(world?.threat).byTown[townName] || 0)),
+    0,
+    100
+  )
+  return normalizeMajorMissionPayload({
+    risk: risk.label,
+    hotGood: asText(pulse.hot[0]?.good, 'Bread', 40),
+    weakGood: asText(pulse.cold[0]?.good, 'Wool', 40),
+    threat
+  })
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function createMajorMissionDraft(world, townName) {
+  const missions = ensureWorldMajorMissions(world)
+  const clock = ensureWorldClock(world)
+  const serial = listMajorMissionsForTown(missions, townName).length + 1
+  const template = pickMajorMissionTemplate(townName, clock.day, clock.season, serial)
+    || MAJOR_MISSION_TEMPLATES[0]
+  const id = createMajorMissionId(missions, townName, clock.day, template.id, serial)
+  return normalizeMajorMission({
+    id,
+    townId: townName,
+    templateId: template.id,
+    status: 'briefed',
+    phase: 0,
+    issuedAtDay: clock.day,
+    acceptedAtDay: 0,
+    stakes: buildMajorMissionStakes(world, townName),
+    progress: { advances: 0 }
+  })
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   at: number,
+ *   idPrefix: string,
+ *   type: string,
+ *   message: string,
+ *   missionId?: string
+ * }} input
+ */
+function appendTownCrier(memory, input) {
+  const townName = asText(input?.townName, '', 80)
+  if (!townName) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null)
+  }
+  const queue = normalizeTownCrierQueue(towns[townName].crierQueue)
+  const clock = ensureWorldClock(memory.world)
+  const day = Number.isInteger(Number(clock.day)) ? Number(clock.day) : 0
+  const type = asText(input?.type, '', 40).toLowerCase()
+  const message = asText(input?.message, '', 240)
+  const missionId = asText(input?.missionId, '', 200)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const crierId = asText(`${idPrefix}:crier:${type}:${(missionId || townName).toLowerCase()}`, '', 200)
+  const entry = normalizeTownCrierEntry({
+    id: crierId,
+    day,
+    type,
+    message,
+    missionId: missionId || undefined
+  })
+  if (!entry) return null
+  queue.push(entry)
+  if (queue.length > TOWN_CRIER_QUEUE_MAX_ENTRIES) {
+    queue.splice(0, queue.length - TOWN_CRIER_QUEUE_MAX_ENTRIES)
+  }
+  towns[townName].crierQueue = queue
+  return entry
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   mission: any,
+ *   at: number,
+ *   idPrefix: string,
+ *   crierType: string,
+ *   message: string,
+ *   status: string
+ * }} input
+ */
+function appendMajorMissionAnnouncements(memory, input) {
+  const mission = normalizeMajorMission(input?.mission)
+  if (!mission) return
+  const townName = asText(input?.townName, '', 80)
+  const message = asText(input?.message, '', 240)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const crierType = asText(input?.crierType, '', 40).toLowerCase()
+  const status = asText(input?.status, '', 20).toLowerCase()
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  if (!townName || !message || !idPrefix || !crierType) return
+
+  appendTownCrier(memory, {
+    townName,
+    at,
+    idPrefix,
+    type: crierType,
+    message,
+    missionId: mission.id
+  })
+
+  const meta = {
+    mission_id: mission.id,
+    template_id: mission.templateId,
+    status: status || mission.status,
+    phase: Number.isInteger(Number(mission.phase)) ? Number(mission.phase) : 0
+  }
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:major_mission:${crierType}:${mission.id.toLowerCase()}`,
+    type: 'major_mission',
+    msg: message,
+    at,
+    town: townName,
+    meta
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:major_mission:${crierType}:${mission.id.toLowerCase()}`,
+    topic: 'mission',
+    msg: message,
+    at,
+    town: townName,
+    meta
+  })
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ */
+function buildMajorMissionTeaserMessage(townName, mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const teaser = asText(template?.teaser, 'A major mission is available.', 160)
+  return asText(`[${townName}] MAYOR TEASER: ${teaser}`, teaser, 240)
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ */
+function buildMajorMissionBriefingMessage(townName, mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const title = asText(template?.title, normalized.templateId, 80)
+  const briefing = asText(template?.briefing, 'Major mission briefing posted.', 160)
+  return asText(
+    `[${townName}] MAYOR BRIEFING: ${title}. ${briefing} Stakes: ${formatMajorMissionStakes(normalized)}`,
+    briefing,
+    240
+  )
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ */
+function buildMajorMissionAcceptanceMessage(townName, mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const title = asText(template?.title, normalized.templateId, 80)
+  return asText(
+    `[${townName}] MAYOR ACCEPTED: ${title} begins at phase ${normalized.phase}.`,
+    `${title} begins.`,
+    240
+  )
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ */
+function buildMajorMissionPhaseChangeMessage(townName, mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const note = getMajorMissionPhaseNote(normalized)
+  const detail = note ? ` ${note}` : ''
+  return asText(
+    `[${townName}] MAJOR MISSION PHASE ${normalized.phase}.${detail}`,
+    `Phase ${normalized.phase}.`,
+    240
+  )
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ */
+function buildMajorMissionCompletionMessage(townName, mission) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const title = asText(template?.title, normalized.templateId, 80)
+  return asText(`[${townName}] MAJOR MISSION WON: ${title} is complete.`, `${title} complete.`, 240)
+}
+
+/**
+ * @param {string} townName
+ * @param {any} mission
+ * @param {string | null} reason
+ */
+function buildMajorMissionFailureMessage(townName, mission, reason) {
+  const normalized = normalizeMajorMission(mission)
+  if (!normalized) return ''
+  const template = findMajorMissionTemplateById(normalized.templateId)
+  const title = asText(template?.title, normalized.templateId, 80)
+  const safeReason = asText(reason, '', 120)
+  const reasonSuffix = safeReason ? ` Reason: ${safeReason}.` : ''
+  return asText(`[${townName}] MAJOR MISSION FAILED: ${title}.${reasonSuffix}`, `${title} failed.`, 240)
 }
 
 /**
@@ -3471,6 +4678,17 @@ function findTownByName(towns, townName) {
  */
 function buildTownNameIndex(world) {
   const names = new Map()
+  for (const townRaw of Object.keys(normalizeWorldTownMissionStates(world?.towns))) {
+    const safeName = asText(townRaw, '', 80)
+    if (!safeName) continue
+    names.set(safeName.toLowerCase(), safeName)
+  }
+  for (const mission of normalizeWorldMajorMissions(world?.majorMissions)) {
+    const safeName = asText(mission?.townId, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
   for (const town of deriveTownsFromMarkers(world?.markers || [])) {
     const safeName = asText(town?.townName, '', 80)
     if (!safeName) continue
@@ -3693,6 +4911,57 @@ function parseGodCommand(rawCommand) {
       return { type: 'town_board', townName, limit }
     }
     return { type: 'invalid', reason: 'Usage: god town list | god town board <townName> [N]' }
+  }
+
+  if (head === 'mayor') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const townName = asText(words.slice(2).join(' '), '', 80)
+    if (!townName || words.length < 3) {
+      return { type: 'invalid', reason: 'Usage: god mayor talk <townName> | god mayor accept <townName>' }
+    }
+    if (action === 'talk') return { type: 'mayor_talk', townName }
+    if (action === 'accept') return { type: 'mayor_accept', townName }
+    return { type: 'invalid', reason: 'Usage: god mayor talk <townName> | god mayor accept <townName>' }
+  }
+
+  if (head === 'mission') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const townName = asText(words[2], '', 80)
+    if (!townName || words.length < 3) {
+      return { type: 'invalid', reason: 'Usage: god mission status <townName> | god mission advance <townName> | god mission complete <townName> | god mission fail <townName> [reason]' }
+    }
+    if (action === 'status' && words.length === 3) return { type: 'mission_status', townName }
+    if (action === 'advance' && words.length === 3) return { type: 'mission_advance', townName }
+    if (action === 'complete' && words.length === 3) return { type: 'mission_complete', townName }
+    if (action === 'fail' && words.length >= 3) {
+      const reason = asText(words.slice(3).join(' '), '', 160) || null
+      return { type: 'mission_fail', townName, reason }
+    }
+    return { type: 'invalid', reason: 'Usage: god mission status <townName> | god mission advance <townName> | god mission complete <townName> | god mission fail <townName> [reason]' }
+  }
+
+  if (head === 'nether') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    if (action === 'status' && words.length === 2) return { type: 'nether_status' }
+    if (action === 'tick') {
+      if (words.length > 3) return { type: 'invalid', reason: 'Usage: god nether status | god nether tick [nDays]' }
+      const nDays = words[2] === undefined ? 1 : Number(words[2])
+      if (!Number.isInteger(nDays) || nDays < 1) {
+        return { type: 'invalid', reason: 'Usage: god nether status | god nether tick [nDays]' }
+      }
+      return { type: 'nether_tick', nDays }
+    }
+    return { type: 'invalid', reason: 'Usage: god nether status | god nether tick [nDays]' }
+  }
+
+  if (head === 'townsfolk') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const townName = asText(words[2], '', 80)
+    const npcName = asText(words.slice(3).join(' '), '', 80)
+    if (action === 'talk' && townName && npcName) {
+      return { type: 'townsfolk_talk', townName, npcName }
+    }
+    return { type: 'invalid', reason: 'Usage: god townsfolk talk <townName> <npcIdOrName>' }
   }
 
   if (head === 'clock') {
@@ -5063,6 +6332,11 @@ function createGodCommandService(deps) {
               day: clock.day,
               at
             })
+            advanceNetherToDay(memory, {
+              targetDay: clock.day,
+              at,
+              idPrefix: `${operationId}:clock_advance:${tickIdx}:nether`
+            })
           }
           if (nextPhase === 'night') {
             emitNightCaravanTrouble(memory, {
@@ -5970,6 +7244,29 @@ function createGodCommandService(deps) {
       const pulse = getMarketPulse(town.townName, snapshot.world)
       const routeRisk = getRouteRisk(town.townName, snapshot.world)
       const traderTip = getTraderTip(town.townName, snapshot.world)
+      const nether = normalizeNetherState(snapshot.world?.nether, deriveNetherSeed(snapshot.world))
+      const latestNetherEvent = normalizeNetherLedger(nether.eventLedger).slice(-1)[0] || null
+      const missionView = getTownMajorMissionView(snapshot.world, town.townName)
+      const activeMajorMission = normalizeMajorMission(missionView?.activeMission)
+      const availableMajorMission = normalizeMajorMission(missionView?.availableMission)
+      const majorMissionLine = activeMajorMission
+        ? `GOD TOWN BOARD MAJOR MISSION ACTIVE: id=${activeMajorMission.id} template=${activeMajorMission.templateId} phase=${activeMajorMission.phase} ${formatMajorMissionStakes(activeMajorMission)}`
+        : availableMajorMission
+          ? `GOD TOWN BOARD MAJOR MISSION TEASER: id=${availableMajorMission.id} template=${availableMajorMission.templateId} status=${availableMajorMission.status} ${formatMajorMissionStakes(availableMajorMission)}`
+          : 'GOD TOWN BOARD MAJOR MISSION: (none)'
+      const sideQuestLines = quests
+        .filter((quest) => {
+          if (!isQuestLinkedToTown(quest)) return false
+          const origin = asText(quest.origin, '', 40).toLowerCase()
+          const isSide = origin === 'townsfolk' || quest.type === 'rumor_task' || quest.meta?.side === true
+          if (!isSide) return false
+          return quest.state === 'offered' || QUEST_ACTIVE_STATES.has(quest.state)
+        })
+        .sort(sortQuests)
+        .slice(0, Math.min(limit, 5))
+        .map(quest => (
+          `GOD TOWN BOARD SIDE QUEST: id=${quest.id} origin=${asText(quest.origin, quest.type === 'rumor_task' ? 'rumor' : 'quest', 40)} state=${quest.state} npc=${asText(quest.npcKey, '-', 80)} supports_major_mission_id=${asText(quest.supportsMajorMissionId, '-', 200)} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+        ))
 
       const lines = [
         `GOD TOWN BOARD: town=${town.townName} marker=${town.marker.name} x=${town.marker.x} y=${town.marker.y} z=${town.marker.z} population=${population} limit=${limit}`,
@@ -5977,6 +7274,13 @@ function createGodCommandService(deps) {
         ...pulse.cold.map(item => `GOD TOWN BOARD MARKET PULSE COLD: good=${item.good} reason=${item.reason}`),
         `GOD TOWN BOARD ROUTE RISK: label=${routeRisk.label} reason=${routeRisk.reason} note=${routeRisk.nightPenaltyHint}`,
         `GOD TOWN BOARD TRADER TIP: ${traderTip}`,
+        `GOD TOWN BOARD NETHER PULSE: ${formatNetherModifierSummary(nether)}`,
+        latestNetherEvent
+          ? `GOD TOWN BOARD NETHER EVENT: day=${latestNetherEvent.day} type=${latestNetherEvent.type} id=${latestNetherEvent.id}`
+          : 'GOD TOWN BOARD NETHER EVENT: (none)',
+        majorMissionLine,
+        `GOD TOWN BOARD SIDE QUESTS TOP: count=${sideQuestLines.length}`,
+        ...(sideQuestLines.length > 0 ? sideQuestLines : ['GOD TOWN BOARD SIDE QUEST: (none)']),
         `GOD TOWN BOARD CONTRACTS AVAILABLE: count=${contractAvailableQuestLines.length}`,
         ...(contractAvailableQuestLines.length > 0 ? contractAvailableQuestLines : ['GOD TOWN BOARD CONTRACT AVAILABLE: (none)']),
         `GOD TOWN BOARD CONTRACTS ACTIVE: count=${contractActiveQuestLines.length}`,
@@ -6009,6 +7313,683 @@ function createGodCommandService(deps) {
         ...(eventLines.length > 0 ? eventLines : ['GOD TOWN BOARD EVENT: (none)'])
       ]
       return { applied: true, command, audit: false, outputLines: lines }
+    }
+
+    if (parsed.type === 'mayor_talk') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view) return { applied: false, command, reason: 'Unknown town.' }
+      if (view.activeMission) {
+        const activeMission = normalizeMajorMission(view.activeMission)
+        const phaseNote = getMajorMissionPhaseNote(activeMission)
+        const phaseNoteLine = phaseNote ? `GOD MAYOR TALK NOTE: ${phaseNote}` : null
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [
+            `GOD MAYOR TALK: town=${townName} status=active mission_id=${activeMission.id} phase=${activeMission.phase} ${formatMajorMissionStakes(activeMission)}`,
+            ...(phaseNoteLine ? [phaseNoteLine] : [])
+          ]
+        }
+      }
+      if (view.availableMission) {
+        const availableMission = normalizeMajorMission(view.availableMission)
+        const teaser = buildMajorMissionTeaserMessage(townName, availableMission)
+        const briefing = buildMajorMissionBriefingMessage(townName, availableMission)
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [
+            `GOD MAYOR TALK: town=${townName} status=${availableMission.status} mission_id=${availableMission.id} template=${availableMission.templateId}`,
+            `GOD MAYOR TALK TEASER: ${teaser}`,
+            `GOD MAYOR TALK BRIEFING: ${briefing}`
+          ]
+        }
+      }
+      if (Number(view.townState.majorMissionCooldownUntilDay || 0) > Number(view.day || 0)) {
+        return {
+          applied: false,
+          command,
+          reason: `Mayor cooldown active until day ${view.townState.majorMissionCooldownUntilDay}.`
+        }
+      }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mayor talk: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          enforceMajorMissionTownExclusivity(memory.world)
+          const nextView = getTownMajorMissionView(memory.world, canonicalTown)
+          if (!nextView) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mayor talk: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          if (nextView.activeMission || nextView.availableMission) {
+            return normalizeMajorMission(nextView.activeMission || nextView.availableMission)
+          }
+          if (Number(nextView.townState.majorMissionCooldownUntilDay || 0) > Number(nextView.day || 0)) {
+            throw new AppError({
+              code: 'MISSION_COOLDOWN',
+              message: `Cooldown active for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+
+          const draftMission = createMajorMissionDraft(memory.world, canonicalTown)
+          const missions = ensureWorldMajorMissions(memory.world)
+          missions.push(draftMission)
+          enforceMajorMissionTownExclusivity(memory.world)
+          const at = now()
+          appendMajorMissionAnnouncements(memory, {
+            townName: canonicalTown,
+            mission: draftMission,
+            at,
+            idPrefix: `${operationId}:mayor_talk:${canonicalTown.toLowerCase()}`,
+            crierType: 'mission_available',
+            message: buildMajorMissionBriefingMessage(canonicalTown, draftMission),
+            status: 'briefed'
+          })
+          return draftMission
+        }, { eventId: `${operationId}:mayor_talk:${townName.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'MISSION_COOLDOWN') {
+          const latest = getTownMajorMissionView(memoryStore.getSnapshot().world, townName)
+          return {
+            applied: false,
+            command,
+            reason: `Mayor cooldown active until day ${latest?.townState?.majorMissionCooldownUntilDay || 0}.`
+          }
+        }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      const mission = normalizeMajorMission(tx.result)
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD MAYOR TALK: town=${townName} status=${mission.status} mission_id=${mission.id} template=${mission.templateId}`,
+          `GOD MAYOR TALK TEASER: ${buildMajorMissionTeaserMessage(townName, mission)}`,
+          `GOD MAYOR TALK BRIEFING: ${buildMajorMissionBriefingMessage(townName, mission)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'mayor_accept') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view) return { applied: false, command, reason: 'Unknown town.' }
+      if (view.activeMission) return { applied: false, command, reason: 'Major mission already active.' }
+      if (Number(view.townState.majorMissionCooldownUntilDay || 0) > Number(view.day || 0)) {
+        return {
+          applied: false,
+          command,
+          reason: `Mayor cooldown active until day ${view.townState.majorMissionCooldownUntilDay}.`
+        }
+      }
+      if (!view.availableMission) {
+        return { applied: false, command, reason: 'No major mission briefing is available. Talk to the mayor first.' }
+      }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mayor accept: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          enforceMajorMissionTownExclusivity(memory.world)
+          const nextView = getTownMajorMissionView(memory.world, canonicalTown)
+          if (!nextView) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mayor accept: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          if (nextView.activeMission) {
+            throw new AppError({
+              code: 'MISSION_ALREADY_ACTIVE',
+              message: `Major mission already active for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          if (Number(nextView.townState.majorMissionCooldownUntilDay || 0) > Number(nextView.day || 0)) {
+            throw new AppError({
+              code: 'MISSION_COOLDOWN',
+              message: `Cooldown active for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const availableMission = normalizeMajorMission(nextView.availableMission)
+          if (!availableMission) {
+            throw new AppError({
+              code: 'MISSION_UNAVAILABLE',
+              message: `No briefed mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const missions = ensureWorldMajorMissions(memory.world)
+          const idx = missions.findIndex(item => sameText(item?.id, availableMission.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'MISSION_UNAVAILABLE',
+              message: `No briefed mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const mission = normalizeMajorMission(missions[idx])
+          if (!mission || (mission.status !== 'briefed' && mission.status !== 'teased')) {
+            throw new AppError({
+              code: 'MISSION_UNAVAILABLE',
+              message: `No briefed mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          mission.status = 'active'
+          mission.phase = MAJOR_MISSION_PHASE_START
+          mission.acceptedAtDay = clock.day
+          mission.progress = normalizeMajorMissionPayload({
+            ...mission.progress,
+            advances: Number(mission.progress?.advances || 0),
+            acceptedAtDay: clock.day
+          })
+          missions[idx] = mission
+          const towns = ensureWorldTownMissionStates(memory.world)
+          if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
+            towns[canonicalTown] = normalizeTownMissionState(null)
+          }
+          towns[canonicalTown].activeMajorMissionId = mission.id
+          enforceMajorMissionTownExclusivity(memory.world)
+          const at = now()
+          appendMajorMissionAnnouncements(memory, {
+            townName: canonicalTown,
+            mission,
+            at,
+            idPrefix: `${operationId}:mayor_accept:${canonicalTown.toLowerCase()}`,
+            crierType: 'mission_accepted',
+            message: buildMajorMissionAcceptanceMessage(canonicalTown, mission),
+            status: 'active'
+          })
+          return mission
+        }, { eventId: `${operationId}:mayor_accept:${townName.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'MISSION_ALREADY_ACTIVE') return { applied: false, command, reason: 'Major mission already active.' }
+        if (err instanceof AppError && err.code === 'MISSION_COOLDOWN') {
+          const latest = getTownMajorMissionView(memoryStore.getSnapshot().world, townName)
+          return {
+            applied: false,
+            command,
+            reason: `Mayor cooldown active until day ${latest?.townState?.majorMissionCooldownUntilDay || 0}.`
+          }
+        }
+        if (err instanceof AppError && err.code === 'MISSION_UNAVAILABLE') {
+          return { applied: false, command, reason: 'No major mission briefing is available. Talk to the mayor first.' }
+        }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD MAYOR ACCEPT: town=${townName} mission_id=${tx.result.id} phase=${tx.result.phase} status=${tx.result.status}`,
+          `GOD MAYOR ACCEPT BRIEF: ${buildMajorMissionAcceptanceMessage(townName, tx.result)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'mission_status') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view) return { applied: false, command, reason: 'Unknown town.' }
+      const crierQueue = normalizeTownCrierQueue(view.townState?.crierQueue)
+      const lines = [
+        `GOD MISSION STATUS: town=${townName} day=${view.day} cooldown_until_day=${view.townState.majorMissionCooldownUntilDay} active_mission=${view.townState.activeMajorMissionId || '-'}`
+      ]
+      if (view.activeMission) {
+        lines.push(
+          `GOD MISSION ACTIVE: id=${view.activeMission.id} template=${view.activeMission.templateId} phase=${view.activeMission.phase} ${formatMajorMissionStakes(view.activeMission)}`
+        )
+      } else if (view.availableMission) {
+        lines.push(
+          `GOD MISSION AVAILABLE: id=${view.availableMission.id} status=${view.availableMission.status} template=${view.availableMission.templateId} ${formatMajorMissionStakes(view.availableMission)}`
+        )
+      } else {
+        lines.push('GOD MISSION: (none)')
+      }
+      const recentCrier = crierQueue.slice(-3)
+      lines.push(`GOD MISSION CRIER: count=${crierQueue.length}`)
+      if (recentCrier.length > 0) {
+        for (const item of recentCrier) {
+          lines.push(`GOD MISSION CRIER ITEM: day=${item.day} type=${item.type} mission_id=${item.missionId || '-'} message=${item.message}`)
+        }
+      }
+      return { applied: true, command, audit: false, outputLines: lines }
+    }
+
+    if (parsed.type === 'mission_advance') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view || !view.activeMission) return { applied: false, command, reason: 'No active major mission.' }
+      const phase = Number(view.activeMission.phase)
+      if (!Number.isInteger(phase) || phase < MAJOR_MISSION_PHASE_START) {
+        return { applied: false, command, reason: 'Active mission phase is invalid.' }
+      }
+      if (phase >= MAJOR_MISSION_PHASE_MAX) {
+        return { applied: false, command, reason: 'Major mission is already at final phase.' }
+      }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mission advance: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          enforceMajorMissionTownExclusivity(memory.world)
+          const nextView = getTownMajorMissionView(memory.world, canonicalTown)
+          const activeMission = normalizeMajorMission(nextView?.activeMission)
+          if (!activeMission) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const currentPhase = Number(activeMission.phase)
+          if (!Number.isInteger(currentPhase) || currentPhase < MAJOR_MISSION_PHASE_START) {
+            throw new AppError({
+              code: 'MISSION_PHASE_INVALID',
+              message: `Mission phase invalid for ${activeMission.id}.`,
+              recoverable: true
+            })
+          }
+          if (currentPhase >= MAJOR_MISSION_PHASE_MAX) {
+            throw new AppError({
+              code: 'MISSION_PHASE_FINAL',
+              message: `Mission ${activeMission.id} already at final phase.`,
+              recoverable: true
+            })
+          }
+          const missions = ensureWorldMajorMissions(memory.world)
+          const idx = missions.findIndex(item => sameText(item?.id, activeMission.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const mission = normalizeMajorMission(missions[idx])
+          mission.phase = currentPhase + 1
+          const clock = ensureWorldClock(memory.world)
+          mission.progress = normalizeMajorMissionPayload({
+            ...mission.progress,
+            advances: Number(mission.progress?.advances || 0) + 1,
+            lastAdvancedDay: clock.day
+          })
+          missions[idx] = mission
+          enforceMajorMissionTownExclusivity(memory.world)
+          const at = now()
+          appendMajorMissionAnnouncements(memory, {
+            townName: canonicalTown,
+            mission,
+            at,
+            idPrefix: `${operationId}:mission_advance:${canonicalTown.toLowerCase()}`,
+            crierType: 'mission_phase',
+            message: buildMajorMissionPhaseChangeMessage(canonicalTown, mission),
+            status: mission.status
+          })
+          return mission
+        }, { eventId: `${operationId}:mission_advance:${townName.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'MISSION_NOT_ACTIVE') return { applied: false, command, reason: 'No active major mission.' }
+        if (err instanceof AppError && err.code === 'MISSION_PHASE_INVALID') return { applied: false, command, reason: 'Active mission phase is invalid.' }
+        if (err instanceof AppError && err.code === 'MISSION_PHASE_FINAL') return { applied: false, command, reason: 'Major mission is already at final phase.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD MISSION ADVANCE: town=${townName} mission_id=${tx.result.id} phase=${tx.result.phase} status=${tx.result.status}`,
+          `GOD MISSION ADVANCE NOTE: ${buildMajorMissionPhaseChangeMessage(townName, tx.result)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'mission_complete') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view || !view.activeMission) return { applied: false, command, reason: 'No active major mission.' }
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mission complete: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          enforceMajorMissionTownExclusivity(memory.world)
+          const nextView = getTownMajorMissionView(memory.world, canonicalTown)
+          const activeMission = normalizeMajorMission(nextView?.activeMission)
+          if (!activeMission) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const missions = ensureWorldMajorMissions(memory.world)
+          const idx = missions.findIndex(item => sameText(item?.id, activeMission.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const mission = normalizeMajorMission(missions[idx])
+          const clock = ensureWorldClock(memory.world)
+          mission.status = 'completed'
+          mission.progress = normalizeMajorMissionPayload({
+            ...mission.progress,
+            completedAtDay: clock.day
+          })
+          missions[idx] = mission
+          const towns = ensureWorldTownMissionStates(memory.world)
+          if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
+            towns[canonicalTown] = normalizeTownMissionState(null)
+          }
+          towns[canonicalTown].activeMajorMissionId = null
+          towns[canonicalTown].majorMissionCooldownUntilDay = clock.day + MAJOR_MISSION_COOLDOWN_DAYS
+          enforceMajorMissionTownExclusivity(memory.world)
+          const at = now()
+          appendMajorMissionAnnouncements(memory, {
+            townName: canonicalTown,
+            mission,
+            at,
+            idPrefix: `${operationId}:mission_complete:${canonicalTown.toLowerCase()}`,
+            crierType: 'mission_win',
+            message: buildMajorMissionCompletionMessage(canonicalTown, mission),
+            status: 'completed'
+          })
+          return {
+            mission,
+            cooldownUntilDay: towns[canonicalTown].majorMissionCooldownUntilDay
+          }
+        }, { eventId: `${operationId}:mission_complete:${townName.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'MISSION_NOT_ACTIVE') return { applied: false, command, reason: 'No active major mission.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD MISSION COMPLETE: town=${townName} mission_id=${tx.result.mission.id} status=${tx.result.mission.status} cooldown_until_day=${tx.result.cooldownUntilDay}`,
+          `GOD MISSION COMPLETE NOTE: ${buildMajorMissionCompletionMessage(townName, tx.result.mission)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'mission_fail') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const view = getTownMajorMissionView(snapshot.world, townName)
+      if (!view || !view.activeMission) return { applied: false, command, reason: 'No active major mission.' }
+      const failReason = asText(parsed.reason, '', 160) || null
+
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for mission fail: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          enforceMajorMissionTownExclusivity(memory.world)
+          const nextView = getTownMajorMissionView(memory.world, canonicalTown)
+          const activeMission = normalizeMajorMission(nextView?.activeMission)
+          if (!activeMission) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const missions = ensureWorldMajorMissions(memory.world)
+          const idx = missions.findIndex(item => sameText(item?.id, activeMission.id, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'MISSION_NOT_ACTIVE',
+              message: `No active mission for ${canonicalTown}.`,
+              recoverable: true
+            })
+          }
+          const mission = normalizeMajorMission(missions[idx])
+          const clock = ensureWorldClock(memory.world)
+          mission.status = 'failed'
+          mission.progress = normalizeMajorMissionPayload({
+            ...mission.progress,
+            failedAtDay: clock.day,
+            ...(failReason ? { failReason } : {})
+          })
+          missions[idx] = mission
+          const towns = ensureWorldTownMissionStates(memory.world)
+          if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
+            towns[canonicalTown] = normalizeTownMissionState(null)
+          }
+          towns[canonicalTown].activeMajorMissionId = null
+          towns[canonicalTown].majorMissionCooldownUntilDay = clock.day + MAJOR_MISSION_COOLDOWN_DAYS
+          enforceMajorMissionTownExclusivity(memory.world)
+          const at = now()
+          appendMajorMissionAnnouncements(memory, {
+            townName: canonicalTown,
+            mission,
+            at,
+            idPrefix: `${operationId}:mission_fail:${canonicalTown.toLowerCase()}`,
+            crierType: 'mission_fail',
+            message: buildMajorMissionFailureMessage(canonicalTown, mission, failReason),
+            status: 'failed'
+          })
+          return {
+            mission,
+            cooldownUntilDay: towns[canonicalTown].majorMissionCooldownUntilDay
+          }
+        }, { eventId: `${operationId}:mission_fail:${townName.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'MISSION_NOT_ACTIVE') return { applied: false, command, reason: 'No active major mission.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD MISSION FAIL: town=${townName} mission_id=${tx.result.mission.id} status=${tx.result.mission.status} cooldown_until_day=${tx.result.cooldownUntilDay} reason=${failReason || '-'}`,
+          `GOD MISSION FAIL NOTE: ${buildMajorMissionFailureMessage(townName, tx.result.mission, failReason)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'nether_status') {
+      const snapshot = memoryStore.getSnapshot()
+      const nether = normalizeNetherState(snapshot.world?.nether, deriveNetherSeed(snapshot.world))
+      const recent = normalizeNetherLedger(nether.eventLedger).slice(-5)
+      const lines = [
+        `GOD NETHER STATUS: seed=${nether.deckState.seed} cursor=${nether.deckState.cursor} last_tick_day=${nether.lastTickDay} ledger_count=${nether.eventLedger.length}`,
+        `GOD NETHER MODIFIERS: ${formatNetherModifierSummary(nether)}`,
+        `GOD NETHER LEDGER: count=${recent.length}`
+      ]
+      if (recent.length === 0) {
+        lines.push('GOD NETHER LEDGER ITEM: (none)')
+      } else {
+        for (const entry of recent) {
+          lines.push(`GOD NETHER LEDGER ITEM: id=${entry.id} day=${entry.day} type=${entry.type} applied=${entry.applied}`)
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: lines
+      }
+    }
+
+    if (parsed.type === 'nether_tick') {
+      const nDays = Math.trunc(Number(parsed.nDays || 1))
+      if (!Number.isInteger(nDays) || nDays < 1 || nDays > 1000) {
+        return { applied: false, command, reason: 'Invalid nDays.' }
+      }
+      const tx = await memoryStore.transact((memory) => {
+        const at = now()
+        const result = advanceNetherByDays(memory, {
+          nDays,
+          at,
+          idPrefix: `${operationId}:nether_tick`
+        })
+        const nether = ensureWorldNether(memory.world)
+        return {
+          nDays,
+          applied: result.applied,
+          lastTickDay: nether.lastTickDay,
+          modifiers: normalizeNetherModifiers(nether.modifiers)
+        }
+      }, { eventId: `${operationId}:nether_tick:${nDays}` })
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD NETHER TICK: n_days=${tx.result.nDays} applied_events=${tx.result.applied.length} last_tick_day=${tx.result.lastTickDay}`,
+          `GOD NETHER MODIFIERS: longNight=${tx.result.modifiers.longNight} omen=${tx.result.modifiers.omen} scarcity=${tx.result.modifiers.scarcity} threat=${tx.result.modifiers.threat}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'townsfolk_talk') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const npcKey = normalizeNpcKey(parsed.npcName)
+      if (!npcKey) return { applied: false, command, reason: 'Invalid npc.' }
+
+      const tx = await memoryStore.transact((memory) => {
+        const canonicalTown = resolveTownName(memory.world, parsed.townName)
+        if (!canonicalTown) {
+          throw new AppError({
+            code: 'UNKNOWN_TOWN',
+            message: `Unknown town for townsfolk talk: ${parsed.townName}`,
+            recoverable: true
+          })
+        }
+        const questDraft = normalizeQuest(buildTownsfolkQuestDraft(memory.world, canonicalTown, parsed.npcName))
+        if (!questDraft) {
+          throw new AppError({
+            code: 'QUEST_BUILD_FAILED',
+            message: `Unable to build townsfolk quest for ${canonicalTown}.`,
+            recoverable: true
+          })
+        }
+        const quests = ensureWorldQuests(memory.world)
+        const already = findQuestById(quests, questDraft.id)
+        if (already) return { quest: already, created: false }
+        quests.push(questDraft)
+        memory.world.quests = boundTownsfolkQuestHistory(quests)
+        const at = now()
+        const msg = `[${canonicalTown}] TOWNSFOLK: ${parsed.npcName} posted side quest ${questDraft.id}.`
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:townsfolk_talk:${questDraft.id.toLowerCase()}`,
+          type: 'quest_offer',
+          msg,
+          at,
+          town: canonicalTown,
+          meta: {
+            quest_id: questDraft.id,
+            origin: 'townsfolk',
+            npc: parsed.npcName
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:townsfolk_talk:${questDraft.id.toLowerCase()}`,
+          topic: 'quest',
+          msg,
+          at,
+          town: canonicalTown,
+          meta: {
+            quest_id: questDraft.id,
+            origin: 'townsfolk',
+            npc: parsed.npcName
+          }
+        })
+        return { quest: questDraft, created: true }
+      }, { eventId: `${operationId}:townsfolk_talk:${townName.toLowerCase()}:${npcKey}` })
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      if (!tx.result?.quest) return { applied: false, command, reason: 'No townsfolk quest available.' }
+      return {
+        applied: true,
+        command,
+        audit: tx.result.created === true,
+        outputLines: [
+          `GOD TOWNSFOLK TALK: town=${townName} npc=${npcKey} status=${tx.result.created ? 'created' : 'existing'} quest_id=${tx.result.quest.id} type=${tx.result.quest.type} state=${tx.result.quest.state}`,
+          `GOD TOWNSFOLK QUEST: supports_major_mission_id=${asText(tx.result.quest.supportsMajorMissionId, '-', 200)} reward=${tx.result.quest.reward} title=${tx.result.quest.title}`
+        ]
+      }
     }
 
     if (parsed.type === 'chronicle_tail') {
@@ -6268,7 +8249,7 @@ function createGodCommandService(deps) {
         outputLines: [
           `GOD QUEST LIST: town=${townFilter ? townFilter.townName : '-'} count=${quests.length}`,
           ...quests.map(quest => (
-            `GOD QUEST: id=${quest.id} type=${quest.type} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
+            `GOD QUEST: id=${quest.id} type=${quest.type} origin=${asText(quest.origin, '-', 40)} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
           ))
         ]
       }
@@ -6297,7 +8278,7 @@ function createGodCommandService(deps) {
         command,
         audit: false,
         outputLines: [
-          `GOD QUEST SHOW: id=${quest.id} type=${quest.type} state=${quest.state} town=${quest.town || '-'} owner=${quest.owner || '-'} reward=${quest.reward} rumor_id=${quest.rumor_id || '-'}`,
+          `GOD QUEST SHOW: id=${quest.id} type=${quest.type} origin=${asText(quest.origin, '-', 40)} state=${quest.state} town=${quest.town || '-'} town_id=${asText(quest.townId, '-', 80)} npc=${asText(quest.npcKey, '-', 80)} supports_major_mission_id=${asText(quest.supportsMajorMissionId, '-', 200)} owner=${quest.owner || '-'} reward=${quest.reward} rumor_id=${quest.rumor_id || '-'}`,
           `GOD QUEST TITLE: ${quest.title}`,
           `GOD QUEST DESC: ${quest.desc}`,
           `GOD QUEST OBJECTIVE: ${objectiveLine}`,

@@ -254,6 +254,185 @@ test('memory store sanitizes additive quests shape on load', () => {
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
+test('memory store defaults additive major mission fields for known towns when missing', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      markers: [
+        { name: 'alpha_hall', x: 0, y: 64, z: 0, tag: 'town:alpha' }
+      ],
+      threat: { byTown: { beta: 12 } }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.majorMissions, [])
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
+  assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 0)
+  assert.deepEqual(snapshot.world.towns.alpha.crierQueue, [])
+  assert.equal(snapshot.world.towns.beta.activeMajorMissionId, null)
+  assert.equal(snapshot.world.towns.beta.majorMissionCooldownUntilDay, 0)
+  assert.deepEqual(snapshot.world.towns.beta.crierQueue, [])
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive major mission + town crier shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      markers: [
+        { name: 'alpha_hall', x: 0, y: 64, z: 0, tag: 'town:alpha' },
+        { name: 'beta_gate', x: 10, y: 64, z: 10, tag: 'town:beta' }
+      ],
+      majorMissions: [
+        {
+          id: 'mm_alpha_1',
+          townId: 'alpha',
+          templateId: 'iron_convoy',
+          status: 'active',
+          phase: 1,
+          issuedAtDay: 3,
+          acceptedAtDay: 3,
+          stakes: { risk: 'high', escortCount: 2 },
+          progress: { advances: 0 }
+        },
+        {
+          id: 'mm_alpha_2',
+          townId: 'alpha',
+          templateId: 'fog_watch',
+          status: 'active',
+          phase: 1,
+          issuedAtDay: 3,
+          acceptedAtDay: 0,
+          stakes: { risk: 'moderate' },
+          progress: { advances: 0 }
+        },
+        {
+          id: '',
+          townId: 'alpha',
+          templateId: 'broken',
+          status: 'active',
+          phase: 1,
+          issuedAtDay: 3,
+          acceptedAtDay: 0,
+          stakes: {},
+          progress: {}
+        }
+      ],
+      towns: {
+        alpha: {
+          activeMajorMissionId: 'mm_alpha_2',
+          majorMissionCooldownUntilDay: -4,
+          crierQueue: [
+            { id: 'a', day: 3, type: 'mission_available', message: 'Briefing posted', missionId: 'mm_alpha_1' },
+            { id: '', day: -1, type: '', message: '' }
+          ]
+        }
+      }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.equal(snapshot.world.majorMissions.length, 2)
+  assert.equal(snapshot.world.majorMissions[0].status, 'active')
+  assert.equal(snapshot.world.majorMissions[1].status, 'briefed')
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, 'mm_alpha_1')
+  assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 0)
+  assert.equal(snapshot.world.towns.alpha.crierQueue.length, 1)
+  assert.equal(snapshot.world.towns.alpha.crierQueue[0].id, 'a')
+  assert.equal(snapshot.world.towns.beta.activeMajorMissionId, null)
+  assert.deepEqual(snapshot.world.towns.beta.crierQueue, [])
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store defaults additive nether fields when missing', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      events: { seed: 2468 }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.nether.eventLedger, [])
+  assert.deepEqual(snapshot.world.nether.modifiers, {
+    longNight: 0,
+    omen: 0,
+    scarcity: 0,
+    threat: 0
+  })
+  assert.equal(snapshot.world.nether.deckState.seed, 2468)
+  assert.equal(snapshot.world.nether.deckState.cursor, 0)
+  assert.equal(snapshot.world.nether.lastTickDay, 0)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive nether ledger + townsfolk quest bounds on load', () => {
+  const filePath = createTempMemoryPath()
+  const townsfolkQuests = Array.from({ length: 40 }).map((_, idx) => ({
+    id: `sq_alpha_${idx}`,
+    type: 'trade_n',
+    state: idx % 7 === 0 ? 'accepted' : 'completed',
+    origin: 'townsfolk',
+    town: 'alpha',
+    townId: 'alpha',
+    npcKey: 'baker',
+    offered_at: `2026-02-${String((idx % 20) + 1).padStart(2, '0')}T00:00:00.000Z`,
+    objective: { kind: 'trade_n', n: 1 },
+    progress: { done: 1 },
+    reward: 1,
+    title: 'SIDE: Test',
+    desc: 'Bound me.'
+  }))
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      events: { seed: 999 },
+      quests: townsfolkQuests,
+      nether: {
+        eventLedger: Array.from({ length: 200 }).map((_, idx) => ({
+          id: `ne_${idx}`,
+          day: idx + 1,
+          type: idx % 2 === 0 ? 'OMEN' : 'SCARCITY',
+          payload: { threat: 1, cursor: idx },
+          applied: true
+        })),
+        modifiers: {
+          longNight: 44,
+          omen: -77,
+          scarcity: 2,
+          threat: 1000
+        },
+        deckState: {
+          seed: 42,
+          cursor: 7
+        },
+        lastTickDay: -3
+      }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  const townsfolk = snapshot.world.quests.filter(quest => quest.origin === 'townsfolk' && quest.townId === 'alpha')
+  assert.ok(townsfolk.length <= 24)
+  assert.equal(snapshot.world.nether.eventLedger.length, 120)
+  assert.equal(snapshot.world.nether.modifiers.longNight, 9)
+  assert.equal(snapshot.world.nether.modifiers.omen, -9)
+  assert.equal(snapshot.world.nether.modifiers.scarcity, 2)
+  assert.equal(snapshot.world.nether.modifiers.threat, 9)
+  assert.equal(snapshot.world.nether.deckState.seed, 42)
+  assert.equal(snapshot.world.nether.deckState.cursor, 7)
+  assert.equal(snapshot.world.nether.lastTickDay, 200)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
 test('memory store defaults additive clock/threat/faction/rep fields when missing', () => {
   const filePath = createTempMemoryPath()
   fs.writeFileSync(filePath, JSON.stringify({

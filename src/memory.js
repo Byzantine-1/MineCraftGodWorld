@@ -153,7 +153,11 @@ const {
  *       id: string,
  *       type: 'trade_n' | 'visit_town' | 'rumor_task',
  *       state: 'offered' | 'accepted' | 'in_progress' | 'completed' | 'cancelled' | 'failed',
+ *       origin?: string,
  *       town?: string,
+ *       townId?: string,
+ *       npcKey?: string,
+ *       supportsMajorMissionId?: string,
  *       offered_at: string,
  *       accepted_at?: string,
  *       owner?: string,
@@ -175,6 +179,48 @@ const {
  *       desc: string,
  *       meta?: Record<string, string | number | boolean | null>
  *     }>,
+ *     majorMissions: Array<{
+ *       id: string,
+ *       townId: string,
+ *       templateId: string,
+ *       status: 'teased' | 'briefed' | 'active' | 'completed' | 'failed',
+ *       phase: number | string,
+ *       issuedAtDay: number,
+ *       acceptedAtDay: number,
+ *       stakes: Record<string, string | number | boolean | null>,
+ *       progress: Record<string, string | number | boolean | null>
+ *     }>,
+ *     towns: Record<string, {
+ *       activeMajorMissionId: string | null,
+ *       majorMissionCooldownUntilDay: number,
+ *       crierQueue: Array<{
+ *         id: string,
+ *         day: number,
+ *         type: string,
+ *         message: string,
+ *         missionId?: string
+ *       }>
+ *     }>,
+ *     nether: {
+ *       eventLedger: Array<{
+ *         id: string,
+ *         day: number,
+ *         type: string,
+ *         payload: Record<string, string | number | boolean | null>,
+ *         applied: boolean
+ *       }>,
+ *       modifiers: {
+ *         longNight: number,
+ *         omen: number,
+ *         scarcity: number,
+ *         threat: number
+ *       },
+ *       deckState: {
+ *         seed: number,
+ *         cursor: number
+ *       },
+ *       lastTickDay: number
+ *     },
  *     archive: Array<{time: number, event: string, important?: boolean}>,
  *     processedEventIds: string[]
  *   }
@@ -217,6 +263,20 @@ const TRAIT_NAME_SET = new Set(TRAIT_NAMES)
 const DEFAULT_AGENT_TRAITS = { courage: 1, greed: 1, faith: 1 }
 const MAX_AGENT_TITLE_LEN = 32
 const MAX_AGENT_TITLE_COUNT = 20
+const MAJOR_MISSION_STATUSES = new Set(['teased', 'briefed', 'active', 'completed', 'failed'])
+const MAX_MAJOR_MISSION_STAKES_KEYS = 12
+const MAX_MAJOR_MISSION_PROGRESS_KEYS = 12
+const MAX_TOWN_CRIER_QUEUE_ENTRIES = 40
+const MAX_TOWNSFOLK_QUESTS_PER_TOWN = 24
+const MAX_NETHER_EVENT_LEDGER_ENTRIES = 120
+const MAX_NETHER_EVENT_PAYLOAD_KEYS = 10
+const NETHER_EVENT_TYPE_KEYS = new Set([
+  'LONG_NIGHT',
+  'OMEN',
+  'SCARCITY',
+  'THREAT_SURGE',
+  'CALM_BEFORE_STORM'
+])
 const WORLD_EVENT_MOD_KEYS = new Set([
   'fear',
   'unrest',
@@ -1011,7 +1071,11 @@ function normalizeQuestShape(questInput) {
   const id = asText(questInput.id, '', 200)
   const type = asText(questInput.type, '', 20).toLowerCase()
   const state = asText(questInput.state, '', 20).toLowerCase()
+  const origin = asText(questInput.origin, '', 40).toLowerCase()
   const town = asText(questInput.town, '', 80)
+  const townId = asText(questInput.townId, '', 80)
+  const npcKey = asText(questInput.npcKey, '', 80)
+  const supportsMajorMissionId = asText(questInput.supportsMajorMissionId, '', 200)
   const offeredAt = normalizeIsoDateText(questInput.offered_at)
   const acceptedAt = normalizeIsoDateText(questInput.accepted_at)
   const owner = asText(questInput.owner, '', 80)
@@ -1046,7 +1110,11 @@ function normalizeQuestShape(questInput) {
   const rumorId = rumorIdRaw || objectiveRumorId
   if (type === 'rumor_task' && !rumorId) return null
   if (rumorId) quest.rumor_id = rumorId
+  if (origin) quest.origin = origin
   if (town) quest.town = town
+  if (townId) quest.townId = townId
+  if (npcKey) quest.npcKey = npcKey
+  if (supportsMajorMissionId) quest.supportsMajorMissionId = supportsMajorMissionId
   if (acceptedAt) quest.accepted_at = acceptedAt
   if (owner) quest.owner = owner
   if (meta) quest.meta = meta
@@ -1063,52 +1131,443 @@ function normalizeQuestsShape(questsInput) {
 }
 
 /**
+ * @param {unknown} questInput
+ */
+function isTownsfolkQuestShape(questInput) {
+  const quest = normalizeQuestShape(questInput)
+  if (!quest) return false
+  return asText(quest.origin, '', 40).toLowerCase() === 'townsfolk'
+}
+
+/**
+ * @param {any} quest
+ */
+function asQuestTime(quest) {
+  const offeredAt = normalizeIsoDateText(quest?.offered_at)
+  const atMs = Date.parse(offeredAt)
+  if (Number.isFinite(atMs)) return atMs
+  return 0
+}
+
+/**
+ * @param {any} quest
+ */
+function isQuestActiveState(quest) {
+  const state = asText(quest?.state, '', 20).toLowerCase()
+  return state === 'accepted' || state === 'in_progress'
+}
+
+/**
+ * @param {any[]} quests
+ */
+function boundTownsfolkQuestHistoryShape(quests) {
+  const safeQuests = (Array.isArray(quests) ? quests : [])
+    .map(normalizeQuestShape)
+    .filter(Boolean)
+
+  const byTown = new Map()
+  for (const quest of safeQuests) {
+    if (!isTownsfolkQuestShape(quest)) continue
+    const townKey = asText(quest.townId || quest.town, '', 80).toLowerCase()
+    if (!townKey) continue
+    if (!byTown.has(townKey)) byTown.set(townKey, [])
+    byTown.get(townKey).push(quest)
+  }
+
+  const dropIds = new Set()
+  for (const questsForTown of byTown.values()) {
+    if (questsForTown.length <= MAX_TOWNSFOLK_QUESTS_PER_TOWN) continue
+    const active = questsForTown
+      .filter(isQuestActiveState)
+      .sort((left, right) => asQuestTime(right) - asQuestTime(left) || left.id.localeCompare(right.id))
+    const inactive = questsForTown
+      .filter(quest => !isQuestActiveState(quest))
+      .sort((left, right) => asQuestTime(right) - asQuestTime(left) || left.id.localeCompare(right.id))
+
+    const keep = new Set()
+    const ordered = [...active, ...inactive]
+    for (const quest of ordered) {
+      if (keep.size >= MAX_TOWNSFOLK_QUESTS_PER_TOWN) break
+      keep.add(quest.id.toLowerCase())
+    }
+    for (const quest of questsForTown) {
+      const key = quest.id.toLowerCase()
+      if (!keep.has(key)) dropIds.add(key)
+    }
+  }
+  if (dropIds.size === 0) return safeQuests
+  return safeQuests.filter(quest => !dropIds.has(quest.id.toLowerCase()))
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeMajorMissionPayloadValue(value) {
+  if (value === null) return null
+  if (typeof value === 'boolean') return value
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value)) return null
+    return Math.trunc(value)
+  }
+  if (typeof value === 'string') {
+    const text = asText(value, '', 120)
+    return text || null
+  }
+  return null
+}
+
+/**
+ * @param {unknown} payloadInput
+ * @param {number} maxKeys
+ */
+function normalizeMajorMissionPayload(payloadInput, maxKeys) {
+  if (!payloadInput || typeof payloadInput !== 'object' || Array.isArray(payloadInput)) return {}
+  const payload = {}
+  let used = 0
+  for (const [keyRaw, valueRaw] of Object.entries(payloadInput)) {
+    if (used >= maxKeys) break
+    const key = asText(keyRaw, '', 40)
+    if (!key) continue
+    const value = normalizeMajorMissionPayloadValue(valueRaw)
+    if (value === null) continue
+    payload[key] = value
+    used += 1
+  }
+  return payload
+}
+
+/**
+ * @param {unknown} valueInput
+ */
+function normalizeNetherModifierValue(valueInput) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return 0
+  return clamp(Math.trunc(value), -9, 9)
+}
+
+/**
+ * @param {unknown} modifiersInput
+ */
+function normalizeNetherModifiersShape(modifiersInput) {
+  const source = (modifiersInput && typeof modifiersInput === 'object' && !Array.isArray(modifiersInput))
+    ? modifiersInput
+    : {}
+  return {
+    longNight: normalizeNetherModifierValue(source.longNight),
+    omen: normalizeNetherModifierValue(source.omen),
+    scarcity: normalizeNetherModifierValue(source.scarcity),
+    threat: normalizeNetherModifierValue(source.threat)
+  }
+}
+
+/**
+ * @param {unknown} deckStateInput
+ * @param {number} fallbackSeed
+ */
+function normalizeNetherDeckStateShape(deckStateInput, fallbackSeed) {
+  const source = (deckStateInput && typeof deckStateInput === 'object' && !Array.isArray(deckStateInput))
+    ? deckStateInput
+    : {}
+  const seed = Number(source.seed)
+  const cursor = Number(source.cursor)
+  return {
+    seed: Number.isInteger(seed) ? seed : fallbackSeed,
+    cursor: Number.isInteger(cursor) && cursor >= 0 ? cursor : 0
+  }
+}
+
+/**
+ * @param {unknown} ledgerEntryInput
+ */
+function normalizeNetherEventLedgerEntryShape(ledgerEntryInput) {
+  if (!ledgerEntryInput || typeof ledgerEntryInput !== 'object' || Array.isArray(ledgerEntryInput)) return null
+  const id = asText(ledgerEntryInput.id, '', 200)
+  const day = Number(ledgerEntryInput.day)
+  const typeRaw = asText(ledgerEntryInput.type, '', 40).toUpperCase()
+  const type = NETHER_EVENT_TYPE_KEYS.has(typeRaw) ? typeRaw : ''
+  if (!id || !Number.isInteger(day) || day < 1 || !type) return null
+  return {
+    id,
+    day,
+    type,
+    payload: normalizeMajorMissionPayload(ledgerEntryInput.payload, MAX_NETHER_EVENT_PAYLOAD_KEYS),
+    applied: ledgerEntryInput.applied !== false
+  }
+}
+
+/**
+ * @param {unknown} ledgerInput
+ */
+function normalizeNetherEventLedgerShape(ledgerInput) {
+  const ledger = (Array.isArray(ledgerInput) ? ledgerInput : [])
+    .map(normalizeNetherEventLedgerEntryShape)
+    .filter(Boolean)
+  if (ledger.length > MAX_NETHER_EVENT_LEDGER_ENTRIES) {
+    return ledger.slice(-MAX_NETHER_EVENT_LEDGER_ENTRIES)
+  }
+  return ledger
+}
+
+/**
+ * @param {unknown} netherInput
+ * @param {number} fallbackSeed
+ */
+function normalizeNetherShape(netherInput, fallbackSeed) {
+  const source = (netherInput && typeof netherInput === 'object' && !Array.isArray(netherInput))
+    ? netherInput
+    : {}
+  const seed = Number.isInteger(fallbackSeed) ? fallbackSeed : 1337
+  const lastTickDay = Number(source.lastTickDay)
+  const nether = {
+    eventLedger: normalizeNetherEventLedgerShape(source.eventLedger),
+    modifiers: normalizeNetherModifiersShape(source.modifiers),
+    deckState: normalizeNetherDeckStateShape(source.deckState, seed),
+    lastTickDay: Number.isInteger(lastTickDay) && lastTickDay >= 0 ? lastTickDay : 0
+  }
+  if (nether.lastTickDay > 0) return nether
+  let inferred = 0
+  for (const entry of nether.eventLedger) {
+    if (entry.day > inferred) inferred = entry.day
+  }
+  nether.lastTickDay = inferred
+  return nether
+}
+
+/**
+ * @param {unknown} majorMissionInput
+ */
+function normalizeMajorMissionShape(majorMissionInput) {
+  if (!majorMissionInput || typeof majorMissionInput !== 'object' || Array.isArray(majorMissionInput)) return null
+  const id = asText(majorMissionInput.id, '', 200)
+  const townId = asText(majorMissionInput.townId, '', 80)
+  const templateId = asText(majorMissionInput.templateId, '', 80).toLowerCase()
+  const status = asText(majorMissionInput.status, '', 20).toLowerCase()
+  const issuedAtDay = Number(majorMissionInput.issuedAtDay)
+  const acceptedAtDayRaw = Number(majorMissionInput.acceptedAtDay)
+  const phaseRaw = majorMissionInput.phase
+
+  if (!id || !townId || !templateId) return null
+  if (!MAJOR_MISSION_STATUSES.has(status)) return null
+  if (!Number.isInteger(issuedAtDay) || issuedAtDay < 1) return null
+  if (!Number.isInteger(acceptedAtDayRaw) || acceptedAtDayRaw < 0) return null
+
+  let phase = null
+  if (Number.isInteger(phaseRaw) && phaseRaw >= 0) {
+    phase = phaseRaw
+  } else {
+    const phaseText = asText(phaseRaw, '', 40)
+    if (phaseText) phase = phaseText
+  }
+  if (phase === null) return null
+
+  return {
+    id,
+    townId,
+    templateId,
+    status,
+    phase,
+    issuedAtDay,
+    acceptedAtDay: acceptedAtDayRaw,
+    stakes: normalizeMajorMissionPayload(majorMissionInput.stakes, MAX_MAJOR_MISSION_STAKES_KEYS),
+    progress: normalizeMajorMissionPayload(majorMissionInput.progress, MAX_MAJOR_MISSION_PROGRESS_KEYS)
+  }
+}
+
+/**
+ * @param {unknown} majorMissionsInput
+ */
+function normalizeMajorMissionsShape(majorMissionsInput) {
+  return (Array.isArray(majorMissionsInput) ? majorMissionsInput : [])
+    .map(normalizeMajorMissionShape)
+    .filter(Boolean)
+}
+
+/**
+ * @param {unknown} crierEntryInput
+ */
+function normalizeTownCrierEntryShape(crierEntryInput) {
+  if (!crierEntryInput || typeof crierEntryInput !== 'object' || Array.isArray(crierEntryInput)) return null
+  const id = asText(crierEntryInput.id, '', 200)
+  const day = Number(crierEntryInput.day)
+  const type = asText(crierEntryInput.type, '', 40).toLowerCase()
+  const message = asText(crierEntryInput.message, '', 240)
+  const missionId = asText(crierEntryInput.missionId, '', 200)
+  if (!id || !Number.isInteger(day) || day < 0 || !type || !message) return null
+  const entry = { id, day, type, message }
+  if (missionId) entry.missionId = missionId
+  return entry
+}
+
+/**
+ * @param {unknown} crierQueueInput
+ */
+function normalizeTownCrierQueueShape(crierQueueInput) {
+  const queue = (Array.isArray(crierQueueInput) ? crierQueueInput : [])
+    .map(normalizeTownCrierEntryShape)
+    .filter(Boolean)
+  if (queue.length > MAX_TOWN_CRIER_QUEUE_ENTRIES) {
+    return queue.slice(-MAX_TOWN_CRIER_QUEUE_ENTRIES)
+  }
+  return queue
+}
+
+/**
+ * @param {unknown} townInput
+ */
+function normalizeTownMissionStateShape(townInput) {
+  const source = (townInput && typeof townInput === 'object' && !Array.isArray(townInput))
+    ? townInput
+    : {}
+  const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
+  const cooldown = Number(source.majorMissionCooldownUntilDay)
+  return {
+    activeMajorMissionId,
+    majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
+    crierQueue: normalizeTownCrierQueueShape(source.crierQueue)
+  }
+}
+
+/**
+ * @param {unknown} townsInput
+ */
+function normalizeTownsShape(townsInput) {
+  const source = (townsInput && typeof townsInput === 'object' && !Array.isArray(townsInput))
+    ? townsInput
+    : {}
+  const towns = {}
+  for (const [townRaw, townState] of Object.entries(source)) {
+    const townName = asText(townRaw, '', 80)
+    if (!townName) continue
+    towns[townName] = normalizeTownMissionStateShape(townState)
+  }
+  return towns
+}
+
+/**
+ * @param {unknown} tag
+ */
+function parseTownNameFromTag(tag) {
+  const safeTag = asText(tag, '', 80)
+  if (!safeTag) return ''
+  const match = /^(town|settlement)\s*:\s*(.+)$/i.exec(safeTag)
+  if (!match) return ''
+  return asText(match[2], '', 80)
+}
+
+/**
+ * @param {MemoryState['world']} world
+ */
+function collectTownNamesForMissionState(world) {
+  const names = new Map()
+  const addTown = (nameRaw) => {
+    const townName = asText(nameRaw, '', 80)
+    if (!townName) return
+    const key = townName.toLowerCase()
+    if (!names.has(key)) names.set(key, townName)
+  }
+
+  for (const townName of Object.keys(world?.towns || {})) addTown(townName)
+  for (const mission of world?.majorMissions || []) addTown(mission?.townId)
+  for (const marker of world?.markers || []) addTown(parseTownNameFromTag(marker?.tag))
+  for (const townName of Object.keys(world?.threat?.byTown || {})) addTown(townName)
+  for (const townName of Object.keys(world?.moods?.byTown || {})) addTown(townName)
+  for (const faction of Object.values(world?.factions || {})) {
+    for (const townName of normalizeStoryTowns(faction?.towns)) addTown(townName)
+  }
+  return Array.from(names.values()).sort((a, b) => a.localeCompare(b))
+}
+
+/**
+ * @param {MemoryState['world']} world
+ */
+function reconcileMajorMissionState(world) {
+  world.quests = boundTownsfolkQuestHistoryShape(world.quests)
+  world.nether = normalizeNetherShape(world.nether, Number(world?.events?.seed))
+  world.majorMissions = normalizeMajorMissionsShape(world.majorMissions)
+  world.towns = normalizeTownsShape(world.towns)
+
+  const activeByTown = new Map()
+  for (let idx = 0; idx < world.majorMissions.length; idx += 1) {
+    const mission = normalizeMajorMissionShape(world.majorMissions[idx])
+    if (!mission) continue
+    if (mission.status === 'active') {
+      const key = mission.townId.toLowerCase()
+      if (activeByTown.has(key)) {
+        mission.status = 'briefed'
+      } else {
+        activeByTown.set(key, mission.id)
+      }
+    }
+    world.majorMissions[idx] = mission
+  }
+
+  for (const townName of collectTownNamesForMissionState(world)) {
+    if (!Object.prototype.hasOwnProperty.call(world.towns, townName)) {
+      world.towns[townName] = normalizeTownMissionStateShape(null)
+    }
+    const key = townName.toLowerCase()
+    const expectedActiveId = activeByTown.get(key) || null
+    world.towns[townName].activeMajorMissionId = expectedActiveId
+    world.towns[townName].crierQueue = normalizeTownCrierQueueShape(world.towns[townName].crierQueue)
+    const cooldown = Number(world.towns[townName].majorMissionCooldownUntilDay)
+    world.towns[townName].majorMissionCooldownUntilDay = Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0
+  }
+}
+
+/**
  * @param {Partial<MemoryState> | null | undefined} input
  * @returns {MemoryState}
  */
 function freshMemoryShape(input) {
   const source = input || {}
+  const world = {
+    warActive: !!source.world?.warActive,
+    rules: {
+      allowLethalPolitics: source.world?.rules?.allowLethalPolitics !== false
+    },
+    player: {
+      name: asText(source.world?.player?.name, 'Player', 60),
+      alive: source.world?.player?.alive !== false,
+      legitimacy: clamp(Number(source.world?.player?.legitimacy ?? 50), 0, 100)
+    },
+    factions: normalizeWorldFactionsShape(source.world?.factions),
+    clock: normalizeClockShape(source.world?.clock),
+    threat: normalizeThreatShape(source.world?.threat),
+    moods: normalizeMoodsShape(source.world?.moods),
+    events: normalizeEventsShape(source.world?.events),
+    rumors: normalizeRumorsShape(source.world?.rumors),
+    decisions: normalizeDecisionsShape(source.world?.decisions),
+    markers: Array.isArray(source.world?.markers)
+      ? source.world.markers
+        .filter(item => !!item && typeof item === 'object')
+        .map(item => ({
+          name: asText(item.name, '', 80),
+          x: Number(item.x || 0),
+          y: Number(item.y || 0),
+          z: Number(item.z || 0),
+          tag: asText(item.tag, '', 80),
+          created_at: Number(item.created_at || 0) || 0
+        }))
+        .filter(item => item.name && Number.isFinite(item.x) && Number.isFinite(item.y) && Number.isFinite(item.z))
+      : [],
+    markets: normalizeMarketsShape(source.world?.markets),
+    economy: normalizeEconomyShape(source.world?.economy),
+    chronicle: normalizeChronicleShape(source.world?.chronicle),
+    news: normalizeNewsShape(source.world?.news),
+    quests: boundTownsfolkQuestHistoryShape(normalizeQuestsShape(source.world?.quests)),
+    majorMissions: normalizeMajorMissionsShape(source.world?.majorMissions),
+    towns: normalizeTownsShape(source.world?.towns),
+    nether: normalizeNetherShape(source.world?.nether, Number(source.world?.events?.seed)),
+    archive: Array.isArray(source.world?.archive) ? source.world.archive : [],
+    processedEventIds: Array.isArray(source.world?.processedEventIds) ? source.world.processedEventIds : []
+  }
+  world.nether = normalizeNetherShape(world.nether, Number(world.events?.seed))
+  reconcileMajorMissionState(world)
+
   return {
     agents: normalizeAgentsShape(source.agents),
     factions: source.factions || {},
-    world: {
-      warActive: !!source.world?.warActive,
-      rules: {
-        allowLethalPolitics: source.world?.rules?.allowLethalPolitics !== false
-      },
-      player: {
-        name: asText(source.world?.player?.name, 'Player', 60),
-        alive: source.world?.player?.alive !== false,
-        legitimacy: clamp(Number(source.world?.player?.legitimacy ?? 50), 0, 100)
-      },
-      factions: normalizeWorldFactionsShape(source.world?.factions),
-      clock: normalizeClockShape(source.world?.clock),
-      threat: normalizeThreatShape(source.world?.threat),
-      moods: normalizeMoodsShape(source.world?.moods),
-      events: normalizeEventsShape(source.world?.events),
-      rumors: normalizeRumorsShape(source.world?.rumors),
-      decisions: normalizeDecisionsShape(source.world?.decisions),
-      markers: Array.isArray(source.world?.markers)
-        ? source.world.markers
-          .filter(item => !!item && typeof item === 'object')
-          .map(item => ({
-            name: asText(item.name, '', 80),
-            x: Number(item.x || 0),
-            y: Number(item.y || 0),
-            z: Number(item.z || 0),
-            tag: asText(item.tag, '', 80),
-            created_at: Number(item.created_at || 0) || 0
-          }))
-          .filter(item => item.name && Number.isFinite(item.x) && Number.isFinite(item.y) && Number.isFinite(item.z))
-        : [],
-      markets: normalizeMarketsShape(source.world?.markets),
-      economy: normalizeEconomyShape(source.world?.economy),
-      chronicle: normalizeChronicleShape(source.world?.chronicle),
-      news: normalizeNewsShape(source.world?.news),
-      quests: normalizeQuestsShape(source.world?.quests),
-      archive: Array.isArray(source.world?.archive) ? source.world.archive : [],
-      processedEventIds: Array.isArray(source.world?.processedEventIds) ? source.world.processedEventIds : []
-    }
+    world
   }
 }
 
@@ -1524,10 +1983,155 @@ function validateMemoryIntegritySnapshot(memory) {
   if (!Array.isArray(world.quests)) {
     issues.push('world.quests must be an array.')
   } else {
+    const townsfolkCountByTown = new Map()
     for (const quest of world.quests) {
-      if (!normalizeQuestShape(quest)) {
+      const normalizedQuest = normalizeQuestShape(quest)
+      if (!normalizedQuest) {
         issues.push('world.quests contains invalid quest entry.')
+        continue
       }
+      if (Object.prototype.hasOwnProperty.call(quest, 'origin') && !asText(quest.origin, '', 40)) {
+        issues.push('world.quests origin must be text when present.')
+      }
+      if (Object.prototype.hasOwnProperty.call(quest, 'townId') && !asText(quest.townId, '', 80)) {
+        issues.push('world.quests townId must be text when present.')
+      }
+      if (Object.prototype.hasOwnProperty.call(quest, 'npcKey') && !asText(quest.npcKey, '', 80)) {
+        issues.push('world.quests npcKey must be text when present.')
+      }
+      if (Object.prototype.hasOwnProperty.call(quest, 'supportsMajorMissionId') && !asText(quest.supportsMajorMissionId, '', 200)) {
+        issues.push('world.quests supportsMajorMissionId must be text when present.')
+      }
+      if (asText(normalizedQuest.origin, '', 40).toLowerCase() === 'townsfolk') {
+        const townKey = asText(normalizedQuest.townId || normalizedQuest.town, '', 80).toLowerCase()
+        if (!townKey) {
+          issues.push('world.quests townsfolk entries must include town or townId.')
+          continue
+        }
+        townsfolkCountByTown.set(townKey, Number(townsfolkCountByTown.get(townKey) || 0) + 1)
+      }
+    }
+    for (const [townKey, count] of townsfolkCountByTown.entries()) {
+      if (count > MAX_TOWNSFOLK_QUESTS_PER_TOWN) {
+        issues.push(`world.quests townsfolk history exceeds max ${MAX_TOWNSFOLK_QUESTS_PER_TOWN} for town ${townKey}.`)
+      }
+    }
+  }
+  if (!world.nether || typeof world.nether !== 'object' || Array.isArray(world.nether)) {
+    issues.push('world.nether must be an object.')
+  } else {
+    if (!Array.isArray(world.nether.eventLedger)) {
+      issues.push('world.nether.eventLedger must be an array.')
+    } else {
+      if (world.nether.eventLedger.length > MAX_NETHER_EVENT_LEDGER_ENTRIES) {
+        issues.push(`world.nether.eventLedger exceeds max entries ${MAX_NETHER_EVENT_LEDGER_ENTRIES}.`)
+      }
+      const seenLedgerIds = new Set()
+      for (const entry of world.nether.eventLedger) {
+        const normalizedEntry = normalizeNetherEventLedgerEntryShape(entry)
+        if (!normalizedEntry) {
+          issues.push('world.nether.eventLedger contains invalid entry.')
+          continue
+        }
+        const key = normalizedEntry.id.toLowerCase()
+        if (seenLedgerIds.has(key)) issues.push(`world.nether.eventLedger has duplicate id ${normalizedEntry.id}.`)
+        seenLedgerIds.add(key)
+      }
+    }
+    const modifiers = world.nether.modifiers
+    if (!modifiers || typeof modifiers !== 'object' || Array.isArray(modifiers)) {
+      issues.push('world.nether.modifiers must be an object.')
+    } else {
+      for (const key of ['longNight', 'omen', 'scarcity', 'threat']) {
+        const value = Number(modifiers[key])
+        if (!Number.isInteger(value) || value < -9 || value > 9) {
+          issues.push(`world.nether.modifiers.${key} must be integer in [-9..9].`)
+        }
+      }
+    }
+    const deckState = world.nether.deckState
+    if (!deckState || typeof deckState !== 'object' || Array.isArray(deckState)) {
+      issues.push('world.nether.deckState must be an object.')
+    } else {
+      if (!Number.isInteger(deckState.seed)) issues.push('world.nether.deckState.seed must be an integer.')
+      if (!Number.isInteger(deckState.cursor) || deckState.cursor < 0) {
+        issues.push('world.nether.deckState.cursor must be integer >= 0.')
+      }
+    }
+    if (!Number.isInteger(world.nether.lastTickDay) || world.nether.lastTickDay < 0) {
+      issues.push('world.nether.lastTickDay must be integer >= 0.')
+    }
+  }
+  const activeMissionByTown = new Map()
+  if (!Array.isArray(world.majorMissions)) {
+    issues.push('world.majorMissions must be an array.')
+  } else {
+    for (const mission of world.majorMissions) {
+      const normalizedMission = normalizeMajorMissionShape(mission)
+      if (!normalizedMission) {
+        issues.push('world.majorMissions contains invalid major mission entry.')
+        continue
+      }
+      if (normalizedMission.status === 'active') {
+        const key = normalizedMission.townId.toLowerCase()
+        const existing = activeMissionByTown.get(key)
+        if (existing && existing !== normalizedMission.id) {
+          issues.push(`world.majorMissions has multiple active missions for town ${normalizedMission.townId}.`)
+        } else {
+          activeMissionByTown.set(key, normalizedMission.id)
+        }
+      }
+    }
+  }
+  if (!world.towns || typeof world.towns !== 'object' || Array.isArray(world.towns)) {
+    issues.push('world.towns must be an object.')
+  } else {
+    for (const [townName, townState] of Object.entries(world.towns)) {
+      const safeTownName = asText(townName, '', 80)
+      if (!safeTownName) {
+        issues.push('world.towns contains invalid town name.')
+        continue
+      }
+      if (!townState || typeof townState !== 'object' || Array.isArray(townState)) {
+        issues.push(`world.towns.${safeTownName} must be an object.`)
+        continue
+      }
+      const activeMajorMissionId = asText(townState.activeMajorMissionId, '', 200) || null
+      const cooldown = Number(townState.majorMissionCooldownUntilDay)
+      if (townState.activeMajorMissionId !== null && activeMajorMissionId === null) {
+        issues.push(`world.towns.${safeTownName}.activeMajorMissionId must be string|null.`)
+      }
+      if (!Number.isInteger(cooldown) || cooldown < 0) {
+        issues.push(`world.towns.${safeTownName}.majorMissionCooldownUntilDay must be integer >= 0.`)
+      }
+      if (!Array.isArray(townState.crierQueue)) {
+        issues.push(`world.towns.${safeTownName}.crierQueue must be an array.`)
+      } else {
+        if (townState.crierQueue.length > MAX_TOWN_CRIER_QUEUE_ENTRIES) {
+          issues.push(`world.towns.${safeTownName}.crierQueue exceeds max entries ${MAX_TOWN_CRIER_QUEUE_ENTRIES}.`)
+        }
+        for (const entry of townState.crierQueue) {
+          if (!normalizeTownCrierEntryShape(entry)) {
+            issues.push(`world.towns.${safeTownName}.crierQueue contains invalid entry.`)
+          }
+        }
+      }
+      const activeMissionIdForTown = activeMissionByTown.get(safeTownName.toLowerCase()) || null
+      if (activeMissionIdForTown && activeMajorMissionId !== activeMissionIdForTown) {
+        issues.push(`world.towns.${safeTownName}.activeMajorMissionId must match active major mission id.`)
+      }
+      if (!activeMissionIdForTown && activeMajorMissionId) {
+        issues.push(`world.towns.${safeTownName}.activeMajorMissionId references non-active mission.`)
+      }
+    }
+  }
+  for (const [townKey, missionId] of activeMissionByTown.entries()) {
+    const hasTownRecord = Object.entries(world.towns || {}).some(([townName, townState]) => {
+      return asText(townName, '', 80).toLowerCase() === townKey
+        && asText(townState?.activeMajorMissionId, '', 200) === missionId
+    })
+    if (!hasTownRecord) {
+      issues.push(`world.towns is missing activeMajorMissionId mapping for town key ${townKey}.`)
     }
   }
   if (world.economy !== undefined) {

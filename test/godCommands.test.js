@@ -2618,6 +2618,392 @@ test('town board shows Trader sections without mutation', async () => {
   assert.equal(board.outputLines.some(line => line.includes('GOD TOWN BOARD DECISION OPEN:')), false)
 })
 
+test('major mission lifecycle enforces single active mission per town and shows on town board', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'major-seed-town'
+  })
+
+  const talk = await service.applyGodCommand({
+    agents,
+    command: 'mayor talk alpha',
+    operationId: 'major-talk-a'
+  })
+  const accept = await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'major-accept-a'
+  })
+  const secondAccept = await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'major-accept-b'
+  })
+  const board = await service.applyGodCommand({
+    agents,
+    command: 'town board alpha 10',
+    operationId: 'major-board-a'
+  })
+
+  assert.equal(talk.applied, true)
+  assert.equal(accept.applied, true)
+  assert.equal(secondAccept.applied, false)
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD MAJOR MISSION ACTIVE:')))
+
+  const snapshot = memoryStore.getSnapshot()
+  const active = snapshot.world.majorMissions.filter(
+    mission => mission.townId === 'alpha' && mission.status === 'active'
+  )
+  assert.equal(active.length, 1)
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, active[0].id)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('major mission accept/advance/complete are transactional and idempotent on replay', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'major-idem-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor talk alpha',
+    operationId: 'major-idem-talk'
+  })
+
+  const acceptA = await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'major-idem-accept'
+  })
+  const acceptReplay = await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'major-idem-accept'
+  })
+  const advanceA = await service.applyGodCommand({
+    agents,
+    command: 'mission advance alpha',
+    operationId: 'major-idem-advance'
+  })
+  const advanceReplay = await service.applyGodCommand({
+    agents,
+    command: 'mission advance alpha',
+    operationId: 'major-idem-advance'
+  })
+  const completeA = await service.applyGodCommand({
+    agents,
+    command: 'mission complete alpha',
+    operationId: 'major-idem-complete'
+  })
+  const completeReplay = await service.applyGodCommand({
+    agents,
+    command: 'mission complete alpha',
+    operationId: 'major-idem-complete'
+  })
+
+  assert.equal(acceptA.applied, true)
+  assert.equal(acceptReplay.applied, false)
+  assert.equal(advanceA.applied, true)
+  assert.equal(advanceReplay.applied, false)
+  assert.equal(completeA.applied, true)
+  assert.equal(completeReplay.applied, false)
+
+  const snapshot = memoryStore.getSnapshot()
+  const mission = snapshot.world.majorMissions.find(item => item.id === snapshot.world.towns.alpha.activeMajorMissionId)
+  assert.equal(mission, undefined)
+  const completed = snapshot.world.majorMissions.find(item => item.status === 'completed' && item.townId === 'alpha')
+  assert.ok(completed)
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
+  assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 3)
+
+  const crierTypes = snapshot.world.towns.alpha.crierQueue.map(item => item.type)
+  assert.equal(crierTypes.filter(type => type === 'mission_available').length, 1)
+  assert.equal(crierTypes.filter(type => type === 'mission_accepted').length, 1)
+  assert.equal(crierTypes.filter(type => type === 'mission_phase').length, 1)
+  assert.equal(crierTypes.filter(type => type === 'mission_win').length, 1)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('major mission fail is transactional and idempotent on replay', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'major-fail-seed-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor talk alpha',
+    operationId: 'major-fail-talk'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'major-fail-accept'
+  })
+
+  const failA = await service.applyGodCommand({
+    agents,
+    command: 'mission fail alpha route collapsed',
+    operationId: 'major-fail-a'
+  })
+  const failReplay = await service.applyGodCommand({
+    agents,
+    command: 'mission fail alpha route collapsed',
+    operationId: 'major-fail-a'
+  })
+
+  assert.equal(failA.applied, true)
+  assert.equal(failReplay.applied, false)
+
+  const snapshot = memoryStore.getSnapshot()
+  const failed = snapshot.world.majorMissions.find(item => item.status === 'failed' && item.townId === 'alpha')
+  assert.ok(failed)
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
+  assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 3)
+  assert.equal(snapshot.world.towns.alpha.crierQueue.filter(item => item.type === 'mission_fail').length, 1)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('major mission crier queue remains bounded', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'major-crier-seed-town'
+  })
+
+  await memoryStore.transact((memory) => {
+    memory.world.towns = memory.world.towns || {}
+    memory.world.towns.alpha = memory.world.towns.alpha || {
+      activeMajorMissionId: null,
+      majorMissionCooldownUntilDay: 0,
+      crierQueue: []
+    }
+    memory.world.towns.alpha.crierQueue = Array.from({ length: 40 }).map((_, idx) => ({
+      id: `seed-${idx}`,
+      day: 1,
+      type: 'seed',
+      message: `seed-${idx}`
+    }))
+  }, { eventId: 'major-crier-seed-queue' })
+
+  const before = memoryStore.getSnapshot().world.towns.alpha.crierQueue
+  assert.equal(before.length, 40)
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor talk alpha',
+    operationId: 'major-crier-talk'
+  })
+
+  const queue = memoryStore.getSnapshot().world.towns.alpha.crierQueue
+  assert.equal(queue.length, 40)
+  assert.equal(queue[0].id, 'seed-1')
+  assert.equal(queue[queue.length - 1].type, 'mission_available')
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('nether tick is deterministic for same seed/state and propagates crier entries to all towns', async () => {
+  const createDeterministicService = () => {
+    const memoryStore = createStore()
+    let t = 0
+    const service = createGodCommandService({
+      memoryStore,
+      now: () => {
+        t += 1000
+        return t
+      }
+    })
+    return { memoryStore, service }
+  }
+  const left = createDeterministicService()
+  const right = createDeterministicService()
+  const agents = createAgents()
+
+  const seedAndTick = async (service) => {
+    await service.applyGodCommand({
+      agents,
+      command: 'mark add alpha_hall 0 64 0 town:alpha',
+      operationId: 'nether-seed-alpha'
+    })
+    await service.applyGodCommand({
+      agents,
+      command: 'mark add beta_gate 100 64 0 town:beta',
+      operationId: 'nether-seed-beta'
+    })
+    await service.applyGodCommand({
+      agents,
+      command: 'event seed 4242',
+      operationId: 'nether-seed-events'
+    })
+    const tick = await service.applyGodCommand({
+      agents,
+      command: 'nether tick 8',
+      operationId: 'nether-tick-a'
+    })
+    assert.equal(tick.applied, true)
+  }
+
+  await seedAndTick(left.service)
+  await seedAndTick(right.service)
+
+  const leftSnapshot = left.memoryStore.getSnapshot()
+  const rightSnapshot = right.memoryStore.getSnapshot()
+  assert.deepEqual(leftSnapshot.world.nether, rightSnapshot.world.nether)
+  assert.ok(leftSnapshot.world.nether.eventLedger.length > 0)
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(entry => entry.type === 'nether_event'))
+  assert.ok(leftSnapshot.world.towns.beta.crierQueue.some(entry => entry.type === 'nether_event'))
+  assert.equal(left.memoryStore.validateMemoryIntegrity().ok, true)
+  assert.equal(right.memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('nether tick is transactional/idempotent on replay and bounded under burst days', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'nether-bound-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_gate 100 64 0 town:beta',
+    operationId: 'nether-bound-seed-beta'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'event seed 1234',
+    operationId: 'nether-bound-seed-events'
+  })
+
+  const tickA = await service.applyGodCommand({
+    agents,
+    command: 'nether tick 20',
+    operationId: 'nether-bound-a'
+  })
+  assert.equal(tickA.applied, true)
+  const afterA = memoryStore.getSnapshot()
+
+  const tickReplay = await service.applyGodCommand({
+    agents,
+    command: 'nether tick 20',
+    operationId: 'nether-bound-a'
+  })
+  assert.equal(tickReplay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterA)
+
+  const burst = await service.applyGodCommand({
+    agents,
+    command: 'nether tick 240',
+    operationId: 'nether-bound-burst'
+  })
+  assert.equal(burst.applied, true)
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.ok(snapshot.world.nether.eventLedger.length <= 120)
+  assert.ok(snapshot.world.news.length <= 200)
+  assert.ok(snapshot.world.chronicle.length <= 200)
+  assert.ok(snapshot.world.towns.alpha.crierQueue.length <= 40)
+  assert.ok(snapshot.world.towns.beta.crierQueue.length <= 40)
+  assert.ok(snapshot.world.towns.alpha.crierQueue.some(entry => entry.type === 'nether_event'))
+  assert.ok(snapshot.world.towns.beta.crierQueue.some(entry => entry.type === 'nether_event'))
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('townsfolk talk creates deterministic side quests with dedupe and major mission linkage', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'townsfolk-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_gate 100 64 0 town:beta',
+    operationId: 'townsfolk-seed-beta'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor talk alpha',
+    operationId: 'townsfolk-major-talk'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mayor accept alpha',
+    operationId: 'townsfolk-major-accept'
+  })
+
+  const talkCreated = await service.applyGodCommand({
+    agents,
+    command: 'townsfolk talk alpha Gate Warden',
+    operationId: 'townsfolk-talk-a'
+  })
+  const talkReplay = await service.applyGodCommand({
+    agents,
+    command: 'townsfolk talk alpha Gate Warden',
+    operationId: 'townsfolk-talk-a'
+  })
+  const talkDedupe = await service.applyGodCommand({
+    agents,
+    command: 'townsfolk talk alpha Gate Warden',
+    operationId: 'townsfolk-talk-b'
+  })
+  assert.equal(talkCreated.applied, true)
+  assert.equal(talkReplay.applied, false)
+  assert.equal(talkDedupe.applied, true)
+  assert.ok(talkDedupe.outputLines.some(line => line.includes('status=existing')))
+
+  const snapshot = memoryStore.getSnapshot()
+  const townsfolkQuests = snapshot.world.quests.filter((quest) => (
+    quest.origin === 'townsfolk'
+    && quest.townId === 'alpha'
+    && quest.npcKey === 'gate_warden'
+  ))
+  assert.equal(townsfolkQuests.length, 1)
+  assert.equal(townsfolkQuests[0].supportsMajorMissionId, snapshot.world.towns.alpha.activeMajorMissionId)
+
+  const board = await service.applyGodCommand({
+    agents,
+    command: 'town board alpha 10',
+    operationId: 'townsfolk-board'
+  })
+  assert.equal(board.applied, true)
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD MAJOR MISSION')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SIDE QUESTS TOP:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD NETHER PULSE:')))
+
+  const list = await service.applyGodCommand({
+    agents,
+    command: 'quest list alpha',
+    operationId: 'townsfolk-quest-list'
+  })
+  assert.equal(list.applied, true)
+  assert.ok(list.outputLines.some(line => line.includes('origin=townsfolk')))
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
 test('decision list/show are read-only and do not mutate state', async () => {
   const memoryStore = createStore()
   const seedService = createGodCommandService({ memoryStore })
