@@ -198,6 +198,28 @@ const MAJOR_MISSION_PHASE_START = 1
 const MAJOR_MISSION_PHASE_MAX = 3
 const MAJOR_MISSION_COOLDOWN_DAYS = 2
 const MAJOR_MISSION_MAX_PAYLOAD_KEYS = 12
+const PROJECT_TYPES = new Set([
+  'trench_reinforcement',
+  'watchtower_line',
+  'ration_depot',
+  'field_chapel',
+  'lantern_line'
+])
+const PROJECT_STATUSES = new Set(['planned', 'active', 'completed', 'failed'])
+const PROJECT_STAGE_MAX = 3
+const MAX_PROJECT_REQUIREMENTS_KEYS = 12
+const MAX_PROJECT_EFFECTS_KEYS = 12
+const MAX_PROJECT_ENTRIES = 120
+const SALVAGE_TARGET_KEYS = new Set([
+  'no_mans_land_scrap',
+  'ruined_hamlet_supplies',
+  'abandoned_shrine_relics',
+  'collapsed_tunnel_tools'
+])
+const SALVAGE_STATUSES = new Set(['planned', 'resolved', 'failed'])
+const SALVAGE_OUTCOME_KEYS = new Set(['secure', 'contested', 'botched'])
+const MAX_SALVAGE_RESULT_KEYS = 12
+const MAX_SALVAGE_RUN_ENTRIES = 120
 const TOWN_CRIER_QUEUE_MAX_ENTRIES = 40
 const MAX_TOWNSFOLK_QUESTS_PER_TOWN = 24
 const MAX_NETHER_EVENT_LEDGER_ENTRIES = 120
@@ -233,6 +255,72 @@ const NETHER_EVENT_CONFIG = {
     headline: 'For one day the roads breathe easier before the next storm.'
   }
 }
+const PRESSURE_BY_NETHER_EVENT = {
+  LONG_NIGHT: { hope: -1, dread: 3 },
+  OMEN: { hope: -1, dread: 2 },
+  SCARCITY: { hope: -2, dread: 3 },
+  THREAT_SURGE: { hope: -1, dread: 4 },
+  CALM_BEFORE_STORM: { hope: 2, dread: -2 }
+}
+const PRESSURE_BY_OUTCOME = {
+  mission_complete: { hope: 7, dread: -4 },
+  mission_fail: { hope: -4, dread: 7 },
+  townsfolk_complete: { hope: 2, dread: -1 },
+  townsfolk_fail: { hope: -1, dread: 3 }
+}
+const MAX_TOWN_RECENT_IMPACTS = 30
+const TOWN_PRESSURE_MIN = 0
+const TOWN_PRESSURE_MAX = 100
+const DEFAULT_TOWN_HOPE = 50
+const DEFAULT_TOWN_DREAD = 50
+const TOWN_IMPACT_TYPE_KEYS = new Set([
+  'nether_event',
+  'mission_complete',
+  'mission_fail',
+  'townsfolk_complete',
+  'townsfolk_fail',
+  'project_start',
+  'project_complete',
+  'project_fail',
+  'salvage_plan',
+  'salvage_resolve',
+  'salvage_fail'
+])
+const PROJECT_TYPE_CONFIG = {
+  trench_reinforcement: {
+    requirements: { labor: 3, timber: 2, iron: 1 },
+    effects: { threatDelta: -2, hopeDelta: 1, dreadDelta: -1, frontlineShield: 2 }
+  },
+  watchtower_line: {
+    requirements: { labor: 2, timber: 2, lantern_oil: 1 },
+    effects: { threatDelta: -1, hopeDelta: 1, dreadDelta: -1, scouting: 3 }
+  },
+  ration_depot: {
+    requirements: { labor: 2, bread: 3, herbs: 1 },
+    effects: { scarcityDelta: -1, hopeDelta: 1, dreadDelta: -1, rations: 4 }
+  },
+  field_chapel: {
+    requirements: { labor: 1, wool: 2, herbs: 1 },
+    effects: { hopeDelta: 3, dreadDelta: -2, sanctity: 2 }
+  },
+  lantern_line: {
+    requirements: { labor: 2, lantern_oil: 3, timber: 1 },
+    effects: { longNightDelta: -1, hopeDelta: 1, dreadDelta: -1, visibility: 2 }
+  }
+}
+const SALVAGE_TARGET_CONFIG = {
+  no_mans_land_scrap: { supplyBase: 2, pressure: -1 },
+  ruined_hamlet_supplies: { supplyBase: 3, pressure: -1 },
+  abandoned_shrine_relics: { supplyBase: 2, pressure: 0 },
+  collapsed_tunnel_tools: { supplyBase: 3, pressure: 1 }
+}
+const SALVAGE_OUTCOME_CONFIG = {
+  secure: { supplies: 3, hopeDelta: 2, dreadDelta: -1, threatDelta: -1, scarcityDelta: -1 },
+  contested: { supplies: 2, hopeDelta: 0, dreadDelta: 1, threatDelta: 0, scarcityDelta: 0 },
+  botched: { supplies: 1, hopeDelta: -1, dreadDelta: 2, threatDelta: 1, scarcityDelta: 1 }
+}
+const PRESSURE_BY_PROJECT_FAIL = { hope: -1, dread: 3 }
+const PRESSURE_BY_SALVAGE_FAIL = { hope: -1, dread: 2 }
 const CONTRACT_TRADE_TEMPLATES = [
   {
     id: 'bread_basket',
@@ -2071,6 +2159,116 @@ function getTraderTip(townName, world) {
 }
 
 /**
+ * @param {number} valueInput
+ */
+function toPressureTier(valueInput) {
+  const value = clamp(Math.trunc(Number(valueInput || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  if (value >= 80) return 'critical'
+  if (value >= 60) return 'high'
+  if (value >= 35) return 'rising'
+  return 'steady'
+}
+
+/**
+ * @param {{
+ *   townThreatLevel: number,
+ *   activeMajorMission: any,
+ *   latestNetherEvent: any,
+ *   hope: number,
+ *   dread: number,
+ *   projectFrontlineShield?: number,
+ *   projectScouting?: number
+ * }} input
+ */
+function deriveFrontlineStatus(input) {
+  const threatLevel = clamp(Math.trunc(Number(input?.townThreatLevel || 0)), 0, 100)
+  const hope = clamp(Math.trunc(Number(input?.hope || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const dread = clamp(Math.trunc(Number(input?.dread || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const projectFrontlineShield = Math.max(0, Math.trunc(Number(input?.projectFrontlineShield || 0)))
+  const projectScouting = Math.max(0, Math.trunc(Number(input?.projectScouting || 0)))
+  const hasActiveMission = !!normalizeMajorMission(input?.activeMajorMission)
+  const netherType = asText(input?.latestNetherEvent?.type, '', 40).toUpperCase()
+  const netherPressure = netherType === 'THREAT_SURGE'
+    ? 18
+    : netherType === 'SCARCITY'
+      ? 12
+      : netherType === 'OMEN'
+        ? 10
+        : netherType === 'LONG_NIGHT'
+          ? 8
+          : netherType === 'CALM_BEFORE_STORM'
+            ? -8
+            : 0
+  const score = clamp(
+    threatLevel
+      + (hasActiveMission ? 10 : 0)
+      + netherPressure
+      + Math.trunc((dread - hope) / 3)
+      - projectFrontlineShield
+      - Math.trunc(projectScouting / 2),
+    0,
+    200
+  )
+  const label = score >= 120
+    ? 'BREACH IMMINENT'
+    : score >= 85
+      ? 'SIEGE PRESSURE'
+      : score >= 55
+        ? 'CONTESTED STREETS'
+        : 'HOLDING LINE'
+  return {
+    label,
+    score,
+    threatLevel,
+    netherType: netherType || '-',
+    mission: hasActiveMission ? 'active' : 'none'
+  }
+}
+
+/**
+ * @param {{
+ *   townThreatLevel: number,
+ *   scarcity: number,
+ *   mood: {prosperity: number, unrest: number},
+ *   projectRations?: number
+ * }} input
+ */
+function deriveRationsStrain(input) {
+  const threatLevel = clamp(Math.trunc(Number(input?.townThreatLevel || 0)), 0, 100)
+  const scarcity = clamp(Math.trunc(Number(input?.scarcity || 0)), -9, 9)
+  const prosperity = clamp(Math.trunc(Number(input?.mood?.prosperity || 0)), 0, 100)
+  const unrest = clamp(Math.trunc(Number(input?.mood?.unrest || 0)), 0, 100)
+  const projectRations = Math.max(0, Math.trunc(Number(input?.projectRations || 0)))
+  const rations = clamp(Math.trunc(72 + (prosperity / 3) - (scarcity * 10) - (threatLevel / 5) + projectRations), 0, 100)
+  const strain = clamp(Math.trunc((threatLevel / 2) + (scarcity * 8) + (unrest / 4)), 0, 100)
+  const outlook = strain >= 75
+    ? 'fracturing'
+    : strain >= 45
+      ? 'strained'
+      : 'holding'
+  return { rations, strain, outlook }
+}
+
+/**
+ * @param {any} impact
+ */
+function formatTownImpact(impact) {
+  const normalized = normalizeTownImpactEntry(impact)
+  if (!normalized) return ''
+  const parts = [
+    `day=${normalized.day}`,
+    `type=${normalized.type}`,
+    `summary=${normalized.summary}`
+  ]
+  if (normalized.missionId) parts.push(`mission_id=${normalized.missionId}`)
+  if (normalized.questId) parts.push(`quest_id=${normalized.questId}`)
+  if (normalized.netherEventId) parts.push(`nether_event_id=${normalized.netherEventId}`)
+  if (normalized.projectId) parts.push(`project_id=${normalized.projectId}`)
+  if (normalized.salvageRunId) parts.push(`salvage_run_id=${normalized.salvageRunId}`)
+  return `GOD TOWN BOARD WAR CHANGE: ${parts.join(' ')}`
+}
+
+/**
  * @param {any} quest
  */
 function isContractQuest(quest) {
@@ -3447,7 +3645,33 @@ function appendNetherAnnouncements(memory, input) {
   const modifiersText = formatNetherModifierSummary(nether)
   const message = asText(`${headline} ${modifiersText}`, headline, 240)
   const towns = listKnownTownNames(memory.world)
+  const pressureDelta = PRESSURE_BY_NETHER_EVENT[event.type] || { hope: 0, dread: 0 }
   for (const townName of towns) {
+    const projectMods = getCompletedProjectModifiers(memory.world, townName)
+    const adjustedPressure = {
+      hope: Math.trunc(Number(pressureDelta.hope || 0)),
+      dread: Math.trunc(Number(pressureDelta.dread || 0))
+    }
+    if (event.type === 'LONG_NIGHT' && projectMods.longNightDelta < 0) {
+      adjustedPressure.hope += Math.abs(projectMods.longNightDelta)
+      adjustedPressure.dread += projectMods.longNightDelta
+    }
+    if (event.type === 'SCARCITY' && projectMods.scarcityDelta < 0) {
+      adjustedPressure.hope += Math.abs(projectMods.scarcityDelta)
+      adjustedPressure.dread += projectMods.scarcityDelta
+    }
+    if (event.type === 'THREAT_SURGE') {
+      const threatGuard = Math.trunc((Math.max(0, projectMods.frontlineShield) + Math.max(0, projectMods.scouting)) / 3)
+      if (threatGuard > 0) adjustedPressure.dread -= threatGuard
+    }
+    applyTownPressureDelta(memory, {
+      townName,
+      delta: adjustedPressure,
+      idPrefix: `${idPrefix}:pressure:${townName.toLowerCase()}`,
+      type: 'nether_event',
+      summary: `nether_${event.type.toLowerCase()}`,
+      netherEventId: event.id
+    })
     appendTownCrier(memory, {
       townName,
       at,
@@ -3635,6 +3859,375 @@ function ensureWorldMajorMissions(world) {
 }
 
 /**
+ * @param {unknown} projectInput
+ */
+function normalizeProject(projectInput) {
+  if (!projectInput || typeof projectInput !== 'object' || Array.isArray(projectInput)) return null
+  const id = asText(projectInput.id, '', 200)
+  const townId = asText(projectInput.townId, '', 80)
+  const type = asText(projectInput.type, '', 40).toLowerCase()
+  const status = asText(projectInput.status, '', 20).toLowerCase()
+  const stage = Number(projectInput.stage)
+  const startedAtDay = Number(projectInput.startedAtDay)
+  const updatedAtDay = Number(projectInput.updatedAtDay)
+  const supportsMajorMissionId = asText(projectInput.supportsMajorMissionId, '', 200)
+  if (!id || !townId || !PROJECT_TYPES.has(type) || !PROJECT_STATUSES.has(status)) return null
+  if (!Number.isInteger(stage) || stage < 0) return null
+  if (!Number.isInteger(startedAtDay) || startedAtDay < 1) return null
+  if (!Number.isInteger(updatedAtDay) || updatedAtDay < startedAtDay) return null
+  const project = {
+    id,
+    townId,
+    type,
+    status,
+    stage,
+    requirements: normalizeMajorMissionPayload(projectInput.requirements, MAX_PROJECT_REQUIREMENTS_KEYS),
+    effects: normalizeMajorMissionPayload(projectInput.effects, MAX_PROJECT_EFFECTS_KEYS),
+    startedAtDay,
+    updatedAtDay
+  }
+  if (supportsMajorMissionId) project.supportsMajorMissionId = supportsMajorMissionId
+  return project
+}
+
+/**
+ * @param {unknown} projectsInput
+ */
+function normalizeWorldProjects(projectsInput) {
+  const projects = (Array.isArray(projectsInput) ? projectsInput : [])
+    .map(normalizeProject)
+    .filter(Boolean)
+  if (projects.length > MAX_PROJECT_ENTRIES) {
+    return projects.slice(-MAX_PROJECT_ENTRIES)
+  }
+  return projects
+}
+
+/**
+ * @param {any} project
+ */
+function asProjectUpdatedDay(project) {
+  const normalized = normalizeProject(project)
+  if (!normalized) return 0
+  return Number(normalized.updatedAtDay || 0)
+}
+
+/**
+ * @param {any} project
+ */
+function isProjectActiveForHistory(project) {
+  const status = asText(project?.status, '', 20).toLowerCase()
+  return status === 'active' || status === 'planned'
+}
+
+/**
+ * @param {any[]} projects
+ */
+function boundProjectHistory(projects) {
+  const normalized = (Array.isArray(projects) ? projects : [])
+    .map(normalizeProject)
+    .filter(Boolean)
+  if (normalized.length <= MAX_PROJECT_ENTRIES) return normalized
+  const active = normalized
+    .filter(isProjectActiveForHistory)
+    .sort((left, right) => asProjectUpdatedDay(right) - asProjectUpdatedDay(left) || left.id.localeCompare(right.id))
+  const inactive = normalized
+    .filter(project => !isProjectActiveForHistory(project))
+    .sort((left, right) => asProjectUpdatedDay(right) - asProjectUpdatedDay(left) || left.id.localeCompare(right.id))
+  const keep = new Set()
+  for (const project of [...active, ...inactive]) {
+    if (keep.size >= MAX_PROJECT_ENTRIES) break
+    keep.add(project.id.toLowerCase())
+  }
+  return normalized.filter(project => keep.has(project.id.toLowerCase()))
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldProjects(world) {
+  world.projects = boundProjectHistory(normalizeWorldProjects(world.projects))
+  return world.projects
+}
+
+/**
+ * @param {any[]} projects
+ * @param {string} projectId
+ */
+function findProjectById(projects, projectId) {
+  const target = asText(projectId, '', 200).toLowerCase()
+  if (!target) return null
+  for (const entry of projects || []) {
+    const project = normalizeProject(entry)
+    if (!project) continue
+    if (project.id.toLowerCase() === target) return project
+  }
+  return null
+}
+
+/**
+ * @param {any[]} projects
+ * @param {string} townName
+ */
+function listProjectsForTown(projects, townName) {
+  return (projects || [])
+    .map(normalizeProject)
+    .filter(Boolean)
+    .filter(project => sameText(project.townId, townName, 80))
+    .sort((left, right) => (
+      Number(right.updatedAtDay || 0) - Number(left.updatedAtDay || 0)
+      || left.id.localeCompare(right.id)
+    ))
+}
+
+/**
+ * @param {number} seed
+ * @param {string} townName
+ * @param {string} projectType
+ * @param {number} day
+ */
+function createProjectId(seed, townName, projectType, day) {
+  const hashBase = shortStableHash(`${seed}:${townName}:${projectType}:${day}:project`)
+  return asText(`pr_${hashBase}_${Math.max(0, day).toString(36)}`, `pr_${hashBase}`, 200)
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {string} projectType
+ */
+function buildProjectDraft(world, townName, projectType) {
+  const type = asText(projectType, '', 40).toLowerCase()
+  const config = PROJECT_TYPE_CONFIG[type]
+  if (!config) return null
+  const clock = ensureWorldClock(world)
+  const day = Math.max(1, Number(clock.day || 1))
+  const seed = deriveNetherSeed(world)
+  const missionView = getTownMajorMissionView(world, townName)
+  const activeMission = normalizeMajorMission(missionView?.activeMission)
+  const id = createProjectId(seed, townName, type, day)
+  const project = normalizeProject({
+    id,
+    townId: townName,
+    type,
+    status: 'active',
+    stage: 1,
+    requirements: config.requirements,
+    effects: config.effects,
+    startedAtDay: day,
+    updatedAtDay: day,
+    supportsMajorMissionId: activeMission ? activeMission.id : undefined
+  })
+  return project
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function getCompletedProjectModifiers(world, townName) {
+  const totals = {
+    frontlineShield: 0,
+    scouting: 0,
+    rations: 0,
+    longNightDelta: 0,
+    scarcityDelta: 0
+  }
+  for (const project of listProjectsForTown(normalizeWorldProjects(world?.projects), townName)) {
+    if (project.status !== 'completed') continue
+    totals.frontlineShield += Number(project.effects.frontlineShield || 0)
+    totals.scouting += Number(project.effects.scouting || 0)
+    totals.rations += Number(project.effects.rations || 0)
+    totals.longNightDelta += Number(project.effects.longNightDelta || 0)
+    totals.scarcityDelta += Number(project.effects.scarcityDelta || 0)
+  }
+  return {
+    frontlineShield: Math.trunc(totals.frontlineShield),
+    scouting: Math.trunc(totals.scouting),
+    rations: Math.trunc(totals.rations),
+    longNightDelta: Math.trunc(totals.longNightDelta),
+    scarcityDelta: Math.trunc(totals.scarcityDelta)
+  }
+}
+
+/**
+ * @param {unknown} salvageInput
+ */
+function normalizeSalvageRun(salvageInput) {
+  if (!salvageInput || typeof salvageInput !== 'object' || Array.isArray(salvageInput)) return null
+  const id = asText(salvageInput.id, '', 200)
+  const townId = asText(salvageInput.townId, '', 80)
+  const targetKey = asText(salvageInput.targetKey, '', 80).toLowerCase()
+  const status = asText(salvageInput.status, '', 20).toLowerCase()
+  const plannedAtDay = Number(salvageInput.plannedAtDay)
+  const resolvedAtDayRaw = Number(salvageInput.resolvedAtDay)
+  const outcomeKey = asText(salvageInput.outcomeKey, '', 80).toLowerCase()
+  const supportsMajorMissionId = asText(salvageInput.supportsMajorMissionId, '', 200)
+  const supportsProjectId = asText(salvageInput.supportsProjectId, '', 200)
+  if (!id || !townId || !SALVAGE_TARGET_KEYS.has(targetKey) || !SALVAGE_STATUSES.has(status)) return null
+  if (!Number.isInteger(plannedAtDay) || plannedAtDay < 1) return null
+  if (!Number.isInteger(resolvedAtDayRaw) || resolvedAtDayRaw < 0) return null
+  const resolvedAtDay = status === 'planned'
+    ? 0
+    : Math.max(plannedAtDay, resolvedAtDayRaw)
+  const run = {
+    id,
+    townId,
+    targetKey,
+    status,
+    plannedAtDay,
+    resolvedAtDay,
+    result: normalizeMajorMissionPayload(salvageInput.result, MAX_SALVAGE_RESULT_KEYS)
+  }
+  if (outcomeKey) run.outcomeKey = outcomeKey
+  if (supportsMajorMissionId) run.supportsMajorMissionId = supportsMajorMissionId
+  if (supportsProjectId) run.supportsProjectId = supportsProjectId
+  return run
+}
+
+/**
+ * @param {unknown} salvageRunsInput
+ */
+function normalizeWorldSalvageRuns(salvageRunsInput) {
+  const runs = (Array.isArray(salvageRunsInput) ? salvageRunsInput : [])
+    .map(normalizeSalvageRun)
+    .filter(Boolean)
+  if (runs.length > MAX_SALVAGE_RUN_ENTRIES) {
+    return runs.slice(-MAX_SALVAGE_RUN_ENTRIES)
+  }
+  return runs
+}
+
+/**
+ * @param {any} run
+ */
+function asSalvageUpdatedDay(run) {
+  const normalized = normalizeSalvageRun(run)
+  if (!normalized) return 0
+  return Number(normalized.resolvedAtDay || normalized.plannedAtDay || 0)
+}
+
+/**
+ * @param {any[]} runs
+ */
+function boundSalvageHistory(runs) {
+  const normalized = (Array.isArray(runs) ? runs : [])
+    .map(normalizeSalvageRun)
+    .filter(Boolean)
+  if (normalized.length <= MAX_SALVAGE_RUN_ENTRIES) return normalized
+  const planned = normalized
+    .filter(run => run.status === 'planned')
+    .sort((left, right) => asSalvageUpdatedDay(right) - asSalvageUpdatedDay(left) || left.id.localeCompare(right.id))
+  const settled = normalized
+    .filter(run => run.status !== 'planned')
+    .sort((left, right) => asSalvageUpdatedDay(right) - asSalvageUpdatedDay(left) || left.id.localeCompare(right.id))
+  const keep = new Set()
+  for (const run of [...planned, ...settled]) {
+    if (keep.size >= MAX_SALVAGE_RUN_ENTRIES) break
+    keep.add(run.id.toLowerCase())
+  }
+  return normalized.filter(run => keep.has(run.id.toLowerCase()))
+}
+
+/**
+ * @param {any} world
+ */
+function ensureWorldSalvageRuns(world) {
+  world.salvageRuns = boundSalvageHistory(normalizeWorldSalvageRuns(world.salvageRuns))
+  return world.salvageRuns
+}
+
+/**
+ * @param {any[]} runs
+ * @param {string} runId
+ */
+function findSalvageRunById(runs, runId) {
+  const target = asText(runId, '', 200).toLowerCase()
+  if (!target) return null
+  for (const entry of runs || []) {
+    const run = normalizeSalvageRun(entry)
+    if (!run) continue
+    if (run.id.toLowerCase() === target) return run
+  }
+  return null
+}
+
+/**
+ * @param {any[]} runs
+ * @param {string} townName
+ */
+function listSalvageRunsForTown(runs, townName) {
+  return (runs || [])
+    .map(normalizeSalvageRun)
+    .filter(Boolean)
+    .filter(run => sameText(run.townId, townName, 80))
+    .sort((left, right) => asSalvageUpdatedDay(right) - asSalvageUpdatedDay(left) || left.id.localeCompare(right.id))
+}
+
+/**
+ * @param {number} seed
+ * @param {string} townName
+ * @param {string} targetKey
+ * @param {number} day
+ */
+function createSalvageRunId(seed, townName, targetKey, day) {
+  const hashBase = shortStableHash(`${seed}:${townName}:${targetKey}:${day}:salvage`)
+  return asText(`sr_${hashBase}_${Math.max(0, day).toString(36)}`, `sr_${hashBase}`, 200)
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {string} targetKey
+ */
+function buildSalvageRunDraft(world, townName, targetKey) {
+  const target = asText(targetKey, '', 80).toLowerCase()
+  if (!SALVAGE_TARGET_KEYS.has(target)) return null
+  const clock = ensureWorldClock(world)
+  const day = Math.max(1, Number(clock.day || 1))
+  const seed = deriveNetherSeed(world)
+  const missionView = getTownMajorMissionView(world, townName)
+  const activeMission = normalizeMajorMission(missionView?.activeMission)
+  const supportProject = listProjectsForTown(normalizeWorldProjects(world?.projects), townName)
+    .find(project => project.status === 'active') || null
+  const run = normalizeSalvageRun({
+    id: createSalvageRunId(seed, townName, target, day),
+    townId: townName,
+    targetKey: target,
+    status: 'planned',
+    plannedAtDay: day,
+    resolvedAtDay: 0,
+    result: {},
+    supportsMajorMissionId: activeMission ? activeMission.id : undefined,
+    supportsProjectId: supportProject ? supportProject.id : undefined
+  })
+  return run
+}
+
+/**
+ * @param {any} world
+ * @param {{townName: string, targetKey: string, outcomeKey: string, day: number}} input
+ */
+function buildSalvageOutcome(world, input) {
+  const townName = asText(input?.townName, '', 80)
+  const targetKey = asText(input?.targetKey, '', 80).toLowerCase()
+  const outcomeKey = asText(input?.outcomeKey, '', 80).toLowerCase()
+  const day = Math.max(1, Math.trunc(Number(input?.day || 1)))
+  const targetConfig = SALVAGE_TARGET_CONFIG[targetKey] || SALVAGE_TARGET_CONFIG.no_mans_land_scrap
+  const outcomeConfig = SALVAGE_OUTCOME_CONFIG[outcomeKey] || SALVAGE_OUTCOME_CONFIG.contested
+  const seed = deriveNetherSeed(world)
+  const roll = stableHashNumber(`${seed}:${townName}:${targetKey}:${outcomeKey}:${day}:salvage_result`)
+  const bonus = roll % 2
+  return {
+    supplies: Math.max(0, Number(targetConfig.supplyBase || 0) + Number(outcomeConfig.supplies || 0) + bonus),
+    hopeDelta: Math.trunc(Number(outcomeConfig.hopeDelta || 0)),
+    dreadDelta: Math.trunc(Number(outcomeConfig.dreadDelta || 0) + Number(targetConfig.pressure || 0)),
+    threatDelta: Math.trunc(Number(outcomeConfig.threatDelta || 0)),
+    scarcityDelta: Math.trunc(Number(outcomeConfig.scarcityDelta || 0))
+  }
+}
+
+/**
  * @param {unknown} crierEntryInput
  */
 function normalizeTownCrierEntry(crierEntryInput) {
@@ -3664,6 +4257,54 @@ function normalizeTownCrierQueue(queueInput) {
 }
 
 /**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownPressureValue(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+}
+
+/**
+ * @param {unknown} impactInput
+ */
+function normalizeTownImpactEntry(impactInput) {
+  if (!impactInput || typeof impactInput !== 'object' || Array.isArray(impactInput)) return null
+  const id = asText(impactInput.id, '', 200)
+  const day = Number(impactInput.day)
+  const typeRaw = asText(impactInput.type, '', 40).toLowerCase()
+  const type = TOWN_IMPACT_TYPE_KEYS.has(typeRaw) ? typeRaw : ''
+  const summary = asText(impactInput.summary, '', 160)
+  const missionId = asText(impactInput.missionId, '', 200)
+  const questId = asText(impactInput.questId, '', 200)
+  const netherEventId = asText(impactInput.netherEventId, '', 200)
+  const projectId = asText(impactInput.projectId, '', 200)
+  const salvageRunId = asText(impactInput.salvageRunId, '', 200)
+  if (!id || !Number.isInteger(day) || day < 0 || !type || !summary) return null
+  const entry = { id, day, type, summary }
+  if (missionId) entry.missionId = missionId
+  if (questId) entry.questId = questId
+  if (netherEventId) entry.netherEventId = netherEventId
+  if (projectId) entry.projectId = projectId
+  if (salvageRunId) entry.salvageRunId = salvageRunId
+  return entry
+}
+
+/**
+ * @param {unknown} impactsInput
+ */
+function normalizeTownRecentImpacts(impactsInput) {
+  const impacts = (Array.isArray(impactsInput) ? impactsInput : [])
+    .map(normalizeTownImpactEntry)
+    .filter(Boolean)
+  if (impacts.length > MAX_TOWN_RECENT_IMPACTS) {
+    return impacts.slice(-MAX_TOWN_RECENT_IMPACTS)
+  }
+  return impacts
+}
+
+/**
  * @param {unknown} townInput
  */
 function normalizeTownMissionState(townInput) {
@@ -3675,7 +4316,10 @@ function normalizeTownMissionState(townInput) {
   return {
     activeMajorMissionId,
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
-    crierQueue: normalizeTownCrierQueue(source.crierQueue)
+    hope: normalizeTownPressureValue(source.hope, DEFAULT_TOWN_HOPE),
+    dread: normalizeTownPressureValue(source.dread, DEFAULT_TOWN_DREAD),
+    crierQueue: normalizeTownCrierQueue(source.crierQueue),
+    recentImpacts: normalizeTownRecentImpacts(source.recentImpacts)
   }
 }
 
@@ -3710,6 +4354,8 @@ function deriveTownNamesForMissionState(world) {
   for (const townName of deriveTownNamesForEvents(world)) addTownName(townName)
   for (const townName of Object.keys(normalizeWorldTownMissionStates(world?.towns))) addTownName(townName)
   for (const mission of normalizeWorldMajorMissions(world?.majorMissions)) addTownName(mission.townId)
+  for (const project of normalizeWorldProjects(world?.projects)) addTownName(project.townId)
+  for (const run of normalizeWorldSalvageRuns(world?.salvageRuns)) addTownName(run.townId)
   for (const faction of Object.values(normalizeWorldStoryFactions(world?.factions))) {
     for (const townName of normalizeStoryTownNames(faction?.towns)) addTownName(townName)
   }
@@ -3753,7 +4399,10 @@ function enforceMajorMissionTownExclusivity(world) {
 
   for (const townName of Object.keys(towns)) {
     towns[townName].activeMajorMissionId = null
+    towns[townName].hope = normalizeTownPressureValue(towns[townName].hope, DEFAULT_TOWN_HOPE)
+    towns[townName].dread = normalizeTownPressureValue(towns[townName].dread, DEFAULT_TOWN_DREAD)
     towns[townName].crierQueue = normalizeTownCrierQueue(towns[townName].crierQueue)
+    towns[townName].recentImpacts = normalizeTownRecentImpacts(towns[townName].recentImpacts)
     const cooldown = Number(towns[townName].majorMissionCooldownUntilDay)
     towns[townName].majorMissionCooldownUntilDay = Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0
   }
@@ -3988,6 +4637,334 @@ function appendTownCrier(memory, input) {
   }
   towns[townName].crierQueue = queue
   return entry
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   idPrefix: string,
+ *   type: string,
+ *   summary: string,
+ *   missionId?: string,
+ *   questId?: string,
+ *   netherEventId?: string,
+ *   projectId?: string,
+ *   salvageRunId?: string
+ * }} input
+ */
+function appendTownImpact(memory, input) {
+  const townName = asText(input?.townName, '', 80)
+  if (!townName) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null)
+  }
+  const clock = ensureWorldClock(memory.world)
+  const day = Number.isInteger(Number(clock.day)) ? Number(clock.day) : 0
+  const typeRaw = asText(input?.type, '', 40).toLowerCase()
+  const type = TOWN_IMPACT_TYPE_KEYS.has(typeRaw) ? typeRaw : ''
+  const summary = asText(input?.summary, '', 160)
+  const missionId = asText(input?.missionId, '', 200)
+  const questId = asText(input?.questId, '', 200)
+  const netherEventId = asText(input?.netherEventId, '', 200)
+  const projectId = asText(input?.projectId, '', 200)
+  const salvageRunId = asText(input?.salvageRunId, '', 200)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const impactId = asText(
+    `${idPrefix}:impact:${type}:${(missionId || questId || netherEventId || projectId || salvageRunId || townName).toLowerCase()}`,
+    '',
+    200
+  )
+  const queue = normalizeTownRecentImpacts(towns[townName].recentImpacts)
+  const impact = normalizeTownImpactEntry({
+    id: impactId,
+    day,
+    type,
+    summary,
+    ...(missionId ? { missionId } : {}),
+    ...(questId ? { questId } : {}),
+    ...(netherEventId ? { netherEventId } : {}),
+    ...(projectId ? { projectId } : {}),
+    ...(salvageRunId ? { salvageRunId } : {})
+  })
+  if (!impact) return null
+  if (queue.some(entry => sameText(entry.id, impact.id, 200))) {
+    return queue.find(entry => sameText(entry.id, impact.id, 200)) || null
+  }
+  queue.push(impact)
+  if (queue.length > MAX_TOWN_RECENT_IMPACTS) {
+    queue.splice(0, queue.length - MAX_TOWN_RECENT_IMPACTS)
+  }
+  towns[townName].recentImpacts = queue
+  return impact
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   delta: {hope?: number, dread?: number},
+ *   idPrefix: string,
+ *   type: string,
+ *   summary: string,
+ *   missionId?: string,
+ *   questId?: string,
+ *   netherEventId?: string,
+ *   projectId?: string,
+ *   salvageRunId?: string
+ * }} input
+ */
+function applyTownPressureDelta(memory, input) {
+  const townName = asText(input?.townName, '', 80)
+  if (!townName) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null)
+  }
+  const state = towns[townName]
+  const currentHope = normalizeTownPressureValue(state.hope, DEFAULT_TOWN_HOPE)
+  const currentDread = normalizeTownPressureValue(state.dread, DEFAULT_TOWN_DREAD)
+  const hopeDelta = Math.trunc(Number(input?.delta?.hope || 0))
+  const dreadDelta = Math.trunc(Number(input?.delta?.dread || 0))
+  const nextHope = clamp(currentHope + hopeDelta, TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const nextDread = clamp(currentDread + dreadDelta, TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  state.hope = nextHope
+  state.dread = nextDread
+  appendTownImpact(memory, {
+    townName,
+    idPrefix: asText(input?.idPrefix, '', 200),
+    type: asText(input?.type, '', 40),
+    summary: asText(input?.summary, '', 160),
+    missionId: asText(input?.missionId, '', 200) || undefined,
+    questId: asText(input?.questId, '', 200) || undefined,
+    netherEventId: asText(input?.netherEventId, '', 200) || undefined,
+    projectId: asText(input?.projectId, '', 200) || undefined,
+    salvageRunId: asText(input?.salvageRunId, '', 200) || undefined
+  })
+  return {
+    townName,
+    hope: nextHope,
+    dread: nextDread
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   project: any,
+ *   at: number,
+ *   idPrefix: string,
+ *   crierType: string,
+ *   message: string
+ * }} input
+ */
+function appendProjectAnnouncements(memory, input) {
+  const project = normalizeProject(input?.project)
+  if (!project) return
+  const townName = asText(input?.townName, '', 80)
+  const message = asText(input?.message, '', 240)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const crierType = asText(input?.crierType, '', 40).toLowerCase()
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  if (!townName || !message || !idPrefix || !crierType) return
+  appendTownCrier(memory, {
+    townName,
+    at,
+    idPrefix,
+    type: crierType,
+    message
+  })
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:project:${crierType}:${project.id.toLowerCase()}`,
+    type: 'project',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      project_id: project.id,
+      project_type: project.type,
+      status: project.status,
+      stage: project.stage
+    }
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:project:${crierType}:${project.id.toLowerCase()}`,
+    topic: 'project',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      project_id: project.id,
+      project_type: project.type,
+      status: project.status,
+      stage: project.stage
+    }
+  })
+}
+
+/**
+ * @param {string} townName
+ * @param {any} project
+ */
+function buildProjectStatusMessage(townName, project) {
+  const normalized = normalizeProject(project)
+  if (!normalized) return ''
+  return asText(
+    `[${townName}] PROJECT ${normalized.status.toUpperCase()}: ${normalized.type} stage=${normalized.stage}.`,
+    `Project ${normalized.type}.`,
+    240
+  )
+}
+
+/**
+ * @param {any} memory
+ * @param {any} project
+ * @param {{idPrefix: string}} input
+ */
+function applyProjectCompletionEffects(memory, project, input) {
+  const normalized = normalizeProject(project)
+  if (!normalized || normalized.status !== 'completed') return
+  const townName = asText(normalized.townId, '', 80)
+  if (!townName) return
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  if (!idPrefix) return
+
+  const threatDelta = Math.trunc(Number(normalized.effects.threatDelta || 0))
+  const scarcityDelta = Math.trunc(Number(normalized.effects.scarcityDelta || 0))
+  const longNightDelta = Math.trunc(Number(normalized.effects.longNightDelta || 0))
+  const hopeDelta = Math.trunc(Number(normalized.effects.hopeDelta || 0))
+  const dreadDelta = Math.trunc(Number(normalized.effects.dreadDelta || 0))
+
+  if (threatDelta !== 0) {
+    const threat = ensureWorldThreat(memory.world)
+    const current = Number(threat.byTown[townName] || 0)
+    threat.byTown[townName] = clamp(current + threatDelta, 0, 100)
+  }
+  if (scarcityDelta !== 0 || longNightDelta !== 0) {
+    const nether = ensureWorldNether(memory.world)
+    nether.modifiers = applyNetherModifierDeltas(nether.modifiers, {
+      scarcity: scarcityDelta,
+      longNight: longNightDelta
+    })
+  }
+  applyTownPressureDelta(memory, {
+    townName,
+    delta: { hope: hopeDelta, dread: dreadDelta },
+    idPrefix: `${idPrefix}:project_complete:${normalized.id.toLowerCase()}`,
+    type: 'project_complete',
+    summary: `project_${normalized.type}_completed`,
+    projectId: normalized.id
+  })
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   run: any,
+ *   at: number,
+ *   idPrefix: string,
+ *   crierType: string,
+ *   message: string
+ * }} input
+ */
+function appendSalvageAnnouncements(memory, input) {
+  const run = normalizeSalvageRun(input?.run)
+  if (!run) return
+  const townName = asText(input?.townName, '', 80)
+  const message = asText(input?.message, '', 240)
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  const crierType = asText(input?.crierType, '', 40).toLowerCase()
+  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  if (!townName || !message || !idPrefix || !crierType) return
+  appendTownCrier(memory, {
+    townName,
+    at,
+    idPrefix,
+    type: crierType,
+    message
+  })
+  appendChronicle(memory, {
+    id: `${idPrefix}:chronicle:salvage:${crierType}:${run.id.toLowerCase()}`,
+    type: 'salvage',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      salvage_run_id: run.id,
+      target_key: run.targetKey,
+      status: run.status,
+      outcome_key: asText(run.outcomeKey, '-', 80)
+    }
+  })
+  appendNews(memory, {
+    id: `${idPrefix}:news:salvage:${crierType}:${run.id.toLowerCase()}`,
+    topic: 'salvage',
+    msg: message,
+    at,
+    town: townName,
+    meta: {
+      salvage_run_id: run.id,
+      target_key: run.targetKey,
+      status: run.status,
+      outcome_key: asText(run.outcomeKey, '-', 80)
+    }
+  })
+}
+
+/**
+ * @param {string} townName
+ * @param {any} run
+ */
+function buildSalvageStatusMessage(townName, run) {
+  const normalized = normalizeSalvageRun(run)
+  if (!normalized) return ''
+  const supplies = Number(normalized.result?.supplies || 0)
+  const outcomeKey = asText(normalized.outcomeKey, '-', 80)
+  return asText(
+    `[${townName}] SALVAGE ${normalized.status.toUpperCase()}: ${normalized.targetKey} outcome=${outcomeKey} supplies=${supplies}.`,
+    `Salvage ${normalized.targetKey}.`,
+    240
+  )
+}
+
+/**
+ * @param {any} memory
+ * @param {any} run
+ * @param {{idPrefix: string}} input
+ */
+function applySalvageResolutionEffects(memory, run, input) {
+  const normalized = normalizeSalvageRun(run)
+  if (!normalized || normalized.status !== 'resolved') return
+  const townName = asText(normalized.townId, '', 80)
+  if (!townName) return
+  const idPrefix = asText(input?.idPrefix, '', 200)
+  if (!idPrefix) return
+  const hopeDelta = Math.trunc(Number(normalized.result.hopeDelta || 0))
+  const dreadDelta = Math.trunc(Number(normalized.result.dreadDelta || 0))
+  const threatDelta = Math.trunc(Number(normalized.result.threatDelta || 0))
+  const scarcityDelta = Math.trunc(Number(normalized.result.scarcityDelta || 0))
+  if (threatDelta !== 0) {
+    const threat = ensureWorldThreat(memory.world)
+    const current = Number(threat.byTown[townName] || 0)
+    threat.byTown[townName] = clamp(current + threatDelta, 0, 100)
+  }
+  if (scarcityDelta !== 0) {
+    const nether = ensureWorldNether(memory.world)
+    nether.modifiers = applyNetherModifierDeltas(nether.modifiers, { scarcity: scarcityDelta })
+  }
+  applyTownPressureDelta(memory, {
+    townName,
+    delta: { hope: hopeDelta, dread: dreadDelta },
+    idPrefix: `${idPrefix}:salvage_resolve:${normalized.id.toLowerCase()}`,
+    type: 'salvage_resolve',
+    summary: `salvage_${normalized.targetKey}_${asText(normalized.outcomeKey, 'contested', 80)}`,
+    missionId: asText(normalized.supportsMajorMissionId, '', 200) || undefined,
+    projectId: asText(normalized.supportsProjectId, '', 200) || undefined,
+    salvageRunId: normalized.id
+  })
 }
 
 /**
@@ -4314,6 +5291,16 @@ function completeQuestAndReward(quest, townFallback, at, idPrefix, memory) {
     idPrefix: `${idPrefix}:quest_complete:${normalized.id.toLowerCase()}`,
     reason: 'quest_complete'
   })
+  if (asText(normalized.origin, '', 40).toLowerCase() === 'townsfolk') {
+    applyTownPressureDelta(memory, {
+      townName: town,
+      delta: PRESSURE_BY_OUTCOME.townsfolk_complete,
+      idPrefix: `${idPrefix}:townsfolk_complete:${normalized.id.toLowerCase()}`,
+      type: 'townsfolk_complete',
+      summary: 'townsfolk_quest_completed',
+      questId: normalized.id
+    })
+  }
   return normalized
 }
 
@@ -4689,6 +5676,18 @@ function buildTownNameIndex(world) {
     const key = safeName.toLowerCase()
     if (!names.has(key)) names.set(key, safeName)
   }
+  for (const project of normalizeWorldProjects(world?.projects)) {
+    const safeName = asText(project?.townId, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
+  for (const run of normalizeWorldSalvageRuns(world?.salvageRuns)) {
+    const safeName = asText(run?.townId, '', 80)
+    if (!safeName) continue
+    const key = safeName.toLowerCase()
+    if (!names.has(key)) names.set(key, safeName)
+  }
   for (const town of deriveTownsFromMarkers(world?.markers || [])) {
     const safeName = asText(town?.townName, '', 80)
     if (!safeName) continue
@@ -4962,6 +5961,69 @@ function parseGodCommand(rawCommand) {
       return { type: 'townsfolk_talk', townName, npcName }
     }
     return { type: 'invalid', reason: 'Usage: god townsfolk talk <townName> <npcIdOrName>' }
+  }
+
+  if (head === 'project') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const townName = asText(words[2], '', 80)
+    if (!townName || words.length < 3) {
+      return {
+        type: 'invalid',
+        reason: 'Usage: god project list <townName> | god project start <townName> <projectType> | god project advance <townName> <projectId> | god project complete <townName> <projectId> | god project fail <townName> <projectId> [reason]'
+      }
+    }
+    if (action === 'list' && words.length === 3) return { type: 'project_list', townName }
+    if (action === 'start' && words.length === 4) {
+      const projectType = asText(words[3], '', 40).toLowerCase()
+      return { type: 'project_start', townName, projectType }
+    }
+    if (action === 'advance' && words.length === 4) {
+      const projectId = asText(words[3], '', 200)
+      return { type: 'project_advance', townName, projectId }
+    }
+    if (action === 'complete' && words.length === 4) {
+      const projectId = asText(words[3], '', 200)
+      return { type: 'project_complete', townName, projectId }
+    }
+    if (action === 'fail' && words.length >= 4) {
+      const projectId = asText(words[3], '', 200)
+      const reason = asText(words.slice(4).join(' '), '', 160) || null
+      return { type: 'project_fail', townName, projectId, reason }
+    }
+    return {
+      type: 'invalid',
+      reason: 'Usage: god project list <townName> | god project start <townName> <projectType> | god project advance <townName> <projectId> | god project complete <townName> <projectId> | god project fail <townName> <projectId> [reason]'
+    }
+  }
+
+  if (head === 'salvage') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const townName = asText(words[2], '', 80)
+    if (!townName || words.length < 3) {
+      return {
+        type: 'invalid',
+        reason: 'Usage: god salvage list <townName> | god salvage plan <townName> <targetKey> | god salvage resolve <townName> <runId> <outcomeKey> | god salvage fail <townName> <runId> [reason]'
+      }
+    }
+    if (action === 'list' && words.length === 3) return { type: 'salvage_list', townName }
+    if (action === 'plan' && words.length === 4) {
+      const targetKey = asText(words[3], '', 80).toLowerCase()
+      return { type: 'salvage_plan', townName, targetKey }
+    }
+    if (action === 'resolve' && words.length === 5) {
+      const runId = asText(words[3], '', 200)
+      const outcomeKey = asText(words[4], '', 80).toLowerCase()
+      return { type: 'salvage_resolve', townName, runId, outcomeKey }
+    }
+    if (action === 'fail' && words.length >= 4) {
+      const runId = asText(words[3], '', 200)
+      const reason = asText(words.slice(4).join(' '), '', 160) || null
+      return { type: 'salvage_fail', townName, runId, reason }
+    }
+    return {
+      type: 'invalid',
+      reason: 'Usage: god salvage list <townName> | god salvage plan <townName> <targetKey> | god salvage resolve <townName> <runId> <outcomeKey> | god salvage fail <townName> <runId> [reason]'
+    }
   }
 
   if (head === 'clock') {
@@ -7249,12 +8311,44 @@ function createGodCommandService(deps) {
       const missionView = getTownMajorMissionView(snapshot.world, town.townName)
       const activeMajorMission = normalizeMajorMission(missionView?.activeMission)
       const availableMajorMission = normalizeMajorMission(missionView?.availableMission)
+      const projects = listProjectsForTown(normalizeWorldProjects(snapshot.world?.projects), town.townName)
+      const activeProjects = projects
+        .filter(project => project.status === 'active' || project.status === 'planned')
+        .slice(0, Math.min(limit, 3))
+      const projectLines = activeProjects.map(project => (
+        `GOD TOWN BOARD PROJECT: id=${project.id} type=${project.type} status=${project.status} stage=${project.stage} updated_day=${project.updatedAtDay} supports_major_mission_id=${asText(project.supportsMajorMissionId, '-', 200)}`
+      ))
+      const projectModifiers = getCompletedProjectModifiers(snapshot.world, town.townName)
+      const salvageRuns = listSalvageRunsForTown(normalizeWorldSalvageRuns(snapshot.world?.salvageRuns), town.townName)
+      const pendingSalvage = salvageRuns.find(run => run.status === 'planned') || null
+      const salvageHeadline = pendingSalvage || salvageRuns[0] || null
+      const salvageSummaryLine = salvageHeadline
+        ? `GOD TOWN BOARD SALVAGE: id=${salvageHeadline.id} target=${salvageHeadline.targetKey} status=${salvageHeadline.status} planned_day=${salvageHeadline.plannedAtDay} resolved_day=${salvageHeadline.resolvedAtDay} outcome=${asText(salvageHeadline.outcomeKey, '-', 80)} supplies=${Number(salvageHeadline.result?.supplies || 0)} supports_major_mission_id=${asText(salvageHeadline.supportsMajorMissionId, '-', 200)} supports_project_id=${asText(salvageHeadline.supportsProjectId, '-', 200)}`
+        : 'GOD TOWN BOARD SALVAGE: (none)'
+      const townState = normalizeTownMissionState(missionView?.townState)
+      const hope = normalizeTownPressureValue(townState.hope, DEFAULT_TOWN_HOPE)
+      const dread = normalizeTownPressureValue(townState.dread, DEFAULT_TOWN_DREAD)
+      const frontline = deriveFrontlineStatus({
+        townThreatLevel,
+        activeMajorMission,
+        latestNetherEvent,
+        hope,
+        dread,
+        projectFrontlineShield: projectModifiers.frontlineShield,
+        projectScouting: projectModifiers.scouting
+      })
+      const rationStrain = deriveRationsStrain({
+        townThreatLevel,
+        scarcity: Number(nether.modifiers?.scarcity || 0),
+        mood: townMood,
+        projectRations: projectModifiers.rations
+      })
       const majorMissionLine = activeMajorMission
         ? `GOD TOWN BOARD MAJOR MISSION ACTIVE: id=${activeMajorMission.id} template=${activeMajorMission.templateId} phase=${activeMajorMission.phase} ${formatMajorMissionStakes(activeMajorMission)}`
         : availableMajorMission
           ? `GOD TOWN BOARD MAJOR MISSION TEASER: id=${availableMajorMission.id} template=${availableMajorMission.templateId} status=${availableMajorMission.status} ${formatMajorMissionStakes(availableMajorMission)}`
           : 'GOD TOWN BOARD MAJOR MISSION: (none)'
-      const sideQuestLines = quests
+      const sideQuestRows = quests
         .filter((quest) => {
           if (!isQuestLinkedToTown(quest)) return false
           const origin = asText(quest.origin, '', 40).toLowerCase()
@@ -7264,12 +8358,55 @@ function createGodCommandService(deps) {
         })
         .sort(sortQuests)
         .slice(0, Math.min(limit, 5))
+      const sideQuestLines = sideQuestRows
         .map(quest => (
           `GOD TOWN BOARD SIDE QUEST: id=${quest.id} origin=${asText(quest.origin, quest.type === 'rumor_task' ? 'rumor' : 'quest', 40)} state=${quest.state} npc=${asText(quest.npcKey, '-', 80)} supports_major_mission_id=${asText(quest.supportsMajorMissionId, '-', 200)} progress=${summarizeQuestProgress(quest)} reward=${quest.reward} title=${quest.title}`
         ))
+      const ordersQuestLines = sideQuestRows
+        .slice(0, 2)
+        .map(quest => (
+          `GOD TOWN BOARD WAR ORDER QUEST: id=${quest.id} state=${quest.state} origin=${asText(quest.origin, quest.type, 40)} reward=${quest.reward} title=${quest.title}`
+        ))
+      const missionOrder = activeMajorMission
+        ? asText(
+          `Hold ${activeMajorMission.id} phase ${activeMajorMission.phase}. ${getMajorMissionPhaseNote(activeMajorMission) || ''}`.trim(),
+          `Hold ${activeMajorMission.id}.`,
+          200
+        )
+        : availableMajorMission
+          ? asText(`Secure approval for ${availableMajorMission.id}.`, `Review ${availableMajorMission.id}.`, 200)
+          : 'No major mission order.'
+      const impactQueue = normalizeTownRecentImpacts(townState.recentImpacts)
+      const todayImpacts = impactQueue.filter(entry => Number(entry.day) === Number(clock.day))
+      const selectedImpacts = (todayImpacts.length > 0 ? todayImpacts : impactQueue)
+        .slice(-3)
+        .reverse()
+      const warChangeLines = selectedImpacts
+        .map(formatTownImpact)
+        .filter(Boolean)
+      if (
+        latestNetherEvent
+        && Number(latestNetherEvent.day || 0) === Number(clock.day)
+        && !selectedImpacts.some(entry => sameText(entry?.netherEventId, latestNetherEvent.id, 200))
+      ) {
+        warChangeLines.unshift(
+          `GOD TOWN BOARD WAR CHANGE: day=${latestNetherEvent.day} type=nether_event summary=nether_${latestNetherEvent.type.toLowerCase()} nether_event_id=${latestNetherEvent.id}`
+        )
+      }
+      if (warChangeLines.length > 3) warChangeLines.splice(3)
 
       const lines = [
         `GOD TOWN BOARD: town=${town.townName} marker=${town.marker.name} x=${town.marker.x} y=${town.marker.y} z=${town.marker.z} population=${population} limit=${limit}`,
+        `GOD TOWN BOARD WAR FRONTLINE STATUS: label=${frontline.label} score=${frontline.score} threat=${frontline.threatLevel} mission=${frontline.mission} nether=${frontline.netherType}`,
+        `GOD TOWN BOARD WAR HOPE DREAD: hope=${hope}(${toPressureTier(hope)}) dread=${dread}(${toPressureTier(dread)})`,
+        `GOD TOWN BOARD WAR RATIONS STRAIN: rations=${rationStrain.rations} strain=${rationStrain.strain} outlook=${rationStrain.outlook}`,
+        `GOD TOWN BOARD WAR WHAT CHANGED TODAY: count=${warChangeLines.length}`,
+        ...(warChangeLines.length > 0 ? warChangeLines : ['GOD TOWN BOARD WAR CHANGE: (none)']),
+        `GOD TOWN BOARD WAR ORDERS OF THE DAY: mission=${missionOrder}`,
+        ...(ordersQuestLines.length > 0 ? ordersQuestLines : ['GOD TOWN BOARD WAR ORDER QUEST: (none)']),
+        `GOD TOWN BOARD PROJECTS: count=${projectLines.length}`,
+        ...(projectLines.length > 0 ? projectLines : ['GOD TOWN BOARD PROJECT: (none)']),
+        salvageSummaryLine,
         ...pulse.hot.map(item => `GOD TOWN BOARD MARKET PULSE HOT: good=${item.good} hint=${item.multiplierHint} reason=${item.reason}`),
         ...pulse.cold.map(item => `GOD TOWN BOARD MARKET PULSE COLD: good=${item.good} reason=${item.reason}`),
         `GOD TOWN BOARD ROUTE RISK: label=${routeRisk.label} reason=${routeRisk.reason} note=${routeRisk.nightPenaltyHint}`,
@@ -7758,6 +8895,14 @@ function createGodCommandService(deps) {
             message: buildMajorMissionCompletionMessage(canonicalTown, mission),
             status: 'completed'
           })
+          applyTownPressureDelta(memory, {
+            townName: canonicalTown,
+            delta: PRESSURE_BY_OUTCOME.mission_complete,
+            idPrefix: `${operationId}:mission_complete:${canonicalTown.toLowerCase()}`,
+            type: 'mission_complete',
+            summary: 'major_mission_won',
+            missionId: mission.id
+          })
           return {
             mission,
             cooldownUntilDay: towns[canonicalTown].majorMissionCooldownUntilDay
@@ -7843,6 +8988,14 @@ function createGodCommandService(deps) {
             crierType: 'mission_fail',
             message: buildMajorMissionFailureMessage(canonicalTown, mission, failReason),
             status: 'failed'
+          })
+          applyTownPressureDelta(memory, {
+            townName: canonicalTown,
+            delta: PRESSURE_BY_OUTCOME.mission_fail,
+            idPrefix: `${operationId}:mission_fail:${canonicalTown.toLowerCase()}`,
+            type: 'mission_fail',
+            summary: 'major_mission_lost',
+            missionId: mission.id
           })
           return {
             mission,
@@ -7988,6 +9141,632 @@ function createGodCommandService(deps) {
         outputLines: [
           `GOD TOWNSFOLK TALK: town=${townName} npc=${npcKey} status=${tx.result.created ? 'created' : 'existing'} quest_id=${tx.result.quest.id} type=${tx.result.quest.type} state=${tx.result.quest.state}`,
           `GOD TOWNSFOLK QUEST: supports_major_mission_id=${asText(tx.result.quest.supportsMajorMissionId, '-', 200)} reward=${tx.result.quest.reward} title=${tx.result.quest.title}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'project_list') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const projects = listProjectsForTown(normalizeWorldProjects(snapshot.world?.projects), townName)
+      if (projects.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [`GOD PROJECT LIST: town=${townName} (none)`]
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD PROJECT LIST: town=${townName} count=${projects.length}`,
+          ...projects.map(project => (
+            `GOD PROJECT: id=${project.id} type=${project.type} status=${project.status} stage=${project.stage} started_day=${project.startedAtDay} updated_day=${project.updatedAtDay} supports_major_mission_id=${asText(project.supportsMajorMissionId, '-', 200)}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'project_start') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      const projectType = asText(parsed.projectType, '', 40).toLowerCase()
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      if (!PROJECT_TYPES.has(projectType)) return { applied: false, command, reason: 'Unknown project type.' }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for project start: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const projects = ensureWorldProjects(memory.world)
+          const draft = buildProjectDraft(memory.world, canonicalTown, projectType)
+          if (!draft) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT_TYPE',
+              message: `Unknown project type: ${projectType}`,
+              recoverable: true
+            })
+          }
+          const existing = findProjectById(projects, draft.id)
+          if (existing) return { project: existing, created: false }
+          projects.push(draft)
+          memory.world.projects = boundProjectHistory(projects)
+          const at = now()
+          appendTownImpact(memory, {
+            townName: canonicalTown,
+            idPrefix: `${operationId}:project_start:${draft.id.toLowerCase()}`,
+            type: 'project_start',
+            summary: `project_${draft.type}_started`,
+            missionId: asText(draft.supportsMajorMissionId, '', 200) || undefined,
+            projectId: draft.id
+          })
+          appendProjectAnnouncements(memory, {
+            townName: canonicalTown,
+            project: draft,
+            at,
+            idPrefix: `${operationId}:project_start:${draft.id.toLowerCase()}`,
+            crierType: 'project_start',
+            message: buildProjectStatusMessage(canonicalTown, draft)
+          })
+          return { project: draft, created: true }
+        }, { eventId: `${operationId}:project_start:${townName.toLowerCase()}:${projectType}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_PROJECT_TYPE') return { applied: false, command, reason: 'Unknown project type.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: tx.result.created === true,
+        outputLines: [
+          `GOD PROJECT START: town=${townName} type=${projectType} status=${tx.result.created ? 'created' : 'existing'} project_id=${tx.result.project.id} stage=${tx.result.project.stage}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'project_advance') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const existing = findProjectById(snapshot.world?.projects || [], parsed.projectId)
+      if (!existing || !sameText(existing.townId, townName, 80)) return { applied: false, command, reason: 'Unknown project.' }
+      if (!(existing.status === 'active' || existing.status === 'planned')) {
+        return { applied: false, command, reason: 'Project cannot advance from current state.' }
+      }
+      if (Number(existing.stage || 0) >= PROJECT_STAGE_MAX) {
+        return { applied: false, command, reason: 'Project is already at final stage.' }
+      }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for project advance: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const projects = ensureWorldProjects(memory.world)
+          const idx = projects.findIndex(project => sameText(project?.id, parsed.projectId, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          const project = normalizeProject(projects[idx])
+          if (!project || !sameText(project.townId, canonicalTown, 80)) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project for town ${canonicalTown}: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          if (!(project.status === 'active' || project.status === 'planned')) {
+            throw new AppError({
+              code: 'PROJECT_STATE_INVALID',
+              message: `Project not advanceable: ${project.id}`,
+              recoverable: true
+            })
+          }
+          if (Number(project.stage || 0) >= PROJECT_STAGE_MAX) {
+            throw new AppError({
+              code: 'PROJECT_STAGE_FINAL',
+              message: `Project already at final stage: ${project.id}`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          project.status = 'active'
+          project.stage = Math.min(PROJECT_STAGE_MAX, Number(project.stage || 0) + 1)
+          project.updatedAtDay = Number(clock.day || project.updatedAtDay || 1)
+          projects[idx] = project
+          const at = now()
+          appendProjectAnnouncements(memory, {
+            townName: canonicalTown,
+            project,
+            at,
+            idPrefix: `${operationId}:project_advance:${project.id.toLowerCase()}`,
+            crierType: 'project_phase',
+            message: buildProjectStatusMessage(canonicalTown, project)
+          })
+          return project
+        }, { eventId: `${operationId}:project_advance:${townName.toLowerCase()}:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_PROJECT') return { applied: false, command, reason: 'Unknown project.' }
+        if (err instanceof AppError && err.code === 'PROJECT_STATE_INVALID') return { applied: false, command, reason: 'Project cannot advance from current state.' }
+        if (err instanceof AppError && err.code === 'PROJECT_STAGE_FINAL') return { applied: false, command, reason: 'Project is already at final stage.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD PROJECT ADVANCE: town=${townName} project_id=${tx.result.id} status=${tx.result.status} stage=${tx.result.stage}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'project_complete') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const existing = findProjectById(snapshot.world?.projects || [], parsed.projectId)
+      if (!existing || !sameText(existing.townId, townName, 80)) return { applied: false, command, reason: 'Unknown project.' }
+      if (!(existing.status === 'active' || existing.status === 'planned')) {
+        return { applied: false, command, reason: 'Project cannot complete from current state.' }
+      }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for project complete: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const projects = ensureWorldProjects(memory.world)
+          const idx = projects.findIndex(project => sameText(project?.id, parsed.projectId, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          const project = normalizeProject(projects[idx])
+          if (!project || !sameText(project.townId, canonicalTown, 80)) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project for town ${canonicalTown}: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          if (!(project.status === 'active' || project.status === 'planned')) {
+            throw new AppError({
+              code: 'PROJECT_STATE_INVALID',
+              message: `Project not completable: ${project.id}`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          project.status = 'completed'
+          project.stage = Math.max(1, Number(project.stage || 1))
+          project.updatedAtDay = Number(clock.day || project.updatedAtDay || 1)
+          projects[idx] = project
+          applyProjectCompletionEffects(memory, project, {
+            idPrefix: `${operationId}:project_complete:${project.id.toLowerCase()}`
+          })
+          const at = now()
+          appendProjectAnnouncements(memory, {
+            townName: canonicalTown,
+            project,
+            at,
+            idPrefix: `${operationId}:project_complete:${project.id.toLowerCase()}`,
+            crierType: 'project_complete',
+            message: buildProjectStatusMessage(canonicalTown, project)
+          })
+          return project
+        }, { eventId: `${operationId}:project_complete:${townName.toLowerCase()}:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_PROJECT') return { applied: false, command, reason: 'Unknown project.' }
+        if (err instanceof AppError && err.code === 'PROJECT_STATE_INVALID') return { applied: false, command, reason: 'Project cannot complete from current state.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD PROJECT COMPLETE: town=${townName} project_id=${tx.result.id} status=${tx.result.status} stage=${tx.result.stage}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'project_fail') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      const failReason = asText(parsed.reason, '', 160) || null
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const existing = findProjectById(snapshot.world?.projects || [], parsed.projectId)
+      if (!existing || !sameText(existing.townId, townName, 80)) return { applied: false, command, reason: 'Unknown project.' }
+      if (!(existing.status === 'active' || existing.status === 'planned')) {
+        return { applied: false, command, reason: 'Project cannot fail from current state.' }
+      }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for project fail: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const projects = ensureWorldProjects(memory.world)
+          const idx = projects.findIndex(project => sameText(project?.id, parsed.projectId, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          const project = normalizeProject(projects[idx])
+          if (!project || !sameText(project.townId, canonicalTown, 80)) {
+            throw new AppError({
+              code: 'UNKNOWN_PROJECT',
+              message: `Unknown project for town ${canonicalTown}: ${parsed.projectId}`,
+              recoverable: true
+            })
+          }
+          if (!(project.status === 'active' || project.status === 'planned')) {
+            throw new AppError({
+              code: 'PROJECT_STATE_INVALID',
+              message: `Project not fail-able: ${project.id}`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          project.status = 'failed'
+          project.updatedAtDay = Number(clock.day || project.updatedAtDay || 1)
+          projects[idx] = project
+          applyTownPressureDelta(memory, {
+            townName: canonicalTown,
+            delta: PRESSURE_BY_PROJECT_FAIL,
+            idPrefix: `${operationId}:project_fail:${project.id.toLowerCase()}`,
+            type: 'project_fail',
+            summary: failReason ? `project_${project.type}_failed` : `project_${project.type}_failed`,
+            missionId: asText(project.supportsMajorMissionId, '', 200) || undefined,
+            projectId: project.id
+          })
+          const at = now()
+          appendProjectAnnouncements(memory, {
+            townName: canonicalTown,
+            project,
+            at,
+            idPrefix: `${operationId}:project_fail:${project.id.toLowerCase()}`,
+            crierType: 'project_fail',
+            message: asText(
+              `${buildProjectStatusMessage(canonicalTown, project)}${failReason ? ` reason=${failReason}` : ''}`,
+              buildProjectStatusMessage(canonicalTown, project),
+              240
+            )
+          })
+          return project
+        }, { eventId: `${operationId}:project_fail:${townName.toLowerCase()}:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_PROJECT') return { applied: false, command, reason: 'Unknown project.' }
+        if (err instanceof AppError && err.code === 'PROJECT_STATE_INVALID') return { applied: false, command, reason: 'Project cannot fail from current state.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD PROJECT FAIL: town=${townName} project_id=${tx.result.id} status=${tx.result.status} reason=${failReason || '-'}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'salvage_list') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const runs = listSalvageRunsForTown(normalizeWorldSalvageRuns(snapshot.world?.salvageRuns), townName)
+      if (runs.length === 0) {
+        return {
+          applied: true,
+          command,
+          audit: false,
+          outputLines: [`GOD SALVAGE LIST: town=${townName} (none)`]
+        }
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD SALVAGE LIST: town=${townName} count=${runs.length}`,
+          ...runs.map(run => (
+            `GOD SALVAGE: id=${run.id} target=${run.targetKey} status=${run.status} planned_day=${run.plannedAtDay} resolved_day=${run.resolvedAtDay} outcome=${asText(run.outcomeKey, '-', 80)} supplies=${Number(run.result?.supplies || 0)} supports_major_mission_id=${asText(run.supportsMajorMissionId, '-', 200)} supports_project_id=${asText(run.supportsProjectId, '-', 200)}`
+          ))
+        ]
+      }
+    }
+
+    if (parsed.type === 'salvage_plan') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      const targetKey = asText(parsed.targetKey, '', 80).toLowerCase()
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      if (!SALVAGE_TARGET_KEYS.has(targetKey)) return { applied: false, command, reason: 'Unknown salvage target.' }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for salvage plan: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const run = buildSalvageRunDraft(memory.world, canonicalTown, targetKey)
+          if (!run) {
+            throw new AppError({
+              code: 'UNKNOWN_SALVAGE_TARGET',
+              message: `Unknown salvage target: ${targetKey}`,
+              recoverable: true
+            })
+          }
+          const runs = ensureWorldSalvageRuns(memory.world)
+          const existing = findSalvageRunById(runs, run.id)
+          if (existing) return { run: existing, created: false }
+          runs.push(run)
+          memory.world.salvageRuns = boundSalvageHistory(runs)
+          const at = now()
+          appendTownImpact(memory, {
+            townName: canonicalTown,
+            idPrefix: `${operationId}:salvage_plan:${run.id.toLowerCase()}`,
+            type: 'salvage_plan',
+            summary: `salvage_${run.targetKey}_planned`,
+            missionId: asText(run.supportsMajorMissionId, '', 200) || undefined,
+            projectId: asText(run.supportsProjectId, '', 200) || undefined,
+            salvageRunId: run.id
+          })
+          appendSalvageAnnouncements(memory, {
+            townName: canonicalTown,
+            run,
+            at,
+            idPrefix: `${operationId}:salvage_plan:${run.id.toLowerCase()}`,
+            crierType: 'salvage_plan',
+            message: buildSalvageStatusMessage(canonicalTown, run)
+          })
+          return { run, created: true }
+        }, { eventId: `${operationId}:salvage_plan:${townName.toLowerCase()}:${targetKey}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_SALVAGE_TARGET') return { applied: false, command, reason: 'Unknown salvage target.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: tx.result.created === true,
+        outputLines: [
+          `GOD SALVAGE PLAN: town=${townName} target=${targetKey} status=${tx.result.created ? 'created' : 'existing'} run_id=${tx.result.run.id}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'salvage_resolve') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      const outcomeKey = asText(parsed.outcomeKey, '', 80).toLowerCase()
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      if (!SALVAGE_OUTCOME_KEYS.has(outcomeKey)) return { applied: false, command, reason: 'Unknown salvage outcome.' }
+      const existing = findSalvageRunById(snapshot.world?.salvageRuns || [], parsed.runId)
+      if (!existing || !sameText(existing.townId, townName, 80)) return { applied: false, command, reason: 'Unknown salvage run.' }
+      if (existing.status !== 'planned') return { applied: false, command, reason: 'Salvage run is not in planned state.' }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for salvage resolve: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const runs = ensureWorldSalvageRuns(memory.world)
+          const idx = runs.findIndex(run => sameText(run?.id, parsed.runId, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_SALVAGE_RUN',
+              message: `Unknown salvage run: ${parsed.runId}`,
+              recoverable: true
+            })
+          }
+          const run = normalizeSalvageRun(runs[idx])
+          if (!run || !sameText(run.townId, canonicalTown, 80)) {
+            throw new AppError({
+              code: 'UNKNOWN_SALVAGE_RUN',
+              message: `Unknown salvage run for town ${canonicalTown}: ${parsed.runId}`,
+              recoverable: true
+            })
+          }
+          if (run.status !== 'planned') {
+            throw new AppError({
+              code: 'SALVAGE_STATE_INVALID',
+              message: `Run not in planned state: ${run.id}`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          run.status = 'resolved'
+          run.outcomeKey = outcomeKey
+          run.resolvedAtDay = Number(clock.day || run.plannedAtDay)
+          run.result = normalizeMajorMissionPayload(
+            buildSalvageOutcome(memory.world, {
+              townName: canonicalTown,
+              targetKey: run.targetKey,
+              outcomeKey,
+              day: run.resolvedAtDay
+            }),
+            MAX_SALVAGE_RESULT_KEYS
+          )
+          runs[idx] = run
+          applySalvageResolutionEffects(memory, run, {
+            idPrefix: `${operationId}:salvage_resolve:${run.id.toLowerCase()}`
+          })
+          const at = now()
+          appendSalvageAnnouncements(memory, {
+            townName: canonicalTown,
+            run,
+            at,
+            idPrefix: `${operationId}:salvage_resolve:${run.id.toLowerCase()}`,
+            crierType: 'salvage_resolve',
+            message: buildSalvageStatusMessage(canonicalTown, run)
+          })
+          return run
+        }, { eventId: `${operationId}:salvage_resolve:${townName.toLowerCase()}:${existing.id.toLowerCase()}:${outcomeKey}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_SALVAGE_RUN') return { applied: false, command, reason: 'Unknown salvage run.' }
+        if (err instanceof AppError && err.code === 'SALVAGE_STATE_INVALID') return { applied: false, command, reason: 'Salvage run is not in planned state.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD SALVAGE RESOLVE: town=${townName} run_id=${tx.result.id} target=${tx.result.targetKey} outcome=${asText(tx.result.outcomeKey, '-', 80)} supplies=${Number(tx.result.result?.supplies || 0)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'salvage_fail') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      const failReason = asText(parsed.reason, '', 160) || null
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const existing = findSalvageRunById(snapshot.world?.salvageRuns || [], parsed.runId)
+      if (!existing || !sameText(existing.townId, townName, 80)) return { applied: false, command, reason: 'Unknown salvage run.' }
+      if (existing.status !== 'planned') return { applied: false, command, reason: 'Salvage run is not in planned state.' }
+      let tx
+      try {
+        tx = await memoryStore.transact((memory) => {
+          const canonicalTown = resolveTownName(memory.world, parsed.townName)
+          if (!canonicalTown) {
+            throw new AppError({
+              code: 'UNKNOWN_TOWN',
+              message: `Unknown town for salvage fail: ${parsed.townName}`,
+              recoverable: true
+            })
+          }
+          const runs = ensureWorldSalvageRuns(memory.world)
+          const idx = runs.findIndex(run => sameText(run?.id, parsed.runId, 200))
+          if (idx < 0) {
+            throw new AppError({
+              code: 'UNKNOWN_SALVAGE_RUN',
+              message: `Unknown salvage run: ${parsed.runId}`,
+              recoverable: true
+            })
+          }
+          const run = normalizeSalvageRun(runs[idx])
+          if (!run || !sameText(run.townId, canonicalTown, 80)) {
+            throw new AppError({
+              code: 'UNKNOWN_SALVAGE_RUN',
+              message: `Unknown salvage run for town ${canonicalTown}: ${parsed.runId}`,
+              recoverable: true
+            })
+          }
+          if (run.status !== 'planned') {
+            throw new AppError({
+              code: 'SALVAGE_STATE_INVALID',
+              message: `Run not in planned state: ${run.id}`,
+              recoverable: true
+            })
+          }
+          const clock = ensureWorldClock(memory.world)
+          run.status = 'failed'
+          run.outcomeKey = 'botched'
+          run.resolvedAtDay = Number(clock.day || run.plannedAtDay)
+          run.result = normalizeMajorMissionPayload({
+            supplies: 0,
+            hopeDelta: PRESSURE_BY_SALVAGE_FAIL.hope,
+            dreadDelta: PRESSURE_BY_SALVAGE_FAIL.dread,
+            reason: failReason || 'failed'
+          }, MAX_SALVAGE_RESULT_KEYS)
+          runs[idx] = run
+          applyTownPressureDelta(memory, {
+            townName: canonicalTown,
+            delta: PRESSURE_BY_SALVAGE_FAIL,
+            idPrefix: `${operationId}:salvage_fail:${run.id.toLowerCase()}`,
+            type: 'salvage_fail',
+            summary: `salvage_${run.targetKey}_failed`,
+            missionId: asText(run.supportsMajorMissionId, '', 200) || undefined,
+            projectId: asText(run.supportsProjectId, '', 200) || undefined,
+            salvageRunId: run.id
+          })
+          const at = now()
+          appendSalvageAnnouncements(memory, {
+            townName: canonicalTown,
+            run,
+            at,
+            idPrefix: `${operationId}:salvage_fail:${run.id.toLowerCase()}`,
+            crierType: 'salvage_fail',
+            message: asText(
+              `${buildSalvageStatusMessage(canonicalTown, run)}${failReason ? ` reason=${failReason}` : ''}`,
+              buildSalvageStatusMessage(canonicalTown, run),
+              240
+            )
+          })
+          return run
+        }, { eventId: `${operationId}:salvage_fail:${townName.toLowerCase()}:${existing.id.toLowerCase()}` })
+      } catch (err) {
+        if (err instanceof AppError && err.code === 'UNKNOWN_TOWN') return { applied: false, command, reason: 'Unknown town.' }
+        if (err instanceof AppError && err.code === 'UNKNOWN_SALVAGE_RUN') return { applied: false, command, reason: 'Unknown salvage run.' }
+        if (err instanceof AppError && err.code === 'SALVAGE_STATE_INVALID') return { applied: false, command, reason: 'Salvage run is not in planned state.' }
+        throw err
+      }
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD SALVAGE FAIL: town=${townName} run_id=${tx.result.id} target=${tx.result.targetKey} reason=${failReason || '-'}`
         ]
       }
     }
@@ -8577,6 +10356,16 @@ function createGodCommandService(deps) {
             idPrefix: `${operationId}:quest_cancel:${quest.id.toLowerCase()}`,
             reason: 'quest_cancel'
           })
+          if (asText(quest.origin, '', 40).toLowerCase() === 'townsfolk' && town) {
+            applyTownPressureDelta(memory, {
+              townName: town,
+              delta: PRESSURE_BY_OUTCOME.townsfolk_fail,
+              idPrefix: `${operationId}:quest_cancel:${quest.id.toLowerCase()}`,
+              type: 'townsfolk_fail',
+              summary: 'townsfolk_quest_failed',
+              questId: quest.id
+            })
+          }
           return quest
         }, { eventId: `${operationId}:quest_cancel:${existing.id.toLowerCase()}` })
       } catch (err) {

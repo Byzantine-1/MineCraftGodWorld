@@ -190,15 +190,52 @@ const {
  *       stakes: Record<string, string | number | boolean | null>,
  *       progress: Record<string, string | number | boolean | null>
  *     }>,
+ *     projects: Array<{
+ *       id: string,
+ *       townId: string,
+ *       type: 'trench_reinforcement' | 'watchtower_line' | 'ration_depot' | 'field_chapel' | 'lantern_line',
+ *       status: 'planned' | 'active' | 'completed' | 'failed',
+ *       stage: number,
+ *       requirements: Record<string, string | number | boolean | null>,
+ *       effects: Record<string, string | number | boolean | null>,
+ *       startedAtDay: number,
+ *       updatedAtDay: number,
+ *       supportsMajorMissionId?: string
+ *     }>,
+ *     salvageRuns: Array<{
+ *       id: string,
+ *       townId: string,
+ *       targetKey: 'no_mans_land_scrap' | 'ruined_hamlet_supplies' | 'abandoned_shrine_relics' | 'collapsed_tunnel_tools',
+ *       status: 'planned' | 'resolved' | 'failed',
+ *       plannedAtDay: number,
+ *       resolvedAtDay: number,
+ *       result: Record<string, string | number | boolean | null>,
+ *       outcomeKey?: string,
+ *       supportsMajorMissionId?: string,
+ *       supportsProjectId?: string
+ *     }>,
  *     towns: Record<string, {
  *       activeMajorMissionId: string | null,
  *       majorMissionCooldownUntilDay: number,
+ *       hope: number,
+ *       dread: number,
  *       crierQueue: Array<{
  *         id: string,
  *         day: number,
  *         type: string,
  *         message: string,
  *         missionId?: string
+ *       }>,
+ *       recentImpacts: Array<{
+ *         id: string,
+ *         day: number,
+ *         type: string,
+ *         summary: string,
+ *         missionId?: string,
+ *         questId?: string,
+ *         netherEventId?: string,
+ *         projectId?: string,
+ *         salvageRunId?: string
  *       }>
  *     }>,
  *     nether: {
@@ -266,10 +303,48 @@ const MAX_AGENT_TITLE_COUNT = 20
 const MAJOR_MISSION_STATUSES = new Set(['teased', 'briefed', 'active', 'completed', 'failed'])
 const MAX_MAJOR_MISSION_STAKES_KEYS = 12
 const MAX_MAJOR_MISSION_PROGRESS_KEYS = 12
+const PROJECT_TYPES = new Set([
+  'trench_reinforcement',
+  'watchtower_line',
+  'ration_depot',
+  'field_chapel',
+  'lantern_line'
+])
+const PROJECT_STATUSES = new Set(['planned', 'active', 'completed', 'failed'])
+const SALVAGE_TARGET_KEYS = new Set([
+  'no_mans_land_scrap',
+  'ruined_hamlet_supplies',
+  'abandoned_shrine_relics',
+  'collapsed_tunnel_tools'
+])
+const SALVAGE_STATUSES = new Set(['planned', 'resolved', 'failed'])
+const MAX_PROJECT_REQUIREMENTS_KEYS = 12
+const MAX_PROJECT_EFFECTS_KEYS = 12
+const MAX_PROJECT_ENTRIES = 120
+const MAX_SALVAGE_RESULT_KEYS = 12
+const MAX_SALVAGE_RUN_ENTRIES = 120
 const MAX_TOWN_CRIER_QUEUE_ENTRIES = 40
 const MAX_TOWNSFOLK_QUESTS_PER_TOWN = 24
 const MAX_NETHER_EVENT_LEDGER_ENTRIES = 120
 const MAX_NETHER_EVENT_PAYLOAD_KEYS = 10
+const MAX_TOWN_RECENT_IMPACTS = 30
+const TOWN_PRESSURE_MIN = 0
+const TOWN_PRESSURE_MAX = 100
+const DEFAULT_TOWN_HOPE = 50
+const DEFAULT_TOWN_DREAD = 50
+const TOWN_IMPACT_TYPE_KEYS = new Set([
+  'nether_event',
+  'mission_complete',
+  'mission_fail',
+  'townsfolk_complete',
+  'townsfolk_fail',
+  'project_start',
+  'project_complete',
+  'project_fail',
+  'salvage_plan',
+  'salvage_resolve',
+  'salvage_fail'
+])
 const NETHER_EVENT_TYPE_KEYS = new Set([
   'LONG_NIGHT',
   'OMEN',
@@ -1383,6 +1458,103 @@ function normalizeMajorMissionsShape(majorMissionsInput) {
 }
 
 /**
+ * @param {unknown} projectInput
+ */
+function normalizeProjectShape(projectInput) {
+  if (!projectInput || typeof projectInput !== 'object' || Array.isArray(projectInput)) return null
+  const id = asText(projectInput.id, '', 200)
+  const townId = asText(projectInput.townId, '', 80)
+  const type = asText(projectInput.type, '', 40).toLowerCase()
+  const status = asText(projectInput.status, '', 20).toLowerCase()
+  const stage = Number(projectInput.stage)
+  const startedAtDay = Number(projectInput.startedAtDay)
+  const updatedAtDay = Number(projectInput.updatedAtDay)
+  const supportsMajorMissionId = asText(projectInput.supportsMajorMissionId, '', 200)
+
+  if (!id || !townId || !PROJECT_TYPES.has(type) || !PROJECT_STATUSES.has(status)) return null
+  if (!Number.isInteger(stage) || stage < 0) return null
+  if (!Number.isInteger(startedAtDay) || startedAtDay < 1) return null
+  if (!Number.isInteger(updatedAtDay) || updatedAtDay < startedAtDay) return null
+
+  const project = {
+    id,
+    townId,
+    type,
+    status,
+    stage,
+    requirements: normalizeMajorMissionPayload(projectInput.requirements, MAX_PROJECT_REQUIREMENTS_KEYS),
+    effects: normalizeMajorMissionPayload(projectInput.effects, MAX_PROJECT_EFFECTS_KEYS),
+    startedAtDay,
+    updatedAtDay
+  }
+  if (supportsMajorMissionId) project.supportsMajorMissionId = supportsMajorMissionId
+  return project
+}
+
+/**
+ * @param {unknown} projectsInput
+ */
+function normalizeProjectsShape(projectsInput) {
+  const projects = (Array.isArray(projectsInput) ? projectsInput : [])
+    .map(normalizeProjectShape)
+    .filter(Boolean)
+  if (projects.length > MAX_PROJECT_ENTRIES) {
+    return projects.slice(-MAX_PROJECT_ENTRIES)
+  }
+  return projects
+}
+
+/**
+ * @param {unknown} salvageInput
+ */
+function normalizeSalvageRunShape(salvageInput) {
+  if (!salvageInput || typeof salvageInput !== 'object' || Array.isArray(salvageInput)) return null
+  const id = asText(salvageInput.id, '', 200)
+  const townId = asText(salvageInput.townId, '', 80)
+  const targetKey = asText(salvageInput.targetKey, '', 80).toLowerCase()
+  const status = asText(salvageInput.status, '', 20).toLowerCase()
+  const plannedAtDay = Number(salvageInput.plannedAtDay)
+  const resolvedAtDayRaw = Number(salvageInput.resolvedAtDay)
+  const outcomeKey = asText(salvageInput.outcomeKey, '', 80).toLowerCase()
+  const supportsMajorMissionId = asText(salvageInput.supportsMajorMissionId, '', 200)
+  const supportsProjectId = asText(salvageInput.supportsProjectId, '', 200)
+
+  if (!id || !townId || !SALVAGE_TARGET_KEYS.has(targetKey) || !SALVAGE_STATUSES.has(status)) return null
+  if (!Number.isInteger(plannedAtDay) || plannedAtDay < 1) return null
+  if (!Number.isInteger(resolvedAtDayRaw) || resolvedAtDayRaw < 0) return null
+
+  const resolvedAtDay = status === 'planned'
+    ? 0
+    : Math.max(plannedAtDay, resolvedAtDayRaw)
+  const salvageRun = {
+    id,
+    townId,
+    targetKey,
+    status,
+    plannedAtDay,
+    resolvedAtDay,
+    result: normalizeMajorMissionPayload(salvageInput.result, MAX_SALVAGE_RESULT_KEYS)
+  }
+  if (outcomeKey) salvageRun.outcomeKey = outcomeKey
+  if (supportsMajorMissionId) salvageRun.supportsMajorMissionId = supportsMajorMissionId
+  if (supportsProjectId) salvageRun.supportsProjectId = supportsProjectId
+  return salvageRun
+}
+
+/**
+ * @param {unknown} salvageRunsInput
+ */
+function normalizeSalvageRunsShape(salvageRunsInput) {
+  const runs = (Array.isArray(salvageRunsInput) ? salvageRunsInput : [])
+    .map(normalizeSalvageRunShape)
+    .filter(Boolean)
+  if (runs.length > MAX_SALVAGE_RUN_ENTRIES) {
+    return runs.slice(-MAX_SALVAGE_RUN_ENTRIES)
+  }
+  return runs
+}
+
+/**
  * @param {unknown} crierEntryInput
  */
 function normalizeTownCrierEntryShape(crierEntryInput) {
@@ -1412,6 +1584,54 @@ function normalizeTownCrierQueueShape(crierQueueInput) {
 }
 
 /**
+ * @param {unknown} impactInput
+ */
+function normalizeTownImpactEntryShape(impactInput) {
+  if (!impactInput || typeof impactInput !== 'object' || Array.isArray(impactInput)) return null
+  const id = asText(impactInput.id, '', 200)
+  const day = Number(impactInput.day)
+  const typeRaw = asText(impactInput.type, '', 40).toLowerCase()
+  const type = TOWN_IMPACT_TYPE_KEYS.has(typeRaw) ? typeRaw : ''
+  const summary = asText(impactInput.summary, '', 160)
+  const missionId = asText(impactInput.missionId, '', 200)
+  const questId = asText(impactInput.questId, '', 200)
+  const netherEventId = asText(impactInput.netherEventId, '', 200)
+  const projectId = asText(impactInput.projectId, '', 200)
+  const salvageRunId = asText(impactInput.salvageRunId, '', 200)
+  if (!id || !Number.isInteger(day) || day < 0 || !type || !summary) return null
+  const entry = { id, day, type, summary }
+  if (missionId) entry.missionId = missionId
+  if (questId) entry.questId = questId
+  if (netherEventId) entry.netherEventId = netherEventId
+  if (projectId) entry.projectId = projectId
+  if (salvageRunId) entry.salvageRunId = salvageRunId
+  return entry
+}
+
+/**
+ * @param {unknown} impactsInput
+ */
+function normalizeTownRecentImpactsShape(impactsInput) {
+  const impacts = (Array.isArray(impactsInput) ? impactsInput : [])
+    .map(normalizeTownImpactEntryShape)
+    .filter(Boolean)
+  if (impacts.length > MAX_TOWN_RECENT_IMPACTS) {
+    return impacts.slice(-MAX_TOWN_RECENT_IMPACTS)
+  }
+  return impacts
+}
+
+/**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownPressureValueShape(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+}
+
+/**
  * @param {unknown} townInput
  */
 function normalizeTownMissionStateShape(townInput) {
@@ -1423,7 +1643,10 @@ function normalizeTownMissionStateShape(townInput) {
   return {
     activeMajorMissionId,
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
-    crierQueue: normalizeTownCrierQueueShape(source.crierQueue)
+    hope: normalizeTownPressureValueShape(source.hope, DEFAULT_TOWN_HOPE),
+    dread: normalizeTownPressureValueShape(source.dread, DEFAULT_TOWN_DREAD),
+    crierQueue: normalizeTownCrierQueueShape(source.crierQueue),
+    recentImpacts: normalizeTownRecentImpactsShape(source.recentImpacts)
   }
 }
 
@@ -1468,6 +1691,8 @@ function collectTownNamesForMissionState(world) {
 
   for (const townName of Object.keys(world?.towns || {})) addTown(townName)
   for (const mission of world?.majorMissions || []) addTown(mission?.townId)
+  for (const project of world?.projects || []) addTown(project?.townId)
+  for (const salvageRun of world?.salvageRuns || []) addTown(salvageRun?.townId)
   for (const marker of world?.markers || []) addTown(parseTownNameFromTag(marker?.tag))
   for (const townName of Object.keys(world?.threat?.byTown || {})) addTown(townName)
   for (const townName of Object.keys(world?.moods?.byTown || {})) addTown(townName)
@@ -1484,6 +1709,8 @@ function reconcileMajorMissionState(world) {
   world.quests = boundTownsfolkQuestHistoryShape(world.quests)
   world.nether = normalizeNetherShape(world.nether, Number(world?.events?.seed))
   world.majorMissions = normalizeMajorMissionsShape(world.majorMissions)
+  world.projects = normalizeProjectsShape(world.projects)
+  world.salvageRuns = normalizeSalvageRunsShape(world.salvageRuns)
   world.towns = normalizeTownsShape(world.towns)
 
   const activeByTown = new Map()
@@ -1508,7 +1735,10 @@ function reconcileMajorMissionState(world) {
     const key = townName.toLowerCase()
     const expectedActiveId = activeByTown.get(key) || null
     world.towns[townName].activeMajorMissionId = expectedActiveId
+    world.towns[townName].hope = normalizeTownPressureValueShape(world.towns[townName].hope, DEFAULT_TOWN_HOPE)
+    world.towns[townName].dread = normalizeTownPressureValueShape(world.towns[townName].dread, DEFAULT_TOWN_DREAD)
     world.towns[townName].crierQueue = normalizeTownCrierQueueShape(world.towns[townName].crierQueue)
+    world.towns[townName].recentImpacts = normalizeTownRecentImpactsShape(world.towns[townName].recentImpacts)
     const cooldown = Number(world.towns[townName].majorMissionCooldownUntilDay)
     world.towns[townName].majorMissionCooldownUntilDay = Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0
   }
@@ -1556,6 +1786,8 @@ function freshMemoryShape(input) {
     news: normalizeNewsShape(source.world?.news),
     quests: boundTownsfolkQuestHistoryShape(normalizeQuestsShape(source.world?.quests)),
     majorMissions: normalizeMajorMissionsShape(source.world?.majorMissions),
+    projects: normalizeProjectsShape(source.world?.projects),
+    salvageRuns: normalizeSalvageRunsShape(source.world?.salvageRuns),
     towns: normalizeTownsShape(source.world?.towns),
     nether: normalizeNetherShape(source.world?.nether, Number(source.world?.events?.seed)),
     archive: Array.isArray(source.world?.archive) ? source.world.archive : [],
@@ -2083,6 +2315,42 @@ function validateMemoryIntegritySnapshot(memory) {
       }
     }
   }
+  if (!Array.isArray(world.projects)) {
+    issues.push('world.projects must be an array.')
+  } else {
+    if (world.projects.length > MAX_PROJECT_ENTRIES) {
+      issues.push(`world.projects exceeds max entries ${MAX_PROJECT_ENTRIES}.`)
+    }
+    const seenProjectIds = new Set()
+    for (const project of world.projects) {
+      const normalizedProject = normalizeProjectShape(project)
+      if (!normalizedProject) {
+        issues.push('world.projects contains invalid project entry.')
+        continue
+      }
+      const key = normalizedProject.id.toLowerCase()
+      if (seenProjectIds.has(key)) issues.push(`world.projects has duplicate id ${normalizedProject.id}.`)
+      seenProjectIds.add(key)
+    }
+  }
+  if (!Array.isArray(world.salvageRuns)) {
+    issues.push('world.salvageRuns must be an array.')
+  } else {
+    if (world.salvageRuns.length > MAX_SALVAGE_RUN_ENTRIES) {
+      issues.push(`world.salvageRuns exceeds max entries ${MAX_SALVAGE_RUN_ENTRIES}.`)
+    }
+    const seenSalvageIds = new Set()
+    for (const run of world.salvageRuns) {
+      const normalizedRun = normalizeSalvageRunShape(run)
+      if (!normalizedRun) {
+        issues.push('world.salvageRuns contains invalid salvage entry.')
+        continue
+      }
+      const key = normalizedRun.id.toLowerCase()
+      if (seenSalvageIds.has(key)) issues.push(`world.salvageRuns has duplicate id ${normalizedRun.id}.`)
+      seenSalvageIds.add(key)
+    }
+  }
   if (!world.towns || typeof world.towns !== 'object' || Array.isArray(world.towns)) {
     issues.push('world.towns must be an object.')
   } else {
@@ -2113,6 +2381,26 @@ function validateMemoryIntegritySnapshot(memory) {
         for (const entry of townState.crierQueue) {
           if (!normalizeTownCrierEntryShape(entry)) {
             issues.push(`world.towns.${safeTownName}.crierQueue contains invalid entry.`)
+          }
+        }
+      }
+      const hope = Number(townState.hope)
+      const dread = Number(townState.dread)
+      if (!Number.isInteger(hope) || hope < TOWN_PRESSURE_MIN || hope > TOWN_PRESSURE_MAX) {
+        issues.push(`world.towns.${safeTownName}.hope must be integer in [${TOWN_PRESSURE_MIN}..${TOWN_PRESSURE_MAX}].`)
+      }
+      if (!Number.isInteger(dread) || dread < TOWN_PRESSURE_MIN || dread > TOWN_PRESSURE_MAX) {
+        issues.push(`world.towns.${safeTownName}.dread must be integer in [${TOWN_PRESSURE_MIN}..${TOWN_PRESSURE_MAX}].`)
+      }
+      if (!Array.isArray(townState.recentImpacts)) {
+        issues.push(`world.towns.${safeTownName}.recentImpacts must be an array.`)
+      } else {
+        if (townState.recentImpacts.length > MAX_TOWN_RECENT_IMPACTS) {
+          issues.push(`world.towns.${safeTownName}.recentImpacts exceeds max entries ${MAX_TOWN_RECENT_IMPACTS}.`)
+        }
+        for (const impact of townState.recentImpacts) {
+          if (!normalizeTownImpactEntryShape(impact)) {
+            issues.push(`world.towns.${safeTownName}.recentImpacts contains invalid entry.`)
           }
         }
       }

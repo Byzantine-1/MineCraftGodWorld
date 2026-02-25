@@ -17,6 +17,9 @@ This repository is the engine layer only. It focuses on deterministic behavior, 
   - mayor-gated major missions with per-town crier queue
   - deterministic nether global shocks with bounded ledger/modifiers
   - townsfolk-driven side quests with deterministic dedupe/linkage
+  - deterministic town pressure meters (`hope`/`dread`) updated on committed outcomes
+  - war-bulletin town board pulse card (frontline, pressure, rations/strain, impacts, orders)
+  - deterministic project + salvage systems (`god project ...`, `god salvage ...`) for build/explore loops
   - rumors, mayor decisions, side quests
   - traits and titles
 - Runtime Town Crier (optional, default off) that reads durable news and broadcasts runtime-only.
@@ -68,6 +71,13 @@ god mission complete alpha
 god nether status
 god nether tick 3
 god townsfolk talk alpha gate_warden
+god project start alpha trench_reinforcement
+god project list alpha
+god project advance alpha <project_id>
+god project complete alpha <project_id>
+god salvage plan alpha no_mans_land_scrap
+god salvage list alpha
+god salvage resolve alpha <run_id> secure
 
 god town board alpha 10
 god news tail 10
@@ -97,6 +107,84 @@ god mission fail alpha route collapsed
   - `world.quests[].townId`
   - `world.quests[].npcKey`
   - `world.quests[].supportsMajorMissionId`
+- Pressure + impact additive keys:
+  - `world.towns.<town>.hope`
+  - `world.towns.<town>.dread`
+  - `world.towns.<town>.recentImpacts[]` (bounded)
+- Project + salvage additive keys:
+  - `world.projects[]` (bounded)
+  - `world.salvageRuns[]` (bounded)
+  - `world.projects[].supportsMajorMissionId` (optional link seam)
+  - `world.salvageRuns[].supportsMajorMissionId` (optional link seam)
+  - `world.salvageRuns[].supportsProjectId` (optional link seam)
+  - `world.towns.<town>.recentImpacts[].projectId` / `.salvageRunId` (optional refs)
+
+## War Bulletin Pulse Card
+
+`god town board <town> [limit]` now opens with a grimdark pulse card while keeping existing board sections.
+
+Example header lines:
+
+```text
+GOD TOWN BOARD WAR FRONTLINE STATUS: label=SIEGE PRESSURE score=92 threat=65 mission=active nether=SCARCITY
+GOD TOWN BOARD WAR HOPE DREAD: hope=57(rising) dread=61(high)
+GOD TOWN BOARD WAR RATIONS STRAIN: rations=41 strain=69 outlook=strained
+GOD TOWN BOARD WAR WHAT CHANGED TODAY: count=3
+GOD TOWN BOARD WAR ORDERS OF THE DAY: mission=Hold mm_alpha_1 phase 2. Reinforce supply routes.
+GOD TOWN BOARD PROJECTS: count=1
+GOD TOWN BOARD PROJECT: id=pr_alpha_trench_reinforcement_12 type=trench_reinforcement status=active stage=2 updated_day=12 supports_major_mission_id=mm_alpha_1
+GOD TOWN BOARD SALVAGE: id=sr_alpha_no_mans_land_scrap_12 target=no_mans_land_scrap status=resolved planned_day=12 resolved_day=12 outcome=secure supplies=5 supports_major_mission_id=mm_alpha_1 supports_project_id=pr_alpha_trench_reinforcement_12
+```
+
+## Hope / Dread Mapping
+
+Pressure meters are deterministic and only move inside committed mutations:
+
+- nether event application: mapping by event type (for example `LONG_NIGHT`, `SCARCITY`, `THREAT_SURGE`)
+- major mission completion/failure
+- townsfolk quest completion/failure
+
+Replay of the same operation/event id remains a durable no-op, so meter deltas do not double-apply.
+
+## Projects + Salvage (Phase 3B)
+
+These commands are deterministic engine abstractions for build/explore loops. They do not require live block counting or embodiment integration.
+
+Built-in project types:
+
+- `trench_reinforcement`
+- `watchtower_line`
+- `ration_depot`
+- `field_chapel`
+- `lantern_line`
+
+Built-in salvage target keys:
+
+- `no_mans_land_scrap`
+- `ruined_hamlet_supplies`
+- `abandoned_shrine_relics`
+- `collapsed_tunnel_tools`
+
+Built-in salvage resolve outcomes:
+
+- `secure`
+- `contested`
+- `botched`
+
+Example command outputs:
+
+```text
+GOD PROJECT START: town=alpha type=trench_reinforcement status=created project_id=<id> stage=1
+GOD PROJECT ADVANCE: town=alpha project_id=<id> status=active stage=2
+GOD PROJECT COMPLETE: town=alpha project_id=<id> status=completed stage=3
+GOD SALVAGE PLAN: town=alpha target=no_mans_land_scrap status=created run_id=<id>
+GOD SALVAGE RESOLVE: town=alpha run_id=<id> target=no_mans_land_scrap outcome=secure supplies=5
+```
+
+Replay safety:
+
+- repeated command retries under the same operation/event identity are durable no-ops
+- bounded history is enforced in sanitize and on enqueue for `world.projects[]` and `world.salvageRuns[]`
 
 ## Test And Validation
 

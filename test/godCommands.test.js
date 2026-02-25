@@ -2725,6 +2725,9 @@ test('major mission accept/advance/complete are transactional and idempotent on 
   assert.ok(completed)
   assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
   assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 3)
+  assert.equal(snapshot.world.towns.alpha.hope, 57)
+  assert.equal(snapshot.world.towns.alpha.dread, 46)
+  assert.equal(snapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'mission_complete').length, 1)
 
   const crierTypes = snapshot.world.towns.alpha.crierQueue.map(item => item.type)
   assert.equal(crierTypes.filter(type => type === 'mission_available').length, 1)
@@ -2774,7 +2777,10 @@ test('major mission fail is transactional and idempotent on replay', async () =>
   assert.ok(failed)
   assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
   assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 3)
+  assert.equal(snapshot.world.towns.alpha.hope, 46)
+  assert.equal(snapshot.world.towns.alpha.dread, 57)
   assert.equal(snapshot.world.towns.alpha.crierQueue.filter(item => item.type === 'mission_fail').length, 1)
+  assert.equal(snapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'mission_fail').length, 1)
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
@@ -2867,9 +2873,15 @@ test('nether tick is deterministic for same seed/state and propagates crier entr
   const leftSnapshot = left.memoryStore.getSnapshot()
   const rightSnapshot = right.memoryStore.getSnapshot()
   assert.deepEqual(leftSnapshot.world.nether, rightSnapshot.world.nether)
+  assert.equal(leftSnapshot.world.towns.alpha.hope, rightSnapshot.world.towns.alpha.hope)
+  assert.equal(leftSnapshot.world.towns.alpha.dread, rightSnapshot.world.towns.alpha.dread)
+  assert.equal(leftSnapshot.world.towns.beta.hope, rightSnapshot.world.towns.beta.hope)
+  assert.equal(leftSnapshot.world.towns.beta.dread, rightSnapshot.world.towns.beta.dread)
   assert.ok(leftSnapshot.world.nether.eventLedger.length > 0)
   assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(entry => entry.type === 'nether_event'))
   assert.ok(leftSnapshot.world.towns.beta.crierQueue.some(entry => entry.type === 'nether_event'))
+  assert.ok(leftSnapshot.world.towns.alpha.recentImpacts.some(entry => entry.type === 'nether_event'))
+  assert.ok(leftSnapshot.world.towns.beta.recentImpacts.some(entry => entry.type === 'nether_event'))
   assert.equal(left.memoryStore.validateMemoryIntegrity().ok, true)
   assert.equal(right.memoryStore.validateMemoryIntegrity().ok, true)
 })
@@ -2924,6 +2936,8 @@ test('nether tick is transactional/idempotent on replay and bounded under burst 
   assert.ok(snapshot.world.chronicle.length <= 200)
   assert.ok(snapshot.world.towns.alpha.crierQueue.length <= 40)
   assert.ok(snapshot.world.towns.beta.crierQueue.length <= 40)
+  assert.ok(snapshot.world.towns.alpha.recentImpacts.length <= 30)
+  assert.ok(snapshot.world.towns.beta.recentImpacts.length <= 30)
   assert.ok(snapshot.world.towns.alpha.crierQueue.some(entry => entry.type === 'nether_event'))
   assert.ok(snapshot.world.towns.beta.crierQueue.some(entry => entry.type === 'nether_event'))
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
@@ -2990,6 +3004,11 @@ test('townsfolk talk creates deterministic side quests with dedupe and major mis
     operationId: 'townsfolk-board'
   })
   assert.equal(board.applied, true)
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR FRONTLINE STATUS:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR HOPE DREAD:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR RATIONS STRAIN:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR WHAT CHANGED TODAY:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR ORDERS OF THE DAY:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD MAJOR MISSION')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SIDE QUESTS TOP:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD NETHER PULSE:')))
@@ -3001,6 +3020,414 @@ test('townsfolk talk creates deterministic side quests with dedupe and major mis
   })
   assert.equal(list.applied, true)
   assert.ok(list.outputLines.some(line => line.includes('origin=townsfolk')))
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('townsfolk quest completion/failure updates hope-dread once and is replay-safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'townsfolk-meter-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_gate 100 64 0 town:beta',
+    operationId: 'townsfolk-meter-seed-beta'
+  })
+
+  await service.applyGodCommand({
+    agents,
+    command: 'townsfolk talk alpha miller',
+    operationId: 'townsfolk-meter-talk-a'
+  })
+  const firstQuest = memoryStore.getSnapshot().world.quests.find(quest => quest.origin === 'townsfolk' && quest.npcKey === 'miller')
+  assert.ok(firstQuest)
+
+  const cancelA = await service.applyGodCommand({
+    agents,
+    command: `quest cancel ${firstQuest.id}`,
+    operationId: 'townsfolk-meter-cancel-a'
+  })
+  const cancelReplay = await service.applyGodCommand({
+    agents,
+    command: `quest cancel ${firstQuest.id}`,
+    operationId: 'townsfolk-meter-cancel-a'
+  })
+  assert.equal(cancelA.applied, true)
+  assert.equal(cancelReplay.applied, false)
+
+  await service.applyGodCommand({
+    agents,
+    command: 'townsfolk talk alpha scout',
+    operationId: 'townsfolk-meter-talk-b'
+  })
+  const secondQuest = memoryStore.getSnapshot().world.quests.find(quest => quest.origin === 'townsfolk' && quest.npcKey === 'scout')
+  assert.ok(secondQuest)
+
+  const accept = await service.applyGodCommand({
+    agents,
+    command: `quest accept Mara ${secondQuest.id}`,
+    operationId: 'townsfolk-meter-accept'
+  })
+  assert.equal(accept.applied, true)
+
+  await memoryStore.transact((memory) => {
+    const target = memory.world.quests.find(entry => entry.id === secondQuest.id)
+    if (!target) return
+    if (target.type === 'trade_n') {
+      target.progress = { done: Number(target.objective?.n || 1) }
+    } else {
+      target.progress = { visited: true }
+    }
+  }, { eventId: 'townsfolk-meter-satisfy-progress' })
+
+  const completeA = await service.applyGodCommand({
+    agents,
+    command: `quest complete ${secondQuest.id}`,
+    operationId: 'townsfolk-meter-complete-a'
+  })
+  const completeReplay = await service.applyGodCommand({
+    agents,
+    command: `quest complete ${secondQuest.id}`,
+    operationId: 'townsfolk-meter-complete-a'
+  })
+  assert.equal(completeA.applied, true)
+  assert.equal(completeReplay.applied, false)
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.equal(snapshot.world.towns.alpha.hope, 51)
+  assert.equal(snapshot.world.towns.alpha.dread, 52)
+  assert.equal(snapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'townsfolk_fail').length, 1)
+  assert.equal(snapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'townsfolk_complete').length, 1)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('project lifecycle is deterministic and replay-safe', async () => {
+  function createScenario() {
+    const memoryStore = createStore()
+    const service = createGodCommandService({ memoryStore })
+    const agents = createAgents()
+    return { memoryStore, service, agents }
+  }
+  async function runScenario(state) {
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mark add alpha_hall 0 64 0 town:alpha',
+      operationId: 'project-seed-alpha'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mark add beta_gate 100 64 0 town:beta',
+      operationId: 'project-seed-beta'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'threat set alpha 20',
+      operationId: 'project-seed-threat'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mayor talk alpha',
+      operationId: 'project-seed-mayor-talk'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mayor accept alpha',
+      operationId: 'project-seed-mayor-accept'
+    })
+
+    const startA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'project start alpha trench_reinforcement',
+      operationId: 'project-start-a'
+    })
+    const startReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'project start alpha trench_reinforcement',
+      operationId: 'project-start-a'
+    })
+    const startDedupe = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'project start alpha trench_reinforcement',
+      operationId: 'project-start-b'
+    })
+    assert.equal(startA.applied, true)
+    assert.equal(startReplay.applied, false)
+    assert.equal(startDedupe.applied, true)
+    assert.ok(startDedupe.outputLines.some(line => line.includes('status=existing')))
+
+    const firstProject = state.memoryStore.getSnapshot().world.projects.find(project => project.type === 'trench_reinforcement' && project.townId === 'alpha')
+    assert.ok(firstProject)
+
+    const advanceA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project advance alpha ${firstProject.id}`,
+      operationId: 'project-advance-a'
+    })
+    const advanceReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project advance alpha ${firstProject.id}`,
+      operationId: 'project-advance-a'
+    })
+    assert.equal(advanceA.applied, true)
+    assert.equal(advanceReplay.applied, false)
+
+    const completeA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project complete alpha ${firstProject.id}`,
+      operationId: 'project-complete-a'
+    })
+    const completeReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project complete alpha ${firstProject.id}`,
+      operationId: 'project-complete-a'
+    })
+    assert.equal(completeA.applied, true)
+    assert.equal(completeReplay.applied, false)
+
+    const startB = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'project start alpha watchtower_line',
+      operationId: 'project-start-c'
+    })
+    assert.equal(startB.applied, true)
+    const secondProject = state.memoryStore.getSnapshot().world.projects.find(project => project.type === 'watchtower_line' && project.townId === 'alpha')
+    assert.ok(secondProject)
+
+    const failA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project fail alpha ${secondProject.id} route collapsed`,
+      operationId: 'project-fail-a'
+    })
+    const failReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `project fail alpha ${secondProject.id} route collapsed`,
+      operationId: 'project-fail-a'
+    })
+    assert.equal(failA.applied, true)
+    assert.equal(failReplay.applied, false)
+  }
+
+  const left = createScenario()
+  const right = createScenario()
+  await runScenario(left)
+  await runScenario(right)
+
+  const leftSnapshot = left.memoryStore.getSnapshot()
+  const rightSnapshot = right.memoryStore.getSnapshot()
+  assert.deepEqual(leftSnapshot.world.projects, rightSnapshot.world.projects)
+  assert.equal(leftSnapshot.world.towns.alpha.hope, rightSnapshot.world.towns.alpha.hope)
+  assert.equal(leftSnapshot.world.towns.alpha.dread, rightSnapshot.world.towns.alpha.dread)
+  assert.equal(leftSnapshot.world.threat.byTown.alpha, 18)
+  assert.equal(leftSnapshot.world.towns.alpha.hope, 50)
+  assert.equal(leftSnapshot.world.towns.alpha.dread, 52)
+  assert.equal(leftSnapshot.world.projects.filter(project => project.status === 'completed').length, 1)
+  assert.equal(leftSnapshot.world.projects.filter(project => project.status === 'failed').length, 1)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'project_complete').length, 1)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'project_fail').length, 1)
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'project_start'))
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'project_phase'))
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'project_complete'))
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'project_fail'))
+  assert.equal(left.memoryStore.validateMemoryIntegrity().ok, true)
+  assert.equal(right.memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('salvage plan/resolve/fail are deterministic and replay-safe', async () => {
+  function createScenario() {
+    const memoryStore = createStore()
+    const service = createGodCommandService({ memoryStore })
+    const agents = createAgents()
+    return { memoryStore, service, agents }
+  }
+  async function runScenario(state) {
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mark add alpha_hall 0 64 0 town:alpha',
+      operationId: 'salvage-seed-alpha'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'mark add beta_gate 100 64 0 town:beta',
+      operationId: 'salvage-seed-beta'
+    })
+    await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'project start alpha lantern_line',
+      operationId: 'salvage-seed-project'
+    })
+
+    const planA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'salvage plan alpha no_mans_land_scrap',
+      operationId: 'salvage-plan-a'
+    })
+    const planReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'salvage plan alpha no_mans_land_scrap',
+      operationId: 'salvage-plan-a'
+    })
+    const planDedupe = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'salvage plan alpha no_mans_land_scrap',
+      operationId: 'salvage-plan-b'
+    })
+    assert.equal(planA.applied, true)
+    assert.equal(planReplay.applied, false)
+    assert.equal(planDedupe.applied, true)
+    assert.ok(planDedupe.outputLines.some(line => line.includes('status=existing')))
+
+    const firstRun = state.memoryStore.getSnapshot().world.salvageRuns.find(run => run.targetKey === 'no_mans_land_scrap' && run.townId === 'alpha')
+    assert.ok(firstRun)
+    assert.ok(firstRun.supportsProjectId)
+
+    const resolveA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `salvage resolve alpha ${firstRun.id} secure`,
+      operationId: 'salvage-resolve-a'
+    })
+    const resolveReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `salvage resolve alpha ${firstRun.id} secure`,
+      operationId: 'salvage-resolve-a'
+    })
+    assert.equal(resolveA.applied, true)
+    assert.equal(resolveReplay.applied, false)
+
+    const planB = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: 'salvage plan alpha collapsed_tunnel_tools',
+      operationId: 'salvage-plan-c'
+    })
+    assert.equal(planB.applied, true)
+    const secondRun = state.memoryStore.getSnapshot().world.salvageRuns.find(run => run.targetKey === 'collapsed_tunnel_tools' && run.townId === 'alpha')
+    assert.ok(secondRun)
+
+    const failA = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `salvage fail alpha ${secondRun.id} patrol broke formation`,
+      operationId: 'salvage-fail-a'
+    })
+    const failReplay = await state.service.applyGodCommand({
+      agents: state.agents,
+      command: `salvage fail alpha ${secondRun.id} patrol broke formation`,
+      operationId: 'salvage-fail-a'
+    })
+    assert.equal(failA.applied, true)
+    assert.equal(failReplay.applied, false)
+  }
+
+  const left = createScenario()
+  const right = createScenario()
+  await runScenario(left)
+  await runScenario(right)
+
+  const leftSnapshot = left.memoryStore.getSnapshot()
+  const rightSnapshot = right.memoryStore.getSnapshot()
+  assert.deepEqual(leftSnapshot.world.salvageRuns, rightSnapshot.world.salvageRuns)
+  assert.equal(leftSnapshot.world.towns.alpha.hope, rightSnapshot.world.towns.alpha.hope)
+  assert.equal(leftSnapshot.world.towns.alpha.dread, rightSnapshot.world.towns.alpha.dread)
+  assert.ok(leftSnapshot.world.salvageRuns.some(run => run.status === 'resolved'))
+  assert.ok(leftSnapshot.world.salvageRuns.some(run => run.status === 'failed'))
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'salvage_plan').length, 2)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'salvage_resolve').length, 1)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'salvage_fail').length, 1)
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'salvage_plan'))
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'salvage_resolve'))
+  assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'salvage_fail'))
+  assert.equal(left.memoryStore.validateMemoryIntegrity().ok, true)
+  assert.equal(right.memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('town board includes project and salvage sections', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'board-proj-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'project start alpha ration_depot',
+    operationId: 'board-proj-start'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'salvage plan alpha ruined_hamlet_supplies',
+    operationId: 'board-salvage-plan'
+  })
+
+  const board = await service.applyGodCommand({
+    agents,
+    command: 'town board alpha 10',
+    operationId: 'board-project-salvage'
+  })
+  assert.equal(board.applied, true)
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD PROJECTS:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD PROJECT:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SALVAGE:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR FRONTLINE STATUS:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SIDE QUESTS TOP:')))
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('project and salvage histories remain bounded during command mutations', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'bound-project-seed-alpha'
+  })
+
+  await memoryStore.transact((memory) => {
+    memory.world.projects = Array.from({ length: 140 }).map((_, idx) => ({
+      id: `pr_bound_${idx}`,
+      townId: 'alpha',
+      type: idx % 2 === 0 ? 'watchtower_line' : 'ration_depot',
+      status: idx % 3 === 0 ? 'active' : 'completed',
+      stage: 1,
+      requirements: { labor: 2 },
+      effects: { hopeDelta: 1 },
+      startedAtDay: 1,
+      updatedAtDay: 1 + idx
+    }))
+    memory.world.salvageRuns = Array.from({ length: 150 }).map((_, idx) => ({
+      id: `sr_bound_${idx}`,
+      townId: 'alpha',
+      targetKey: idx % 2 === 0 ? 'no_mans_land_scrap' : 'collapsed_tunnel_tools',
+      status: idx % 3 === 0 ? 'planned' : 'resolved',
+      plannedAtDay: 1,
+      resolvedAtDay: idx % 3 === 0 ? 0 : (1 + idx),
+      result: { supplies: 2, hopeDelta: 1, dreadDelta: -1 }
+    }))
+  }, { eventId: 'bound-project-salvage-seed' })
+
+  const start = await service.applyGodCommand({
+    agents,
+    command: 'project start alpha trench_reinforcement',
+    operationId: 'bound-project-start'
+  })
+  const plan = await service.applyGodCommand({
+    agents,
+    command: 'salvage plan alpha no_mans_land_scrap',
+    operationId: 'bound-salvage-plan'
+  })
+  assert.equal(start.applied, true)
+  assert.equal(plan.applied, true)
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.ok(snapshot.world.projects.length <= 120)
+  assert.ok(snapshot.world.salvageRuns.length <= 120)
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 

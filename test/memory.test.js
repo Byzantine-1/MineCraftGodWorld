@@ -269,12 +269,20 @@ test('memory store defaults additive major mission fields for known towns when m
   const snapshot = store.loadAllMemory()
 
   assert.deepEqual(snapshot.world.majorMissions, [])
+  assert.deepEqual(snapshot.world.projects, [])
+  assert.deepEqual(snapshot.world.salvageRuns, [])
   assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
   assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 0)
+  assert.equal(snapshot.world.towns.alpha.hope, 50)
+  assert.equal(snapshot.world.towns.alpha.dread, 50)
   assert.deepEqual(snapshot.world.towns.alpha.crierQueue, [])
+  assert.deepEqual(snapshot.world.towns.alpha.recentImpacts, [])
   assert.equal(snapshot.world.towns.beta.activeMajorMissionId, null)
   assert.equal(snapshot.world.towns.beta.majorMissionCooldownUntilDay, 0)
+  assert.equal(snapshot.world.towns.beta.hope, 50)
+  assert.equal(snapshot.world.towns.beta.dread, 50)
   assert.deepEqual(snapshot.world.towns.beta.crierQueue, [])
+  assert.deepEqual(snapshot.world.towns.beta.recentImpacts, [])
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
@@ -325,10 +333,18 @@ test('memory store sanitizes additive major mission + town crier shapes on load'
         alpha: {
           activeMajorMissionId: 'mm_alpha_2',
           majorMissionCooldownUntilDay: -4,
+          hope: 500,
+          dread: -100,
           crierQueue: [
             { id: 'a', day: 3, type: 'mission_available', message: 'Briefing posted', missionId: 'mm_alpha_1' },
             { id: '', day: -1, type: '', message: '' }
-          ]
+          ],
+          recentImpacts: Array.from({ length: 60 }).map((_, idx) => ({
+            id: `impact-${idx}`,
+            day: 3,
+            type: idx % 2 === 0 ? 'mission_complete' : 'nether_event',
+            summary: `s${idx}`
+          }))
         }
       }
     }
@@ -342,10 +358,17 @@ test('memory store sanitizes additive major mission + town crier shapes on load'
   assert.equal(snapshot.world.majorMissions[1].status, 'briefed')
   assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, 'mm_alpha_1')
   assert.equal(snapshot.world.towns.alpha.majorMissionCooldownUntilDay, 0)
+  assert.equal(snapshot.world.towns.alpha.hope, 100)
+  assert.equal(snapshot.world.towns.alpha.dread, 0)
   assert.equal(snapshot.world.towns.alpha.crierQueue.length, 1)
   assert.equal(snapshot.world.towns.alpha.crierQueue[0].id, 'a')
+  assert.equal(snapshot.world.towns.alpha.recentImpacts.length, 30)
+  assert.equal(snapshot.world.towns.alpha.recentImpacts[0].id, 'impact-30')
   assert.equal(snapshot.world.towns.beta.activeMajorMissionId, null)
+  assert.equal(snapshot.world.towns.beta.hope, 50)
+  assert.equal(snapshot.world.towns.beta.dread, 50)
   assert.deepEqual(snapshot.world.towns.beta.crierQueue, [])
+  assert.deepEqual(snapshot.world.towns.beta.recentImpacts, [])
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
@@ -430,6 +453,69 @@ test('memory store sanitizes additive nether ledger + townsfolk quest bounds on 
   assert.equal(snapshot.world.nether.deckState.seed, 42)
   assert.equal(snapshot.world.nether.deckState.cursor, 7)
   assert.equal(snapshot.world.nether.lastTickDay, 200)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
+test('memory store sanitizes additive projects + salvage shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      projects: [
+        ...Array.from({ length: 140 }).map((_, idx) => ({
+          id: `pr_${idx}`,
+          townId: idx % 2 === 0 ? 'alpha' : 'beta',
+          type: idx % 2 === 0 ? 'watchtower_line' : 'ration_depot',
+          status: idx % 3 === 0 ? 'active' : 'completed',
+          stage: 1 + (idx % 3),
+          requirements: { labor: 2 },
+          effects: { hopeDelta: 1 },
+          startedAtDay: 1,
+          updatedAtDay: 1 + idx
+        })),
+        {
+          id: 'bad_project',
+          townId: 'alpha',
+          type: 'castle',
+          status: 'active',
+          stage: 1,
+          requirements: {},
+          effects: {},
+          startedAtDay: 1,
+          updatedAtDay: 2
+        }
+      ],
+      salvageRuns: [
+        ...Array.from({ length: 150 }).map((_, idx) => ({
+          id: `sr_${idx}`,
+          townId: idx % 2 === 0 ? 'alpha' : 'beta',
+          targetKey: idx % 2 === 0 ? 'no_mans_land_scrap' : 'collapsed_tunnel_tools',
+          status: idx % 3 === 0 ? 'planned' : 'resolved',
+          plannedAtDay: 1,
+          resolvedAtDay: idx % 3 === 0 ? 0 : 2 + idx,
+          result: { supplies: 2, hopeDelta: 1, dreadDelta: -1 }
+        })),
+        {
+          id: 'bad_run',
+          townId: 'alpha',
+          targetKey: 'deep_cave_cache',
+          status: 'resolved',
+          plannedAtDay: 1,
+          resolvedAtDay: 2,
+          result: {}
+        }
+      ]
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.equal(snapshot.world.projects.length, 120)
+  assert.ok(snapshot.world.projects.every(project => project.type === 'watchtower_line' || project.type === 'ration_depot'))
+  assert.equal(snapshot.world.projects[0].id, 'pr_20')
+  assert.equal(snapshot.world.salvageRuns.length, 120)
+  assert.ok(snapshot.world.salvageRuns.every(run => run.targetKey === 'no_mans_land_scrap' || run.targetKey === 'collapsed_tunnel_tools'))
+  assert.equal(snapshot.world.salvageRuns[0].id, 'sr_30')
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
