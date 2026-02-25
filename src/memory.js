@@ -285,6 +285,20 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
 }
 
+const DETERMINISTIC_TIME_EPOCH_MS = Date.parse('2026-01-01T00:00:00.000Z')
+
+/**
+ * @param {string} text
+ */
+function stableHashNumber(text) {
+  let hash = 0
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+
 const QUEST_TYPES = new Set(['trade_n', 'visit_town', 'rumor_task'])
 const RUMOR_TASK_KINDS = new Set(['rumor_trade', 'rumor_visit', 'rumor_choice'])
 const QUEST_STATES = new Set(['offered', 'accepted', 'in_progress', 'completed', 'cancelled', 'failed'])
@@ -1861,6 +1875,23 @@ function markEvent(memory, eventId) {
 }
 
 /**
+ * @param {MemoryState} memory
+ * @param {string} scopeKey
+ * @param {number} [offset]
+ */
+function deterministicArchiveTime(memory, scopeKey, offset = 0) {
+  const dayRaw = Number(memory?.world?.clock?.day)
+  const day = Number.isInteger(dayRaw) && dayRaw > 0 ? dayRaw : 1
+  const processedCount = Array.isArray(memory?.world?.processedEventIds)
+    ? Math.max(0, Math.trunc(memory.world.processedEventIds.length))
+    : 0
+  const orderedOffset = Math.min(86000, processedCount) * 1000
+  const salt = stableHashNumber(`${scopeKey}:${day}`) % 997
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0))
+  return DETERMINISTIC_TIME_EPOCH_MS + ((day - 1) * 86400000) + orderedOffset + salt + safeOffset
+}
+
+/**
  * @param {string[]} entries
  */
 function summarize(entries) {
@@ -2737,7 +2768,10 @@ function createMemoryStore(options = {}) {
         }
       }
 
-      memory.agents[safeAgent].archive.push({ time: now(), event: safeEntry })
+      memory.agents[safeAgent].archive.push({
+        time: deterministicArchiveTime(memory, `${eventId || 'agent'}:agent:${safeAgent}`),
+        event: safeEntry
+      })
     }, { eventId: eventId ? `${eventId}:agent:${safeAgent}` : undefined })
   }
 
@@ -2764,7 +2798,10 @@ function createMemoryStore(options = {}) {
       if (important || memory.factions[safeFaction].long.length % 20 === 0) {
         memory.factions[safeFaction].summary = summarize(memory.factions[safeFaction].long)
       }
-      memory.factions[safeFaction].archive.push({ time: now(), event: safeEntry })
+      memory.factions[safeFaction].archive.push({
+        time: deterministicArchiveTime(memory, `${eventId || 'faction'}:faction:${safeFaction}`),
+        event: safeEntry
+      })
     }, { eventId: eventId ? `${eventId}:faction:${safeFaction}` : undefined })
   }
 
@@ -2784,7 +2821,11 @@ function createMemoryStore(options = {}) {
     }
 
     await transact((memory) => {
-      memory.world.archive.push({ time: now(), event: safeEntry, important: !!important })
+      memory.world.archive.push({
+        time: deterministicArchiveTime(memory, `${eventId || 'world'}:world`),
+        event: safeEntry,
+        important: !!important
+      })
       if (memory.world.archive.length > 500) memory.world.archive = memory.world.archive.slice(-500)
     }, { eventId: eventId ? `${eventId}:world` : undefined })
   }

@@ -6,6 +6,7 @@ const SUPPORTED_GOD_COMMANDS = new Set(['declare_war', 'make_peace', 'bless_peop
 const INTENT_TYPES = new Set(['idle', 'wander', 'follow', 'respond'])
 const JOB_ROLES = new Set(['scout', 'guard', 'builder', 'farmer', 'hauler'])
 const FEED_MAX_ENTRIES = 200
+const DETERMINISTIC_TIME_EPOCH_MS = Date.parse('2026-01-01T00:00:00.000Z')
 const QUEST_TYPES = new Set(['trade_n', 'visit_town', 'rumor_task'])
 const RUMOR_TASK_KINDS = new Set(['rumor_trade', 'rumor_visit', 'rumor_choice'])
 const QUEST_STATES = new Set(['offered', 'accepted', 'in_progress', 'completed', 'cancelled', 'failed'])
@@ -1259,7 +1260,9 @@ function applyTownMoodDelta(memory, input) {
   const thresholdCrossings = collectMoodThresholdCrossings(before, next)
   const shouldNarrate = beforeLabel !== afterLabel || thresholdCrossings.length > 0
   const safeIdPrefix = asText(input?.idPrefix, '', 200)
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${safeIdPrefix || 'mood'}:${townName}:mood`)
   if (shouldNarrate && safeIdPrefix) {
     const message = buildMoodNarration(townName, next, afterLabel)
     appendChronicle(memory, {
@@ -1553,7 +1556,9 @@ function spawnWorldRumor(memory, input) {
   const expiresDay = startsDay + expiresInDays
   const idPrefix = asText(input.idPrefix, '', 200)
   const rumorId = createRumorId(rumors, idPrefix, townName, kind, startsDay)
-  const createdAt = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
+  const createdAt = Number.isFinite(Number(input.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'rumor_spawn'}:${townName}:${kind}:${startsDay}`)
   const rumor = {
     id: rumorId,
     town: townName,
@@ -1810,7 +1815,9 @@ function createDecisionForEvent(memory, event, input) {
   const decisions = ensureWorldDecisions(memory.world)
   const idPrefix = asText(input?.idPrefix, '', 200)
   const decisionId = createDecisionId(decisions, idPrefix, normalizedEvent.town, normalizedEvent.id)
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'decision_open'}:${normalizedEvent.town}:${normalizedEvent.id}`)
   const decision = {
     id: decisionId,
     town: normalizedEvent.town,
@@ -2534,7 +2541,13 @@ function generateDailyContracts(memory, input) {
 
     for (let slot = 0; slot < missing; slot += 1) {
       const draft = buildContractDraft(world, townName, towns, input.day, slot)
-      const at = Number(input.at || Date.now())
+      const at = Number.isFinite(Number(input.at))
+        ? Number(input.at)
+        : deterministicAtFromMemory(
+            memory,
+            `${asText(input.idPrefix, '', 200) || asText(input.operationId, '', 200) || 'contract_offer'}:${townName}:${input.day}`,
+            slot
+          )
       const questId = createQuestId(quests, `${input.operationId}:contract:${townName}:${input.day}:${slot}`, townName, draft.type, at + slot)
       const quest = {
         id: questId,
@@ -2770,7 +2783,9 @@ function drawAndApplyWorldEvent(memory, input) {
   events.index = drawIndex + 1
   events.active.push(event)
 
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${asText(input?.idPrefix, '', 200) || 'event_draw'}:${eventId}:${drawIndex}`)
   const message = `[${townName}] EVENT: ${config.title}`
   appendChronicle(memory, {
     id: `${input.idPrefix}:chronicle:event_draw:${eventId.toLowerCase()}`,
@@ -3245,6 +3260,66 @@ function stableHashNumber(text) {
     hash |= 0
   }
   return Math.abs(hash)
+}
+
+/**
+ * @param {any} world
+ */
+function getProcessedEventCount(world) {
+  if (!Array.isArray(world?.processedEventIds)) return 0
+  return Math.max(0, Math.trunc(world.processedEventIds.length))
+}
+
+/**
+ * @param {any} world
+ * @param {string} scopeKey
+ */
+function deterministicTimelineBase(world, scopeKey) {
+  const clock = normalizeWorldClock(world?.clock)
+  const day = Math.max(1, Math.trunc(Number(clock.day || 1)))
+  const seed = deriveNetherSeed(world)
+  const processedCount = getProcessedEventCount(world)
+  const orderedOffset = Math.min(86000, processedCount) * 1000
+  const salt = stableHashNumber(`${seed}:${asText(scopeKey, 'timeline', 200)}:${day}`) % 997
+  return DETERMINISTIC_TIME_EPOCH_MS + ((day - 1) * 86400000) + orderedOffset + salt
+}
+
+/**
+ * @param {any} world
+ * @param {string} scopeKey
+ * @param {number} [offset]
+ */
+function deterministicAtFromWorld(world, scopeKey, offset = 0) {
+  const base = deterministicTimelineBase(world, scopeKey)
+  const safeOffset = Math.max(0, Math.trunc(Number(offset) || 0))
+  return base + safeOffset
+}
+
+/**
+ * @param {any} memory
+ * @param {string} scopeKey
+ * @param {number} [offset]
+ */
+function deterministicAtFromMemory(memory, scopeKey, offset = 0) {
+  return deterministicAtFromWorld(memory?.world, scopeKey, offset)
+}
+
+/**
+ * @param {any} world
+ * @param {string} operationId
+ * @param {string} commandTag
+ */
+function createDeterministicCommandNow(world, operationId, commandTag) {
+  const base = deterministicTimelineBase(
+    world,
+    `${asText(operationId, 'op', 200)}:${asText(commandTag, 'command', 240)}`
+  )
+  let seq = 0
+  return () => {
+    const at = base + seq
+    seq += 1
+    return at
+  }
 }
 
 /**
@@ -4767,7 +4842,9 @@ function appendProjectAnnouncements(memory, input) {
   const message = asText(input?.message, '', 240)
   const idPrefix = asText(input?.idPrefix, '', 200)
   const crierType = asText(input?.crierType, '', 40).toLowerCase()
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'project'}:${crierType}:${project.id}`)
   if (!townName || !message || !idPrefix || !crierType) return
   appendTownCrier(memory, {
     townName,
@@ -4877,7 +4954,9 @@ function appendSalvageAnnouncements(memory, input) {
   const message = asText(input?.message, '', 240)
   const idPrefix = asText(input?.idPrefix, '', 200)
   const crierType = asText(input?.crierType, '', 40).toLowerCase()
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'salvage'}:${crierType}:${run.id}`)
   if (!townName || !message || !idPrefix || !crierType) return
   appendTownCrier(memory, {
     townName,
@@ -4987,7 +5066,9 @@ function appendMajorMissionAnnouncements(memory, input) {
   const idPrefix = asText(input?.idPrefix, '', 200)
   const crierType = asText(input?.crierType, '', 40).toLowerCase()
   const status = asText(input?.status, '', 20).toLowerCase()
-  const at = Number.isFinite(Number(input?.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input?.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'major_mission'}:${crierType}:${mission.id}`)
   if (!townName || !message || !idPrefix || !crierType) return
 
   appendTownCrier(memory, {
@@ -5386,7 +5467,9 @@ function createRumorSideQuest(memory, rumor, input) {
     })
   }
   const quests = ensureWorldQuests(memory.world)
-  const at = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
+  const at = Number.isFinite(Number(input.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${asText(input.operationId, '', 200) || 'rumor_quest'}:${normalizedRumor.id}`)
   const subtype = selectRumorQuestSubtype(normalizedRumor)
   const reward = clamp(Number(normalizedRumor.severity || 1) + 1, 0, 4)
   const questId = createQuestId(quests, input.operationId, normalizedRumor.town, 'rumor_task', at)
@@ -5460,8 +5543,10 @@ function applyDecisionChoiceEffects(memory, decision, option, input) {
   const normalizedDecision = normalizeDecision(decision)
   const normalizedOption = normalizeDecisionOption(option)
   if (!normalizedDecision || !normalizedOption) return null
-  const at = Number.isFinite(Number(input.at)) ? Number(input.at) : Date.now()
   const idPrefix = asText(input.operationId, '', 200)
+  const at = Number.isFinite(Number(input.at))
+    ? Number(input.at)
+    : deterministicAtFromMemory(memory, `${idPrefix || 'decision_choose'}:${normalizedDecision.id}:${normalizedOption.key}`)
   const effects = normalizeDecisionEffects(normalizedOption.effects) || {}
   const summary = []
 
@@ -6604,7 +6689,7 @@ function createGodCommandService(deps) {
   const runtimeMark = typeof deps.runtimeMark === 'function' ? deps.runtimeMark : null
   const runtimeJob = typeof deps.runtimeJob === 'function' ? deps.runtimeJob : null
   const getStatusSnapshot = typeof deps.getStatusSnapshot === 'function' ? deps.getStatusSnapshot : null
-  const now = deps.now || (() => Date.now())
+  const providedNow = typeof deps.now === 'function' ? deps.now : null
 
   /**
    * @param {{agents: unknown[], command: string, operationId: string}} input
@@ -6629,6 +6714,18 @@ function createGodCommandService(deps) {
         message: 'God command requires operationId for idempotency.',
         recoverable: true
       })
+    }
+    const deterministicNow = createDeterministicCommandNow(
+      memoryStore.getSnapshot().world,
+      operationId,
+      `${parsed.type}:${command}`
+    )
+    const now = () => {
+      if (providedNow) {
+        const candidate = Number(providedNow())
+        if (Number.isFinite(candidate) && candidate >= 0) return candidate
+      }
+      return deterministicNow()
     }
 
     if (parsed.type === 'legacy_world') {

@@ -9,6 +9,7 @@ const ACTION_TYPES = new Set([
   'desert_faction',
   'attack_player'
 ])
+const DETERMINISTIC_TIME_EPOCH_MS = Date.parse('2026-01-01T00:00:00.000Z')
 
 /**
  * @param {number} n
@@ -17,6 +18,32 @@ const ACTION_TYPES = new Set([
  */
 function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
+}
+
+/**
+ * @param {string} text
+ */
+function stableHashNumber(text) {
+  let hash = 0
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash) + text.charCodeAt(i)
+    hash |= 0
+  }
+  return Math.abs(hash)
+}
+
+/**
+ * @param {any} world
+ * @param {string} scopeKey
+ * @param {number} [offset]
+ */
+function deterministicArchiveTime(world, scopeKey, offset = 0) {
+  const dayRaw = Number(world?.clock?.day)
+  const day = Number.isInteger(dayRaw) && dayRaw > 0 ? dayRaw : 1
+  const processedCount = Array.isArray(world?.processedEventIds) ? world.processedEventIds.length : 0
+  const orderedOffset = Math.min(86000, Math.max(0, Math.trunc(processedCount))) * 1000
+  const salt = stableHashNumber(scopeKey) % 997
+  return DETERMINISTIC_TIME_EPOCH_MS + ((day - 1) * 86400000) + orderedOffset + salt + Math.max(0, Math.trunc(Number(offset) || 0))
 }
 
 /**
@@ -73,7 +100,7 @@ function createActionEngine(deps) {
 
   const memoryStore = deps.memoryStore
   const logger = deps.logger || createLogger({ component: 'action_engine' })
-  const now = deps.now || (() => Date.now())
+  const providedNow = typeof deps.now === 'function' ? deps.now : null
 
   /**
    * Deterministic action application with persistent idempotency.
@@ -109,9 +136,19 @@ function createActionEngine(deps) {
     const tx = await memoryStore.transact((memory) => {
       const world = memory.world
       const factionStats = ensureFactionStats(world.factions, faction)
+      let archiveSeq = 0
 
-      function appendWorldEvent(event, important = false) {
-        world.archive.push({ time: now(), event, important: !!important })
+      function nextArchiveTime(scopeTag) {
+        if (providedNow) {
+          const candidate = Number(providedNow())
+          if (Number.isFinite(candidate) && candidate >= 0) return candidate
+        }
+        const safeTag = asText(scopeTag, 'event', 80)
+        return deterministicArchiveTime(world, `${operationId}:${agentName}:${safeTag}`, archiveSeq++)
+      }
+
+      function appendWorldEvent(event, important = false, scopeTag = 'event') {
+        world.archive.push({ time: nextArchiveTime(scopeTag), event, important: !!important })
         if (world.archive.length > 500) world.archive = world.archive.slice(-500)
       }
 
@@ -126,14 +163,14 @@ function createActionEngine(deps) {
         if (type === 'spread_rumor') {
           world.player.legitimacy = clamp(world.player.legitimacy - 2, 0, 100)
           factionStats.hostilityToPlayer = clamp(factionStats.hostilityToPlayer + 3, 0, 100)
-          appendWorldEvent(`[RUMOR] ${agentName} spreads a rumor: ${action.reason || '...'}`)
+          appendWorldEvent(`[RUMOR] ${agentName} spreads a rumor: ${action.reason || '...'}`, false, 'spread_rumor')
           outcomes.push({ type, accepted: true, outcome: 'rumor_spread' })
           continue
         }
 
         if (type === 'call_meeting') {
           factionStats.stability = clamp(factionStats.stability - 2, 0, 100)
-          appendWorldEvent(`[MEETING] ${agentName} calls a meeting in ${faction}.`)
+          appendWorldEvent(`[MEETING] ${agentName} calls a meeting in ${faction}.`, false, 'call_meeting')
           outcomes.push({ type, accepted: true, outcome: 'meeting_called' })
           continue
         }
@@ -146,7 +183,7 @@ function createActionEngine(deps) {
 
         if (type === 'desert_faction') {
           factionStats.stability = clamp(factionStats.stability - 6, 0, 100)
-          appendWorldEvent(`[SPLINTER] ${agentName} deserts ${faction}.`)
+          appendWorldEvent(`[SPLINTER] ${agentName} deserts ${faction}.`, false, 'desert_faction')
           outcomes.push({ type, accepted: true, outcome: 'deserted' })
           continue
         }
@@ -171,7 +208,7 @@ function createActionEngine(deps) {
           }
 
           world.player.alive = false
-          appendWorldEvent(`[ASSASSINATION] ${agentName} leads an attack. The player is killed.`, true)
+          appendWorldEvent(`[ASSASSINATION] ${agentName} leads an attack. The player is killed.`, true, 'attack_player')
           outcomes.push({ type, accepted: true, outcome: 'player_killed' })
           continue
         }

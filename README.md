@@ -186,6 +186,36 @@ Replay safety:
 - repeated command retries under the same operation/event identity are durable no-ops
 - bounded history is enforced in sanitize and on enqueue for `world.projects[]` and `world.salvageRuns[]`
 
+ID semantics (Option A, intentional):
+
+- `god project start <town> <projectType>` is deterministic per `(day, town, projectType)` and returns the same `project_id` on repeats that day
+- `god salvage plan <town> <targetKey>` is deterministic per `(day, town, targetKey)` and returns the same `run_id` on repeats that day
+- repeated same-day requests return `status=existing` and do not append extra news/chronicle/crier/recent-impact entries
+- repeated same-day requests do not apply extra pressure/threat/nether deltas
+
+Deterministic timestamping:
+
+- durable feed timestamps (`news`, `chronicle`, crier-linked announcements) are derived from durable state + command identity, not OS wall clock
+- replay of the same committed operation does not create duplicate feed rows
+
+## Package Boundaries
+
+Current package scripts include both engine-only and transitional bridge/testing tooling.
+
+Engine-only aliases:
+
+- `npm run engine:cli`
+- `npm run engine:test`
+- `npm run engine:smoke`
+- `npm run engine:stress`
+- `npm run engine:scale`
+
+Transitional aliases (kept for current workflows, candidate for repo split):
+
+- `npm run bridge:bots`
+- `npm run bridge:playtest`
+- `npm run qa:blackbox`
+
 ## Test And Validation
 
 Public unit/integration suite:

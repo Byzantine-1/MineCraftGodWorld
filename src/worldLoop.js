@@ -12,6 +12,7 @@ const RESPOND_LINES = [
   'Holding this position.',
   'Copy that.'
 ]
+const DETERMINISTIC_TIME_EPOCH_MS = Date.parse('2026-01-01T00:00:00.000Z')
 
 /**
  * @param {unknown} value
@@ -404,7 +405,7 @@ function createWorldLoop(deps) {
   const memoryStore = deps.memoryStore
   const getAgents = deps.getAgents
   const logger = deps.logger || createLogger({ component: 'world_loop' })
-  const now = deps.now || (() => Date.now())
+  const runtimeNow = deps.now || (() => Date.now())
   const setIntervalFn = deps.setIntervalFn || setInterval
   const clearIntervalFn = deps.clearIntervalFn || clearInterval
   const runtimeActions = deps.runtimeActions || {}
@@ -469,6 +470,12 @@ function createWorldLoop(deps) {
   const townCrierDedupeSet = new Set()
   let townCrierLastBroadcastAt = 0
   let townCrierBroadcastsTotal = 0
+
+  function deterministicTickAtMs(currentTickNumber) {
+    const safeTick = Math.max(1, Math.trunc(Number(currentTickNumber) || 1))
+    const safeTickMs = Math.max(1, Math.trunc(Number(tickMs) || 1))
+    return DETERMINISTIC_TIME_EPOCH_MS + (safeTick * safeTickMs)
+  }
 
   function resetTownCrierRuntimeState() {
     townCrierDedupeRing.length = 0
@@ -649,9 +656,7 @@ function createWorldLoop(deps) {
    * Run one deterministic tick. Exposed to tests to avoid flaky timer-based assertions.
    */
   async function runTickOnce() {
-    const tickAt = now()
-    const tickStartedAt = now()
-    lastTickAt = tickAt
+    const tickStartedAt = runtimeNow()
 
     if (tickInFlight) {
       backpressure = true
@@ -663,6 +668,8 @@ function createWorldLoop(deps) {
     tickInFlight = true
     tickNumber += 1
     try {
+      const tickAt = deterministicTickAtMs(tickNumber)
+      lastTickAt = tickAt
       const observability = observe()
       const pressure = evaluateBackpressure(memoryStore, observability, previousMetrics, previousObservability)
       previousMetrics = pressure.metrics
@@ -763,7 +770,7 @@ function createWorldLoop(deps) {
 
       scheduledCount = scheduled
       await maybeBroadcastTownCrierNews(tickAt, tickNumber)
-      lastTickDurationMs = now() - tickStartedAt
+      lastTickDurationMs = runtimeNow() - tickStartedAt
       tickDurationTotalMs += lastTickDurationMs
       tickDurationCount += 1
       tickDurationMaxMs = Math.max(tickDurationMaxMs, lastTickDurationMs)
@@ -773,7 +780,7 @@ function createWorldLoop(deps) {
       reason = 'tick_error'
       logger.errorWithStack('world_loop_tick_failed', err, { tickNumber })
       scheduledCount = 0
-      lastTickDurationMs = now() - tickStartedAt
+      lastTickDurationMs = runtimeNow() - tickStartedAt
       tickDurationTotalMs += lastTickDurationMs
       tickDurationCount += 1
       tickDurationMaxMs = Math.max(tickDurationMaxMs, lastTickDurationMs)

@@ -225,6 +225,8 @@ Expected outputs include lines like:
 - `GOD PROJECT COMPLETE: town=alpha project_id=... status=completed stage=3`
 - `GOD SALVAGE PLAN: town=alpha target=no_mans_land_scrap status=created run_id=...`
 - `GOD SALVAGE RESOLVE: town=alpha run_id=... target=no_mans_land_scrap outcome=secure supplies=...`
+- `GOD PROJECT START: ... status=existing ...` on same-day same-type repeats
+- `GOD SALVAGE PLAN: ... status=existing ...` on same-day same-target repeats
 - `GOD TOWN BOARD PROJECTS: count=...`
 - `GOD TOWN BOARD SALVAGE: ...`
 
@@ -235,16 +237,19 @@ Expected state effects in `src/memory.json`:
 - `world.towns.<town>.crierQueue[]` gets `project_*` and `salvage_*` announcements (bounded)
 - `world.news[]` / `world.chronicle[]` append project/salvage lifecycle facts via existing bounded append paths
 - `world.towns.<town>.recentImpacts[]` can include `projectId` and `salvageRunId` refs
+- durable feed `at` values are deterministic (derived from durable state + command identity, not OS wall clock)
 
 Replay/idempotency expectation:
 
 - duplicate replays of the same operation id/event id do not duplicate project/salvage entries
 - duplicate replays of resolve/complete/fail do not double-apply pressure/threat/nether modifiers
+- existing (non-create) same-day project/salvage commands do not append new news/chronicle/crier/recent-impact rows
 
 Determinism expectation:
 
 - project id generation is stable for the same seed/day/town/type
 - salvage id and resolve result payload are stable for the same seed/day/town/target/outcome
+- same-day same-type/target repeats return `status=existing` with unchanged ids and no side effects
 
 ## 11) Town Crier Verification (Optional, Runtime-Only)
 

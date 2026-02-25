@@ -3150,15 +3150,39 @@ test('project lifecycle is deterministic and replay-safe', async () => {
       command: 'project start alpha trench_reinforcement',
       operationId: 'project-start-a'
     })
+    const beforeStartExisting = state.memoryStore.getSnapshot()
     const startDedupe = await state.service.applyGodCommand({
       agents: state.agents,
       command: 'project start alpha trench_reinforcement',
       operationId: 'project-start-b'
     })
+    const afterStartExisting = state.memoryStore.getSnapshot()
     assert.equal(startA.applied, true)
     assert.equal(startReplay.applied, false)
     assert.equal(startDedupe.applied, true)
     assert.ok(startDedupe.outputLines.some(line => line.includes('status=existing')))
+    assert.equal(
+      afterStartExisting.world.news.filter(entry => entry.topic === 'project').length,
+      beforeStartExisting.world.news.filter(entry => entry.topic === 'project').length
+    )
+    assert.equal(
+      afterStartExisting.world.chronicle.filter(entry => entry.type === 'project').length,
+      beforeStartExisting.world.chronicle.filter(entry => entry.type === 'project').length
+    )
+    assert.equal(
+      afterStartExisting.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('project_')).length,
+      beforeStartExisting.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('project_')).length
+    )
+    assert.equal(
+      afterStartExisting.world.towns.alpha.recentImpacts.filter(item => item.type.startsWith('project_')).length,
+      beforeStartExisting.world.towns.alpha.recentImpacts.filter(item => item.type.startsWith('project_')).length
+    )
+    assert.equal(afterStartExisting.world.towns.alpha.hope, beforeStartExisting.world.towns.alpha.hope)
+    assert.equal(afterStartExisting.world.towns.alpha.dread, beforeStartExisting.world.towns.alpha.dread)
+    assert.equal(
+      Number(afterStartExisting.world.threat?.byTown?.alpha || 0),
+      Number(beforeStartExisting.world.threat?.byTown?.alpha || 0)
+    )
 
     const firstProject = state.memoryStore.getSnapshot().world.projects.find(project => project.type === 'trench_reinforcement' && project.townId === 'alpha')
     assert.ok(firstProject)
@@ -3225,6 +3249,17 @@ test('project lifecycle is deterministic and replay-safe', async () => {
   assert.equal(leftSnapshot.world.threat.byTown.alpha, 18)
   assert.equal(leftSnapshot.world.towns.alpha.hope, 50)
   assert.equal(leftSnapshot.world.towns.alpha.dread, 52)
+  const projectNews = leftSnapshot.world.news.filter(entry => entry.topic === 'project')
+  const projectChronicle = leftSnapshot.world.chronicle.filter(entry => entry.type === 'project')
+  const projectCrier = leftSnapshot.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('project_'))
+  assert.equal(projectNews.length, 5)
+  assert.equal(projectChronicle.length, 5)
+  assert.equal(projectCrier.length, 5)
+  assert.equal(new Set(projectNews.map(entry => entry.id.toLowerCase())).size, projectNews.length)
+  assert.equal(new Set(projectChronicle.map(entry => entry.id.toLowerCase())).size, projectChronicle.length)
+  assert.equal(new Set(projectCrier.map(entry => entry.id.toLowerCase())).size, projectCrier.length)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'project_start').length, 2)
+  assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'project_phase').length, 0)
   assert.equal(leftSnapshot.world.projects.filter(project => project.status === 'completed').length, 1)
   assert.equal(leftSnapshot.world.projects.filter(project => project.status === 'failed').length, 1)
   assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'project_complete').length, 1)
@@ -3271,15 +3306,39 @@ test('salvage plan/resolve/fail are deterministic and replay-safe', async () => 
       command: 'salvage plan alpha no_mans_land_scrap',
       operationId: 'salvage-plan-a'
     })
+    const beforePlanExisting = state.memoryStore.getSnapshot()
     const planDedupe = await state.service.applyGodCommand({
       agents: state.agents,
       command: 'salvage plan alpha no_mans_land_scrap',
       operationId: 'salvage-plan-b'
     })
+    const afterPlanExisting = state.memoryStore.getSnapshot()
     assert.equal(planA.applied, true)
     assert.equal(planReplay.applied, false)
     assert.equal(planDedupe.applied, true)
     assert.ok(planDedupe.outputLines.some(line => line.includes('status=existing')))
+    assert.equal(
+      afterPlanExisting.world.news.filter(entry => entry.topic === 'salvage').length,
+      beforePlanExisting.world.news.filter(entry => entry.topic === 'salvage').length
+    )
+    assert.equal(
+      afterPlanExisting.world.chronicle.filter(entry => entry.type === 'salvage').length,
+      beforePlanExisting.world.chronicle.filter(entry => entry.type === 'salvage').length
+    )
+    assert.equal(
+      afterPlanExisting.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('salvage_')).length,
+      beforePlanExisting.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('salvage_')).length
+    )
+    assert.equal(
+      afterPlanExisting.world.towns.alpha.recentImpacts.filter(item => item.type.startsWith('salvage_')).length,
+      beforePlanExisting.world.towns.alpha.recentImpacts.filter(item => item.type.startsWith('salvage_')).length
+    )
+    assert.equal(afterPlanExisting.world.towns.alpha.hope, beforePlanExisting.world.towns.alpha.hope)
+    assert.equal(afterPlanExisting.world.towns.alpha.dread, beforePlanExisting.world.towns.alpha.dread)
+    assert.equal(
+      Number(afterPlanExisting.world.threat?.byTown?.alpha || 0),
+      Number(beforePlanExisting.world.threat?.byTown?.alpha || 0)
+    )
 
     const firstRun = state.memoryStore.getSnapshot().world.salvageRuns.find(run => run.targetKey === 'no_mans_land_scrap' && run.townId === 'alpha')
     assert.ok(firstRun)
@@ -3331,6 +3390,15 @@ test('salvage plan/resolve/fail are deterministic and replay-safe', async () => 
   assert.deepEqual(leftSnapshot.world.salvageRuns, rightSnapshot.world.salvageRuns)
   assert.equal(leftSnapshot.world.towns.alpha.hope, rightSnapshot.world.towns.alpha.hope)
   assert.equal(leftSnapshot.world.towns.alpha.dread, rightSnapshot.world.towns.alpha.dread)
+  const salvageNews = leftSnapshot.world.news.filter(entry => entry.topic === 'salvage')
+  const salvageChronicle = leftSnapshot.world.chronicle.filter(entry => entry.type === 'salvage')
+  const salvageCrier = leftSnapshot.world.towns.alpha.crierQueue.filter(item => item.type.startsWith('salvage_'))
+  assert.equal(salvageNews.length, 4)
+  assert.equal(salvageChronicle.length, 4)
+  assert.equal(salvageCrier.length, 4)
+  assert.equal(new Set(salvageNews.map(entry => entry.id.toLowerCase())).size, salvageNews.length)
+  assert.equal(new Set(salvageChronicle.map(entry => entry.id.toLowerCase())).size, salvageChronicle.length)
+  assert.equal(new Set(salvageCrier.map(entry => entry.id.toLowerCase())).size, salvageCrier.length)
   assert.ok(leftSnapshot.world.salvageRuns.some(run => run.status === 'resolved'))
   assert.ok(leftSnapshot.world.salvageRuns.some(run => run.status === 'failed'))
   assert.equal(leftSnapshot.world.towns.alpha.recentImpacts.filter(item => item.type === 'salvage_plan').length, 2)
@@ -3341,6 +3409,81 @@ test('salvage plan/resolve/fail are deterministic and replay-safe', async () => 
   assert.ok(leftSnapshot.world.towns.alpha.crierQueue.some(item => item.type === 'salvage_fail'))
   assert.equal(left.memoryStore.validateMemoryIntegrity().ok, true)
   assert.equal(right.memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('project/salvage ids are deterministic per town+type/target+day and existing commands are no-op', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'id-seed-alpha'
+  })
+
+  const projectStartA = await service.applyGodCommand({
+    agents,
+    command: 'project start alpha trench_reinforcement',
+    operationId: 'id-project-a'
+  })
+  const projectIdA = /project_id=([^ ]+)/.exec(projectStartA.outputLines?.[0] || '')?.[1] || ''
+  assert.ok(projectIdA)
+  assert.ok(projectStartA.outputLines.some(line => line.includes('status=created')))
+
+  const beforeProjectExisting = memoryStore.getSnapshot()
+  const projectStartB = await service.applyGodCommand({
+    agents,
+    command: 'project start alpha trench_reinforcement',
+    operationId: 'id-project-b'
+  })
+  const projectIdB = /project_id=([^ ]+)/.exec(projectStartB.outputLines?.[0] || '')?.[1] || ''
+  const afterProjectExisting = memoryStore.getSnapshot()
+  assert.equal(projectIdB, projectIdA)
+  assert.ok(projectStartB.outputLines.some(line => line.includes('status=existing')))
+  assert.equal(afterProjectExisting.world.projects.length, beforeProjectExisting.world.projects.length)
+  assert.equal(afterProjectExisting.world.news.length, beforeProjectExisting.world.news.length)
+  assert.equal(afterProjectExisting.world.chronicle.length, beforeProjectExisting.world.chronicle.length)
+  assert.equal(
+    afterProjectExisting.world.towns.alpha.crierQueue.length,
+    beforeProjectExisting.world.towns.alpha.crierQueue.length
+  )
+  assert.equal(
+    afterProjectExisting.world.towns.alpha.recentImpacts.length,
+    beforeProjectExisting.world.towns.alpha.recentImpacts.length
+  )
+
+  const salvagePlanA = await service.applyGodCommand({
+    agents,
+    command: 'salvage plan alpha no_mans_land_scrap',
+    operationId: 'id-salvage-a'
+  })
+  const runIdA = /run_id=([^ ]+)/.exec(salvagePlanA.outputLines?.[0] || '')?.[1] || ''
+  assert.ok(runIdA)
+  assert.ok(salvagePlanA.outputLines.some(line => line.includes('status=created')))
+
+  const beforeSalvageExisting = memoryStore.getSnapshot()
+  const salvagePlanB = await service.applyGodCommand({
+    agents,
+    command: 'salvage plan alpha no_mans_land_scrap',
+    operationId: 'id-salvage-b'
+  })
+  const runIdB = /run_id=([^ ]+)/.exec(salvagePlanB.outputLines?.[0] || '')?.[1] || ''
+  const afterSalvageExisting = memoryStore.getSnapshot()
+  assert.equal(runIdB, runIdA)
+  assert.ok(salvagePlanB.outputLines.some(line => line.includes('status=existing')))
+  assert.equal(afterSalvageExisting.world.salvageRuns.length, beforeSalvageExisting.world.salvageRuns.length)
+  assert.equal(afterSalvageExisting.world.news.length, beforeSalvageExisting.world.news.length)
+  assert.equal(afterSalvageExisting.world.chronicle.length, beforeSalvageExisting.world.chronicle.length)
+  assert.equal(
+    afterSalvageExisting.world.towns.alpha.crierQueue.length,
+    beforeSalvageExisting.world.towns.alpha.crierQueue.length
+  )
+  assert.equal(
+    afterSalvageExisting.world.towns.alpha.recentImpacts.length,
+    beforeSalvageExisting.world.towns.alpha.recentImpacts.length
+  )
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
 test('town board includes project and salvage sections', async () => {
@@ -3375,6 +3518,12 @@ test('town board includes project and salvage sections', async () => {
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SALVAGE:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR FRONTLINE STATUS:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD SIDE QUESTS TOP:')))
+  const projectRows = board.outputLines.filter(line => line.startsWith('GOD TOWN BOARD PROJECT:'))
+  const salvageRows = board.outputLines.filter(line => line.startsWith('GOD TOWN BOARD SALVAGE:'))
+  const warChangeRows = board.outputLines.filter(line => line.startsWith('GOD TOWN BOARD WAR CHANGE:'))
+  assert.ok(projectRows.length >= 1 && projectRows.length <= 3)
+  assert.equal(salvageRows.length, 1)
+  assert.ok(warChangeRows.length >= 1 && warChangeRows.length <= 3)
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
