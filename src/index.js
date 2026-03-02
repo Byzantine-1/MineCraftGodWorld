@@ -21,10 +21,24 @@ const { createKeyedQueue, deriveOperationId, hashText } = require('./flowControl
 const { startRuntimeMetricsReporter, getObservabilitySnapshot } = require('./runtimeMetrics')
 const { createWorldLoop } = require('./worldLoop')
 
-const logger = createLogger({ component: 'cli' })
+function selectLogLevel() {
+  const raw = String(process.env.LOG_MIN_LEVEL || 'debug').trim().toLowerCase()
+  return ['debug', 'info', 'warn', 'error'].includes(raw) ? raw : 'debug'
+}
+
+function selectMemoryFilePath() {
+  const raw = String(process.env.MEMORY_STORE_FILE_PATH || '').trim()
+  return raw ? path.resolve(raw) : path.resolve(__dirname, './memory.json')
+}
+
+const memoryFilePath = selectMemoryFilePath()
+const logger = createLogger({
+  component: 'cli',
+  minLevel: selectLogLevel()
+})
 startRuntimeMetricsReporter(logger.child({ subsystem: 'metrics' }), 60000)
 const memoryStore = createMemoryStore({
-  filePath: path.resolve(__dirname, './memory.json'),
+  filePath: memoryFilePath,
   logger: logger.child({ subsystem: 'memory' })
 })
 const dialogueService = createDialogueService({
@@ -119,7 +133,7 @@ function buildGodStatusSnapshot() {
 
   let memoryBytes = 0
   try {
-    memoryBytes = fs.statSync(path.resolve(__dirname, './memory.json')).size
+    memoryBytes = fs.statSync(memoryFilePath).size
   } catch (err) {
     memoryBytes = Buffer.byteLength(JSON.stringify(memoryStore.getSnapshot()), 'utf-8')
   }
@@ -298,7 +312,7 @@ async function handleLine(rawInput) {
 
     const world = memoryStore.recallWorld()
     if (world.player.alive === false) {
-      writeLine('The player is dead. Restart after setting world.player.alive=true in src/memory.json.')
+      writeLine(`The player is dead. Restart after setting world.player.alive=true in ${memoryFilePath}.`)
       return
     }
 
