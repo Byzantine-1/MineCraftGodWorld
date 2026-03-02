@@ -161,6 +161,11 @@ const executionAdapter = createExecutionAdapter({
 })
 
 memoryStore.loadAllMemory()
+const startupExecutionRecovery = executionAdapter.recoverInterruptedExecutions()
+  .catch((error) => {
+    logger.errorWithStack('execution_recovery_failed', error)
+    throw error
+  })
 
 async function shutdown(reason) {
   if (shuttingDown) return
@@ -205,6 +210,8 @@ rl.prompt()
  * @param {string} rawInput
  */
 async function handleLine(rawInput) {
+  await startupExecutionRecovery
+
   const handoff = parseExecutionHandoffLine(rawInput)
   if (handoff) {
     const result = await executionAdapter.executeHandoff({

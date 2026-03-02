@@ -345,11 +345,13 @@ const MAX_TOWN_RECENT_IMPACTS = 30
 const MAX_EXECUTION_AUTHORITY_COMMANDS = 12
 const MAX_EXECUTION_HISTORY_ENTRIES = 512
 const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
+const MAX_PENDING_EXECUTION_ENTRIES = 128
 const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
 const EXECUTION_RESULT_STATUSES = new Set(['executed', 'rejected', 'stale', 'duplicate', 'failed'])
+const PENDING_EXECUTION_STATUSES = new Set(['pending'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
   'nether_event',
   'mission_complete',
@@ -1821,6 +1823,64 @@ function normalizeExecutionEventLedgerShape(ledgerInput) {
 }
 
 /**
+ * @param {unknown} entryInput
+ */
+function normalizePendingExecutionEntryShape(entryInput) {
+  if (!entryInput || typeof entryInput !== 'object' || Array.isArray(entryInput)) return null
+  const pendingId = asText(entryInput.pendingId, '', 200)
+  const handoffId = asText(entryInput.handoffId, '', 200)
+  const proposalId = asText(entryInput.proposalId, '', 200)
+  const idempotencyKey = asText(entryInput.idempotencyKey, '', 200)
+  const actorId = asText(entryInput.actorId, '', 80)
+  const townId = asText(entryInput.townId, '', 80)
+  const proposalType = asText(entryInput.proposalType, '', 80)
+  const command = asText(entryInput.command, '', 240)
+  const status = asText(entryInput.status, '', 40).toLowerCase()
+  const totalCommandCount = Number(entryInput.totalCommandCount)
+  const completedCommandCount = Number(entryInput.completedCommandCount)
+
+  if (!pendingId || !handoffId || !proposalId || !idempotencyKey) return null
+  if (!actorId || !townId || !proposalType || !command) return null
+  if (!PENDING_EXECUTION_STATUSES.has(status)) return null
+  if (!Number.isInteger(totalCommandCount) || totalCommandCount < 0) return null
+  if (!Number.isInteger(completedCommandCount) || completedCommandCount < 0) return null
+  if (completedCommandCount > totalCommandCount) return null
+
+  return {
+    pendingId,
+    handoffId,
+    proposalId,
+    idempotencyKey,
+    actorId,
+    townId,
+    proposalType,
+    command,
+    authorityCommands: normalizeExecutionAuthorityCommands(entryInput.authorityCommands),
+    status,
+    preparedSnapshotHash: normalizeNullableExecutionHash(entryInput.preparedSnapshotHash),
+    preparedDecisionEpoch: normalizeNullableExecutionDay(entryInput.preparedDecisionEpoch),
+    lastKnownSnapshotHash: normalizeNullableExecutionHash(entryInput.lastKnownSnapshotHash),
+    lastKnownDecisionEpoch: normalizeNullableExecutionDay(entryInput.lastKnownDecisionEpoch),
+    totalCommandCount,
+    completedCommandCount,
+    lastAppliedCommand: asText(entryInput.lastAppliedCommand, '', 240) || null
+  }
+}
+
+/**
+ * @param {unknown} pendingInput
+ */
+function normalizePendingExecutionShape(pendingInput) {
+  const pending = (Array.isArray(pendingInput) ? pendingInput : [])
+    .map(normalizePendingExecutionEntryShape)
+    .filter(Boolean)
+  if (pending.length > MAX_PENDING_EXECUTION_ENTRIES) {
+    return pending.slice(-MAX_PENDING_EXECUTION_ENTRIES)
+  }
+  return pending
+}
+
+/**
  * @param {unknown} executionInput
  */
 function normalizeExecutionStateShape(executionInput) {
@@ -1829,7 +1889,8 @@ function normalizeExecutionStateShape(executionInput) {
     : {}
   return {
     history: normalizeExecutionHistoryShape(source.history),
-    eventLedger: normalizeExecutionEventLedgerShape(source.eventLedger)
+    eventLedger: normalizeExecutionEventLedgerShape(source.eventLedger),
+    pending: normalizePendingExecutionShape(source.pending)
   }
 }
 
@@ -2536,6 +2597,27 @@ function validateMemoryIntegritySnapshot(memory) {
           issues.push(`world.execution.eventLedger has duplicate id ${normalizedEntry.id}.`)
         }
         seenExecutionLedgerIds.add(key)
+      }
+    }
+
+    if (!Array.isArray(world.execution.pending)) {
+      issues.push('world.execution.pending must be an array.')
+    } else {
+      if (world.execution.pending.length > MAX_PENDING_EXECUTION_ENTRIES) {
+        issues.push(`world.execution.pending exceeds max entries ${MAX_PENDING_EXECUTION_ENTRIES}.`)
+      }
+      const seenPendingIds = new Set()
+      for (const entry of world.execution.pending) {
+        const normalizedEntry = normalizePendingExecutionEntryShape(entry)
+        if (!normalizedEntry) {
+          issues.push('world.execution.pending contains invalid entry.')
+          break
+        }
+        const pendingIdKey = normalizedEntry.pendingId.toLowerCase()
+        if (seenPendingIds.has(pendingIdKey)) {
+          issues.push(`world.execution.pending has duplicate pendingId ${normalizedEntry.pendingId}.`)
+        }
+        seenPendingIds.add(pendingIdKey)
       }
     }
   }

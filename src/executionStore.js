@@ -2,6 +2,7 @@ const { AppError } = require('./errors')
 
 const MAX_EXECUTION_HISTORY_ENTRIES = 512
 const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
+const MAX_PENDING_EXECUTION_ENTRIES = 128
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -35,7 +36,8 @@ function ensureExecutionState(world) {
   if (!isPlainObject(world.execution)) {
     world.execution = {
       history: [],
-      eventLedger: []
+      eventLedger: [],
+      pending: []
     }
   }
 
@@ -47,6 +49,10 @@ function ensureExecutionState(world) {
     world.execution.eventLedger = []
   }
 
+  if (!Array.isArray(world.execution.pending)) {
+    world.execution.pending = []
+  }
+
   return world.execution
 }
 
@@ -54,6 +60,64 @@ function normalizeAuthorityCommands(value) {
   return (Array.isArray(value) ? value : [])
     .map((entry) => asText(entry))
     .filter(Boolean)
+}
+
+function matchesExecutionIdentity(entry, { handoffId, idempotencyKey }) {
+  const safeHandoffId = asText(handoffId)
+  const safeIdempotencyKey = asText(idempotencyKey)
+  if (!safeHandoffId && !safeIdempotencyKey) return false
+
+  if (safeHandoffId && entry?.handoffId === safeHandoffId) {
+    return true
+  }
+
+  if (safeIdempotencyKey && entry?.idempotencyKey === safeIdempotencyKey) {
+    return true
+  }
+
+  return false
+}
+
+function removeMatchingPending(pendingEntries, identity) {
+  if (!Array.isArray(pendingEntries) || pendingEntries.length === 0) return 0
+  let removed = 0
+  for (let index = pendingEntries.length - 1; index >= 0; index -= 1) {
+    if (!matchesExecutionIdentity(pendingEntries[index], identity)) continue
+    pendingEntries.splice(index, 1)
+    removed += 1
+  }
+  return removed
+}
+
+function findMatchingReceipt(history, { handoffId, idempotencyKey }) {
+  const safeHandoffId = asText(handoffId)
+  const safeIdempotencyKey = asText(idempotencyKey)
+  if (!safeHandoffId && !safeIdempotencyKey) return null
+
+  for (let index = history.length - 1; index >= 0; index -= 1) {
+    const receipt = history[index]
+    if (!isPlainObject(receipt)) continue
+    if (safeHandoffId && receipt.handoffId === safeHandoffId) {
+      return cloneValue(receipt)
+    }
+    if (safeIdempotencyKey && receipt.idempotencyKey === safeIdempotencyKey) {
+      return cloneValue(receipt)
+    }
+  }
+
+  return null
+}
+
+function findMatchingPending(pendingEntries, identity) {
+  if (!Array.isArray(pendingEntries)) return null
+  for (let index = pendingEntries.length - 1; index >= 0; index -= 1) {
+    const pending = pendingEntries[index]
+    if (!isPlainObject(pending)) continue
+    if (matchesExecutionIdentity(pending, identity)) {
+      return cloneValue(pending)
+    }
+  }
+  return null
 }
 
 function createReceiptFromResult(result) {
@@ -98,23 +162,40 @@ function createLedgerEntryFromResult(result, kind) {
   }
 }
 
-function findMatchingReceipt(history, { handoffId, idempotencyKey }) {
-  const safeHandoffId = asText(handoffId)
-  const safeIdempotencyKey = asText(idempotencyKey)
-  if (!safeHandoffId && !safeIdempotencyKey) return null
-
-  for (let index = history.length - 1; index >= 0; index -= 1) {
-    const receipt = history[index]
-    if (!isPlainObject(receipt)) continue
-    if (safeHandoffId && receipt.handoffId === safeHandoffId) {
-      return cloneValue(receipt)
-    }
-    if (safeIdempotencyKey && receipt.idempotencyKey === safeIdempotencyKey) {
-      return cloneValue(receipt)
-    }
+function createPendingExecutionRecord({
+  handoff,
+  proposalType,
+  actorId,
+  townId,
+  authorityCommands,
+  beforeProjection
+}) {
+  return {
+    pendingId: asText(handoff?.handoffId),
+    handoffId: asText(handoff?.handoffId),
+    proposalId: asText(handoff?.proposalId),
+    idempotencyKey: asText(handoff?.idempotencyKey),
+    actorId: asText(actorId, 80),
+    townId: asText(townId, 80),
+    proposalType: asText(proposalType, 80),
+    command: asText(handoff?.command, 240),
+    authorityCommands: normalizeAuthorityCommands(authorityCommands),
+    status: 'pending',
+    preparedSnapshotHash: asText(beforeProjection?.snapshotHash, 64) || null,
+    preparedDecisionEpoch: asNullableInteger(beforeProjection?.decisionEpoch),
+    lastKnownSnapshotHash: asText(beforeProjection?.snapshotHash, 64) || null,
+    lastKnownDecisionEpoch: asNullableInteger(beforeProjection?.decisionEpoch),
+    totalCommandCount: normalizeAuthorityCommands(authorityCommands).length,
+    completedCommandCount: 0,
+    lastAppliedCommand: null
   }
+}
 
-  return null
+function createPendingIdentity(entry) {
+  return {
+    handoffId: entry?.handoffId,
+    idempotencyKey: entry?.idempotencyKey
+  }
 }
 
 function createExecutionStore({ memoryStore, logger } = {}) {
@@ -138,7 +219,126 @@ function createExecutionStore({ memoryStore, logger } = {}) {
     return findMatchingReceipt(execution.history, input || {})
   }
 
-  async function recordResult(result, { kind = `result:${asText(result?.status, 40)}`, persistReceipt = true } = {}) {
+  function findPendingExecution(input) {
+    const world = memoryStore.recallWorld()
+    const execution = ensureExecutionState(world)
+    return findMatchingPending(execution.pending, input || {})
+  }
+
+  function listPendingExecutions() {
+    const world = memoryStore.recallWorld()
+    const execution = ensureExecutionState(world)
+    return execution.pending.map((entry) => cloneValue(entry))
+  }
+
+  async function stagePendingExecution(input) {
+    const pendingEntry = createPendingExecutionRecord(input || {})
+    if (!pendingEntry.pendingId || !pendingEntry.handoffId || !pendingEntry.idempotencyKey) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_INVALID_PENDING',
+        message: 'Pending execution identity is required.',
+        recoverable: false
+      })
+    }
+
+    const tx = await memoryStore.transact((memory) => {
+      const execution = ensureExecutionState(memory.world)
+      removeMatchingPending(execution.pending, createPendingIdentity(pendingEntry))
+      appendBounded(execution.pending, pendingEntry, MAX_PENDING_EXECUTION_ENTRIES)
+      return {
+        pendingSize: execution.pending.length
+      }
+    }, { eventId: `execution-store:pending:stage:${pendingEntry.handoffId}` })
+
+    if (!tx.skipped) {
+      safeLogger.info('execution_store_pending_staged', {
+        handoffId: pendingEntry.handoffId,
+        idempotencyKey: pendingEntry.idempotencyKey,
+        pendingSize: tx.result?.pendingSize
+      })
+    }
+
+    return pendingEntry
+  }
+
+  async function markPendingExecutionProgress({
+    handoffId,
+    idempotencyKey,
+    completedCommandCount,
+    lastAppliedCommand,
+    lastKnownSnapshotHash,
+    lastKnownDecisionEpoch
+  } = {}) {
+    const identity = { handoffId, idempotencyKey }
+    const safeHandoffId = asText(handoffId)
+    if (!safeHandoffId) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_INVALID_PENDING',
+        message: 'handoffId is required to update pending execution progress.',
+        recoverable: false
+      })
+    }
+
+    const tx = await memoryStore.transact((memory) => {
+      const execution = ensureExecutionState(memory.world)
+      let updated = null
+      for (const pendingEntry of execution.pending) {
+        if (!matchesExecutionIdentity(pendingEntry, identity)) continue
+        pendingEntry.completedCommandCount = Math.max(
+          0,
+          Math.min(
+            Number.isInteger(completedCommandCount) ? completedCommandCount : 0,
+            Number.isInteger(pendingEntry.totalCommandCount) ? pendingEntry.totalCommandCount : 0
+          )
+        )
+        pendingEntry.lastAppliedCommand = asText(lastAppliedCommand, 240) || null
+        pendingEntry.lastKnownSnapshotHash = asText(lastKnownSnapshotHash, 64) || pendingEntry.lastKnownSnapshotHash || null
+        pendingEntry.lastKnownDecisionEpoch = asNullableInteger(lastKnownDecisionEpoch)
+          ?? pendingEntry.lastKnownDecisionEpoch
+        updated = cloneValue(pendingEntry)
+        break
+      }
+      return updated
+    }, { eventId: `execution-store:pending:progress:${safeHandoffId}:${Number(completedCommandCount) || 0}` })
+
+    if (!tx.skipped && tx.result) {
+      safeLogger.info('execution_store_pending_progress', {
+        handoffId: safeHandoffId,
+        completedCommandCount: tx.result.completedCommandCount,
+        totalCommandCount: tx.result.totalCommandCount
+      })
+    }
+
+    return tx.result || findPendingExecution(identity)
+  }
+
+  async function clearPendingExecution(identity, { kind = 'pending_clear' } = {}) {
+    const safeHandoffId = asText(identity?.handoffId)
+    if (!safeHandoffId && !asText(identity?.idempotencyKey)) {
+      return 0
+    }
+
+    const tx = await memoryStore.transact((memory) => {
+      const execution = ensureExecutionState(memory.world)
+      return removeMatchingPending(execution.pending, identity)
+    }, { eventId: `execution-store:${kind}:${safeHandoffId || asText(identity?.idempotencyKey)}` })
+
+    if (!tx.skipped && Number(tx.result) > 0) {
+      safeLogger.info('execution_store_pending_cleared', {
+        handoffId: safeHandoffId || null,
+        idempotencyKey: asText(identity?.idempotencyKey) || null,
+        kind,
+        removed: tx.result
+      })
+    }
+
+    return Number(tx.result) || 0
+  }
+
+  async function recordResult(
+    result,
+    { kind = `result:${asText(result?.status, 40)}`, persistReceipt = true, clearPending = true } = {}
+  ) {
     const safeExecutionId = asText(result?.executionId)
     if (!safeExecutionId) {
       throw new AppError({
@@ -157,9 +357,16 @@ function createExecutionStore({ memoryStore, logger } = {}) {
         appendBounded(execution.history, receipt, MAX_EXECUTION_HISTORY_ENTRIES)
       }
       appendBounded(execution.eventLedger, ledgerEntry, MAX_EXECUTION_EVENT_LEDGER_ENTRIES)
+      const clearedPendingCount = clearPending
+        ? removeMatchingPending(execution.pending, {
+          handoffId: receipt.handoffId,
+          idempotencyKey: receipt.idempotencyKey
+        })
+        : 0
       return {
         historySize: execution.history.length,
-        eventLedgerSize: execution.eventLedger.length
+        eventLedgerSize: execution.eventLedger.length,
+        clearedPendingCount
       }
     }, { eventId: `execution-store:${kind}:${safeExecutionId}` })
 
@@ -169,8 +376,10 @@ function createExecutionStore({ memoryStore, logger } = {}) {
         handoffId: receipt.handoffId,
         kind,
         persistReceipt,
+        clearPending,
         historySize: tx.result?.historySize,
-        eventLedgerSize: tx.result?.eventLedgerSize
+        eventLedgerSize: tx.result?.eventLedgerSize,
+        clearedPendingCount: tx.result?.clearedPendingCount
       })
     }
 
@@ -178,14 +387,20 @@ function createExecutionStore({ memoryStore, logger } = {}) {
   }
 
   return {
+    clearPendingExecution,
+    findPendingExecution,
     findReceipt,
+    listPendingExecutions,
+    markPendingExecutionProgress,
     readSnapshotSource,
-    recordResult
+    recordResult,
+    stagePendingExecution
   }
 }
 
 module.exports = {
   MAX_EXECUTION_EVENT_LEDGER_ENTRIES,
   MAX_EXECUTION_HISTORY_ENTRIES,
+  MAX_PENDING_EXECUTION_ENTRIES,
   createExecutionStore
 }

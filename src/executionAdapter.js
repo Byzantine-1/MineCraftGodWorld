@@ -18,6 +18,7 @@ const HASH_PATTERN = /^[0-9a-f]{64}$/i
 const HANDOFF_ID_PATTERN = /^handoff_[0-9a-f]{64}$/i
 const RESULT_ID_PATTERN = /^result_[0-9a-f]{64}$/i
 const PROPOSAL_ID_PATTERN = /^proposal_[0-9a-f]{64}$/i
+const INTERRUPTED_EXECUTION_REASON_CODE = 'INTERRUPTED_EXECUTION_RECOVERY'
 const DEFAULT_SALVAGE_FOCUS_MAP = Object.freeze({
   scarcity: 'ruined_hamlet_supplies',
   dread: 'abandoned_shrine_relics',
@@ -426,6 +427,35 @@ function createPreconditionEvaluation(failures) {
   }
 }
 
+function createInterruptedExecutionEvaluation({ actualSnapshotHash, actualDecisionEpoch, completedCommandCount, totalCommandCount, lastAppliedCommand }) {
+  const commandDetail = lastAppliedCommand
+    ? ` last_applied_command=${lastAppliedCommand}.`
+    : ''
+  return {
+    preconditions: {
+      evaluated: true,
+      passed: false,
+      failures: [
+        buildFailure(
+          'interrupted_execution',
+          `Recovered interrupted execution after restart. completed_steps=${completedCommandCount}/${totalCommandCount}.${commandDetail}`.trim()
+        )
+      ]
+    },
+    staleCheck: {
+      evaluated: true,
+      passed: true,
+      actualSnapshotHash: actualSnapshotHash || null,
+      actualDecisionEpoch: Number.isInteger(actualDecisionEpoch) ? actualDecisionEpoch : null
+    },
+    duplicateCheck: {
+      evaluated: true,
+      duplicate: false,
+      duplicateOf: null
+    }
+  }
+}
+
 function createDuplicateEvaluation({ actualSnapshotHash, actualDecisionEpoch, duplicateOf }) {
   return {
     preconditions: {
@@ -510,6 +540,75 @@ function createExecutionAdapter(deps) {
     return townIdAliases[normalized.toLowerCase()] || normalized
   }
 
+  async function recoverInterruptedExecutions() {
+    const recoveredResults = []
+    const pendingExecutions = executionStore.listPendingExecutions()
+
+    for (const pending of pendingExecutions) {
+      const existingReceipt = executionStore.findReceipt({
+        handoffId: pending.handoffId,
+        idempotencyKey: pending.idempotencyKey
+      })
+
+      if (existingReceipt) {
+        await executionStore.clearPendingExecution({
+          handoffId: pending.handoffId,
+          idempotencyKey: pending.idempotencyKey
+        }, { kind: 'pending_reconciled' })
+        continue
+      }
+
+      const currentWorld = executionStore.readSnapshotSource()
+      const currentProjection = createAuthoritativeSnapshotProjection(currentWorld)
+      const recoveryHandoff = {
+        handoffId: pending.handoffId,
+        proposalId: pending.proposalId,
+        idempotencyKey: pending.idempotencyKey,
+        snapshotHash: pending.preparedSnapshotHash || currentProjection.snapshotHash,
+        decisionEpoch: Number.isInteger(pending.preparedDecisionEpoch)
+          ? pending.preparedDecisionEpoch
+          : currentProjection.decisionEpoch,
+        command: pending.command
+      }
+
+      const recoveredResult = createExecutionResult({
+        handoff: recoveryHandoff,
+        proposalType: pending.proposalType,
+        actorId: pending.actorId,
+        townId: pending.townId,
+        authorityCommands: pending.authorityCommands,
+        status: 'failed',
+        accepted: true,
+        executed: false,
+        reasonCode: INTERRUPTED_EXECUTION_REASON_CODE,
+        evaluation: createInterruptedExecutionEvaluation({
+          actualSnapshotHash: currentProjection.snapshotHash,
+          actualDecisionEpoch: currentProjection.decisionEpoch,
+          completedCommandCount: Number(pending.completedCommandCount) || 0,
+          totalCommandCount: Number(pending.totalCommandCount) || pending.authorityCommands.length,
+          lastAppliedCommand: pending.lastAppliedCommand || null
+        }),
+        worldState: createWorldStateFromProjection(currentProjection)
+      })
+
+      await executionStore.recordResult(recoveredResult, {
+        kind: 'recovery_interrupted',
+        persistReceipt: true,
+        clearPending: true
+      })
+      recoveredResults.push(recoveredResult)
+
+      logger.warn('execution_adapter_interrupted_execution_recovered', {
+        handoffId: pending.handoffId,
+        executionId: recoveredResult.executionId,
+        completedCommandCount: pending.completedCommandCount,
+        totalCommandCount: pending.totalCommandCount
+      })
+    }
+
+    return recoveredResults
+  }
+
   async function executeHandoff({ handoff, agents = [] } = {}) {
     if (!isValidExecutionHandoff(handoff)) {
       throw new AppError({
@@ -518,6 +617,8 @@ function createExecutionAdapter(deps) {
         recoverable: true
       })
     }
+
+    await recoverInterruptedExecutions()
 
     const beforeWorld = executionStore.readSnapshotSource()
     const beforeProjection = createAuthoritativeSnapshotProjection(beforeWorld)
@@ -628,6 +729,15 @@ function createExecutionAdapter(deps) {
       return rejectedResult
     }
 
+    await executionStore.stagePendingExecution({
+      handoff,
+      proposalType: translation.proposalType,
+      actorId: translation.actorId,
+      townId: translation.townId,
+      authorityCommands: translation.authorityCommands,
+      beforeProjection
+    })
+
     let accepted = false
     for (let index = 0; index < translation.authorityCommands.length; index += 1) {
       const authorityCommand = translation.authorityCommands[index]
@@ -666,7 +776,8 @@ function createExecutionAdapter(deps) {
           })
           await executionStore.recordResult(duplicateResult, {
             kind: 'duplicate_step_replayed',
-            persistReceipt: false
+            persistReceipt: false,
+            clearPending: true
           })
           return duplicateResult
         }
@@ -711,11 +822,27 @@ function createExecutionAdapter(deps) {
           },
           worldState: createWorldStateFromProjection(currentProjection)
         })
+        if (accepted && typeof deps.beforeTerminalReceiptPersist === 'function') {
+          await deps.beforeTerminalReceiptPersist({
+            handoff,
+            result: rejectedResult,
+            authorityCommands: translation.authorityCommands
+          })
+        }
         await executionStore.recordResult(rejectedResult)
         return rejectedResult
       }
 
       accepted = true
+      const progressProjection = createAuthoritativeSnapshotProjection(executionStore.readSnapshotSource())
+      await executionStore.markPendingExecutionProgress({
+        handoffId: handoff.handoffId,
+        idempotencyKey: handoff.idempotencyKey,
+        completedCommandCount: index + 1,
+        lastAppliedCommand: authorityCommand,
+        lastKnownSnapshotHash: progressProjection.snapshotHash,
+        lastKnownDecisionEpoch: progressProjection.decisionEpoch
+      })
     }
 
     const afterWorld = executionStore.readSnapshotSource()
@@ -746,6 +873,13 @@ function createExecutionAdapter(deps) {
       },
       worldState: createWorldStateFromProjection(afterProjection)
     })
+    if (typeof deps.beforeTerminalReceiptPersist === 'function') {
+      await deps.beforeTerminalReceiptPersist({
+        handoff,
+        result,
+        authorityCommands: translation.authorityCommands
+      })
+    }
     await executionStore.recordResult(result)
 
     logger.info('execution_adapter_handoff_executed', {
@@ -760,6 +894,7 @@ function createExecutionAdapter(deps) {
 
   return {
     executeHandoff,
+    recoverInterruptedExecutions,
     resolveTownId
   }
 }
