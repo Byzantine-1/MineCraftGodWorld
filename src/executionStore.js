@@ -7,6 +7,10 @@ const { AppError } = require('./errors')
 const MAX_EXECUTION_HISTORY_ENTRIES = 512
 const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
 const MAX_PENDING_EXECUTION_ENTRIES = 128
+const MAX_WORLD_MEMORY_QUERY_LIMIT = 200
+const CHRONICLE_RECORD_TYPE = 'chronicle-record.v1'
+const HISTORY_RECORD_TYPE = 'history-record.v1'
+const HISTORY_SUMMARY_SCHEMA_VERSION = 1
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -33,6 +37,372 @@ function appendBounded(list, entry, maxEntries) {
   list.push(entry)
   if (list.length > maxEntries) {
     list.splice(0, list.length - maxEntries)
+  }
+}
+
+function normalizeQueryLimit(value, defaultLimit = 50, maxLimit = MAX_WORLD_MEMORY_QUERY_LIMIT) {
+  const parsed = Number(value)
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    return defaultLimit
+  }
+  return Math.min(parsed, maxLimit)
+}
+
+function normalizeScalarRecord(value, maxEntries = 24) {
+  if (!isPlainObject(value)) return {}
+  const out = {}
+  let count = 0
+  for (const key of Object.keys(value).sort()) {
+    if (count >= maxEntries) break
+    const safeKey = asText(key, 80)
+    if (!safeKey) continue
+    const entryValue = value[key]
+    if (entryValue === null) {
+      out[safeKey] = null
+      count += 1
+      continue
+    }
+    if (typeof entryValue === 'boolean') {
+      out[safeKey] = entryValue
+      count += 1
+      continue
+    }
+    if (typeof entryValue === 'number' && Number.isFinite(entryValue)) {
+      out[safeKey] = Math.trunc(entryValue)
+      count += 1
+      continue
+    }
+    if (typeof entryValue === 'string') {
+      const safeValue = asText(entryValue, 240)
+      if (!safeValue) continue
+      out[safeKey] = safeValue
+      count += 1
+    }
+  }
+  return out
+}
+
+function compareRecordsDesc(left, right) {
+  const leftAt = Number(left?.at) || 0
+  const rightAt = Number(right?.at) || 0
+  if (leftAt !== rightAt) {
+    return rightAt - leftAt
+  }
+  return String(right?.recordId || '').localeCompare(String(left?.recordId || ''))
+}
+
+function buildChronicleTags({ entryType, townId, factionId } = {}) {
+  const tags = new Set(['chronicle'])
+  const safeEntryType = asText(entryType, 80)
+  const safeTownId = asText(townId, 80)
+  const safeFactionId = asText(factionId, 80)
+  if (safeEntryType) tags.add(`type:${safeEntryType.toLowerCase()}`)
+  if (safeTownId) tags.add(`town:${safeTownId.toLowerCase()}`)
+  if (safeFactionId) tags.add(`faction:${safeFactionId.toLowerCase()}`)
+  return Array.from(tags).sort((left, right) => left.localeCompare(right))
+}
+
+function createChronicleRecord(entry) {
+  const sourceId = asText(entry?.id)
+  if (!sourceId) return null
+  const meta = normalizeScalarRecord(entry?.meta)
+  const entryType = asText(entry?.type, 80)
+  const townId = asText(entry?.town, 80) || null
+  const factionId = asText(meta.factionId ?? meta.faction, 80) || null
+  const at = asNullableInteger(entry?.at) ?? 0
+  return {
+    type: CHRONICLE_RECORD_TYPE,
+    schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
+    recordId: `chronicle:${sourceId}`,
+    sourceId,
+    entryType,
+    message: asText(entry?.msg, 240),
+    at,
+    townId,
+    factionId,
+    sourceKind: asText(meta.sourceKind ?? meta.origin, 80) || null,
+    sourceRefId: asText(
+      meta.sourceId
+      ?? meta.executionId
+      ?? meta.questId
+      ?? meta.missionId
+      ?? meta.projectId
+      ?? meta.salvageRunId,
+      200
+    ) || null,
+    tags: buildChronicleTags({ entryType, townId, factionId }),
+    meta
+  }
+}
+
+function buildHistorySummary({ sourceType, kind, proposalType, status, reasonCode, townId }) {
+  return [
+    asText(sourceType, 40),
+    asText(kind, 80),
+    asText(proposalType, 80),
+    asText(status, 40),
+    asText(reasonCode, 80),
+    asText(townId, 80)
+  ].filter(Boolean).join(' ')
+}
+
+function createReceiptIndex(receipts) {
+  const byExecutionId = new Map()
+  const byHandoffId = new Map()
+  const byIdempotencyKey = new Map()
+  for (const receipt of Array.isArray(receipts) ? receipts : []) {
+    if (!isPlainObject(receipt)) continue
+    if (receipt.executionId) byExecutionId.set(receipt.executionId, receipt)
+    if (receipt.handoffId) byHandoffId.set(receipt.handoffId, receipt)
+    if (receipt.idempotencyKey) byIdempotencyKey.set(receipt.idempotencyKey, receipt)
+  }
+  return {
+    byExecutionId,
+    byHandoffId,
+    byIdempotencyKey
+  }
+}
+
+function resolveReceiptForHistoryEntry(entry, receiptIndex) {
+  if (!receiptIndex) return null
+  if (entry?.executionId && receiptIndex.byExecutionId.has(entry.executionId)) {
+    return receiptIndex.byExecutionId.get(entry.executionId)
+  }
+  if (entry?.handoffId && receiptIndex.byHandoffId.has(entry.handoffId)) {
+    return receiptIndex.byHandoffId.get(entry.handoffId)
+  }
+  if (entry?.idempotencyKey && receiptIndex.byIdempotencyKey.has(entry.idempotencyKey)) {
+    return receiptIndex.byIdempotencyKey.get(entry.idempotencyKey)
+  }
+  return null
+}
+
+function createHistoryRecordFromReceipt(receipt) {
+  const executionId = asText(receipt?.executionId)
+  if (!executionId) return null
+  const townId = asText(receipt?.townId, 80) || null
+  const proposalType = asText(receipt?.proposalType, 80) || null
+  const status = asText(receipt?.status, 40) || null
+  const reasonCode = asText(receipt?.reasonCode, 80) || null
+  const at = asNullableInteger(receipt?.postExecutionDecisionEpoch)
+    ?? asNullableInteger(receipt?.actualDecisionEpoch)
+    ?? 0
+  return {
+    type: HISTORY_RECORD_TYPE,
+    schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
+    recordId: `history:receipt:${executionId}`,
+    sourceType: 'execution_receipt',
+    sourceId: executionId,
+    handoffId: asText(receipt?.handoffId),
+    idempotencyKey: asText(receipt?.idempotencyKey),
+    executionId,
+    actorId: asText(receipt?.actorId, 80) || null,
+    townId,
+    proposalType,
+    command: asText(receipt?.command, 240) || null,
+    authorityCommands: normalizeAuthorityCommands(receipt?.authorityCommands),
+    status,
+    reasonCode,
+    kind: 'terminal_receipt',
+    at,
+    snapshotHash: asText(receipt?.postExecutionSnapshotHash, 64)
+      || asText(receipt?.actualSnapshotHash, 64)
+      || null,
+    summary: buildHistorySummary({
+      sourceType: 'execution_receipt',
+      kind: 'terminal_receipt',
+      proposalType,
+      status,
+      reasonCode,
+      townId
+    })
+  }
+}
+
+function createHistoryRecordFromLedgerEntry(entry, receiptIndex) {
+  const sourceId = asText(entry?.id, 240)
+  if (!sourceId) return null
+  const receipt = resolveReceiptForHistoryEntry(entry, receiptIndex)
+  const townId = asText(receipt?.townId ?? null, 80) || null
+  const proposalType = asText(receipt?.proposalType ?? null, 80) || null
+  const status = asText(entry?.status, 40) || asText(receipt?.status, 40) || null
+  const reasonCode = asText(entry?.reasonCode, 80) || asText(receipt?.reasonCode, 80) || null
+  const kind = asText(entry?.kind, 80) || 'execution_event'
+  const at = asNullableInteger(entry?.day) ?? 0
+  return {
+    type: HISTORY_RECORD_TYPE,
+    schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
+    recordId: `history:event:${sourceId}`,
+    sourceType: 'execution_event',
+    sourceId,
+    handoffId: asText(entry?.handoffId),
+    idempotencyKey: asText(entry?.idempotencyKey),
+    executionId: asText(entry?.executionId, 200) || asText(receipt?.executionId, 200) || null,
+    actorId: asText(receipt?.actorId, 80) || null,
+    townId,
+    proposalType,
+    command: asText(receipt?.command, 240) || null,
+    authorityCommands: normalizeAuthorityCommands(receipt?.authorityCommands),
+    status,
+    reasonCode,
+    kind,
+    at,
+    snapshotHash: asText(entry?.postExecutionSnapshotHash, 64)
+      || asText(entry?.actualSnapshotHash, 64)
+      || asText(receipt?.postExecutionSnapshotHash, 64)
+      || asText(receipt?.actualSnapshotHash, 64)
+      || null,
+    summary: buildHistorySummary({
+      sourceType: 'execution_event',
+      kind,
+      proposalType,
+      status,
+      reasonCode,
+      townId
+    })
+  }
+}
+
+function matchesChronicleRecord(record, {
+  townId,
+  factionId,
+  entryType,
+  search
+} = {}) {
+  const safeTownId = asText(townId, 80)
+  if (safeTownId && record.townId !== safeTownId) return false
+  const safeFactionId = asText(factionId, 80)
+  if (safeFactionId && record.factionId !== safeFactionId) return false
+  const safeEntryType = asText(entryType, 80)
+  if (safeEntryType && record.entryType !== safeEntryType) return false
+  const safeSearch = asText(search, 120).toLowerCase()
+  if (safeSearch) {
+    const haystack = [
+      record.message,
+      record.entryType,
+      record.townId,
+      record.factionId,
+      record.summary
+    ].filter(Boolean).join(' ').toLowerCase()
+    if (!haystack.includes(safeSearch)) return false
+  }
+  return true
+}
+
+function matchesHistoryRecord(record, {
+  townId,
+  status,
+  proposalType,
+  sourceType,
+  kind
+} = {}) {
+  const safeTownId = asText(townId, 80)
+  if (safeTownId && record.townId !== safeTownId) return false
+  const safeStatus = asText(status, 40)
+  if (safeStatus && record.status !== safeStatus) return false
+  const safeProposalType = asText(proposalType, 80)
+  if (safeProposalType && record.proposalType !== safeProposalType) return false
+  const safeSourceType = asText(sourceType, 40)
+  if (safeSourceType && record.sourceType !== safeSourceType) return false
+  const safeKind = asText(kind, 80)
+  if (safeKind && record.kind !== safeKind) return false
+  return true
+}
+
+function buildChronicleRecordsFromWorld(world) {
+  return (Array.isArray(world?.chronicle) ? world.chronicle : [])
+    .map((entry) => createChronicleRecord(entry))
+    .filter(Boolean)
+    .sort(compareRecordsDesc)
+}
+
+function buildHistoryRecords(receipts, ledgerEntries, query = {}) {
+  const receiptIndex = createReceiptIndex(receipts)
+  const records = []
+  for (const receipt of Array.isArray(receipts) ? receipts : []) {
+    const record = createHistoryRecordFromReceipt(receipt)
+    if (record) records.push(record)
+  }
+  for (const entry of Array.isArray(ledgerEntries) ? ledgerEntries : []) {
+    const record = createHistoryRecordFromLedgerEntry(entry, receiptIndex)
+    if (record) records.push(record)
+  }
+  return records
+    .filter((record) => matchesHistoryRecord(record, query))
+    .sort(compareRecordsDesc)
+    .slice(0, normalizeQueryLimit(query.limit, 50, MAX_EXECUTION_HISTORY_ENTRIES + MAX_EXECUTION_EVENT_LEDGER_ENTRIES))
+}
+
+function buildTownHistorySummary(world, chronicleRecords, historyRecords, townId) {
+  const townState = isPlainObject(world?.towns?.[townId]) ? world.towns[townId] : null
+  const factionIds = Object.entries(world?.factions || {})
+    .filter(([, faction]) => Array.isArray(faction?.towns) && faction.towns.includes(townId))
+    .map(([factionId]) => factionId)
+    .sort((left, right) => left.localeCompare(right))
+  const executionCounts = {
+    executed: 0,
+    rejected: 0,
+    stale: 0,
+    duplicate: 0,
+    failed: 0
+  }
+  for (const record of historyRecords) {
+    if (record.sourceType !== 'execution_receipt') continue
+    if (!Object.prototype.hasOwnProperty.call(executionCounts, record.status)) continue
+    executionCounts[record.status] += 1
+  }
+  return {
+    type: 'town-history-summary.v1',
+    schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
+    townId,
+    chronicleCount: chronicleRecords.length,
+    historyCount: historyRecords.length,
+    lastChronicleAt: chronicleRecords[0]?.at ?? null,
+    lastHistoryAt: historyRecords[0]?.at ?? null,
+    hope: Number.isFinite(Number(townState?.hope)) ? Number(townState.hope) : null,
+    dread: Number.isFinite(Number(townState?.dread)) ? Number(townState.dread) : null,
+    activeMajorMissionId: asText(townState?.activeMajorMissionId, 200) || null,
+    recentImpactCount: Array.isArray(townState?.recentImpacts) ? townState.recentImpacts.length : 0,
+    crierQueueDepth: Array.isArray(townState?.crierQueue) ? townState.crierQueue.length : 0,
+    activeProjectCount: (Array.isArray(world?.projects) ? world.projects : [])
+      .filter((project) => project?.townId === townId && project?.status === 'active')
+      .length,
+    factions: factionIds,
+    executionCounts,
+    recentChronicle: chronicleRecords.slice(0, 5),
+    recentHistory: historyRecords.slice(0, 5)
+  }
+}
+
+function buildFactionHistorySummary(world, chronicleRecords, historyRecords, factionId) {
+  const factionState = isPlainObject(world?.factions?.[factionId]) ? world.factions[factionId] : null
+  const towns = Array.isArray(factionState?.towns)
+    ? factionState.towns
+      .map((entry) => asText(entry, 80))
+      .filter(Boolean)
+      .sort((left, right) => left.localeCompare(right))
+    : []
+  return {
+    type: 'faction-history-summary.v1',
+    schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
+    factionId,
+    towns,
+    chronicleCount: chronicleRecords.length,
+    historyCount: historyRecords.length,
+    lastChronicleAt: chronicleRecords[0]?.at ?? null,
+    lastHistoryAt: historyRecords[0]?.at ?? null,
+    hostilityToPlayer: Number.isFinite(Number(factionState?.hostilityToPlayer))
+      ? Number(factionState.hostilityToPlayer)
+      : null,
+    stability: Number.isFinite(Number(factionState?.stability))
+      ? Number(factionState.stability)
+      : null,
+    doctrine: asText(factionState?.doctrine, 240) || null,
+    rivals: Array.isArray(factionState?.rivals)
+      ? factionState.rivals.map((entry) => asText(entry, 80)).filter(Boolean).sort((left, right) => left.localeCompare(right))
+      : [],
+    recentChronicle: chronicleRecords.slice(0, 5),
+    recentHistory: historyRecords.slice(0, 5)
   }
 }
 
@@ -212,6 +582,9 @@ function validatePersistenceBackend(backend) {
     && typeof backend.markPendingExecutionProgress === 'function'
     && typeof backend.clearPendingExecution === 'function'
     && typeof backend.recordResult === 'function'
+    && typeof backend.syncWorldMemoryFromSnapshot === 'function'
+    && typeof backend.listChronicleRecords === 'function'
+    && typeof backend.listHistoryRecords === 'function'
   )
 }
 
@@ -403,15 +776,38 @@ function createMemoryExecutionPersistence({ memoryStore, logger } = {}) {
     return receipt
   }
 
+  function syncWorldMemoryFromSnapshot(world) {
+    return {
+      backend: 'memory',
+      chronicleCount: buildChronicleRecordsFromWorld(world).length
+    }
+  }
+
+  function listChronicleRecords(query = {}) {
+    const world = memoryStore.recallWorld()
+    return buildChronicleRecordsFromWorld(world)
+      .filter((record) => matchesChronicleRecord(record, query))
+      .slice(0, normalizeQueryLimit(query.limit))
+  }
+
+  function listHistoryRecords(query = {}) {
+    const world = memoryStore.recallWorld()
+    const execution = ensureExecutionState(world)
+    return buildHistoryRecords(execution.history, execution.eventLedger, query)
+  }
+
   return {
     backendName: 'memory',
     findPendingExecution,
     findReceipt,
     listPendingExecutions,
+    listChronicleRecords,
+    listHistoryRecords,
     markPendingExecutionProgress,
     recordResult,
     clearPendingExecution,
-    stagePendingExecution
+    stagePendingExecution,
+    syncWorldMemoryFromSnapshot
   }
 }
 
@@ -527,6 +923,21 @@ function createSqliteExecutionPersistence(options = {}) {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_execution_event_ledger_handoff ON execution_event_ledger(handoff_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS world_chronicle_records (
+        record_id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL UNIQUE,
+        entry_type TEXT NOT NULL,
+        town_id TEXT,
+        faction_id TEXT,
+        at INTEGER NOT NULL,
+        message TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_world_chronicle_records_at ON world_chronicle_records(at DESC, record_id DESC);
+      CREATE INDEX IF NOT EXISTS idx_world_chronicle_records_town ON world_chronicle_records(town_id, at DESC);
+      CREATE INDEX IF NOT EXISTS idx_world_chronicle_records_faction ON world_chronicle_records(faction_id, at DESC);
     `)
 
     initialized = true
@@ -776,16 +1187,120 @@ function createSqliteExecutionPersistence(options = {}) {
     return receipt
   }
 
+  function syncWorldMemoryFromSnapshot(world) {
+    ensureInitialized()
+    const records = buildChronicleRecordsFromWorld(world)
+    const timestamp = Math.trunc(now())
+    const statements = [
+      'BEGIN IMMEDIATE;',
+      'DELETE FROM world_chronicle_records;'
+    ]
+    for (const record of records) {
+      statements.push(`
+        INSERT OR REPLACE INTO world_chronicle_records (
+          record_id,
+          source_id,
+          entry_type,
+          town_id,
+          faction_id,
+          at,
+          message,
+          payload_json,
+          created_at,
+          updated_at
+        ) VALUES (
+          ${sqlValue(record.recordId)},
+          ${sqlValue(record.sourceId)},
+          ${sqlValue(record.entryType)},
+          ${sqlValue(record.townId)},
+          ${sqlValue(record.factionId)},
+          ${sqlValue(record.at)},
+          ${sqlValue(record.message)},
+          ${sqlValue(JSON.stringify(record))},
+          ${sqlValue(timestamp)},
+          ${sqlValue(timestamp)}
+        );
+      `)
+    }
+    statements.push('COMMIT;')
+    runSql(statements.join('\n'))
+
+    safeLogger.info('execution_store_world_memory_synced', {
+      backend: 'sqlite',
+      chronicleCount: records.length,
+      dbPath
+    })
+
+    return {
+      backend: 'sqlite',
+      chronicleCount: records.length
+    }
+  }
+
+  function listChronicleRecords(query = {}) {
+    ensureInitialized()
+    const safeTownId = asText(query?.townId, 80)
+    const safeFactionId = asText(query?.factionId, 80)
+    const safeEntryType = asText(query?.entryType, 80)
+    const safeSearch = asText(query?.search, 120).toLowerCase()
+    const clauses = []
+    if (safeTownId) clauses.push(`town_id = ${sqlValue(safeTownId)}`)
+    if (safeFactionId) clauses.push(`faction_id = ${sqlValue(safeFactionId)}`)
+    if (safeEntryType) clauses.push(`entry_type = ${sqlValue(safeEntryType)}`)
+    if (safeSearch) {
+      const likeValue = `%${safeSearch.replace(/[%_]/g, '')}%`
+      clauses.push(`(
+        LOWER(message) LIKE ${sqlValue(likeValue)}
+        OR LOWER(entry_type) LIKE ${sqlValue(likeValue)}
+        OR LOWER(COALESCE(town_id, '')) LIKE ${sqlValue(likeValue)}
+        OR LOWER(COALESCE(faction_id, '')) LIKE ${sqlValue(likeValue)}
+      )`)
+    }
+    const rows = runSql(`
+      SELECT payload_json
+      FROM world_chronicle_records
+      ${clauses.length > 0 ? `WHERE ${clauses.join(' AND ')}` : ''}
+      ORDER BY at DESC, record_id DESC
+      LIMIT ${sqlValue(normalizeQueryLimit(query.limit))};
+    `, { json: true })
+
+    return rows
+      .map((row) => cloneValue(JSON.parse(row.payload_json)))
+      .filter((record) => matchesChronicleRecord(record, query))
+      .sort(compareRecordsDesc)
+      .slice(0, normalizeQueryLimit(query.limit))
+  }
+
+  function listHistoryRecords(query = {}) {
+    ensureInitialized()
+    const receiptRows = runSql(`
+      SELECT payload_json
+      FROM execution_receipts
+      ORDER BY created_at DESC;
+    `, { json: true })
+    const ledgerRows = runSql(`
+      SELECT payload_json
+      FROM execution_event_ledger
+      ORDER BY created_at DESC;
+    `, { json: true })
+    const receipts = receiptRows.map((row) => cloneValue(JSON.parse(row.payload_json)))
+    const ledgerEntries = ledgerRows.map((row) => cloneValue(JSON.parse(row.payload_json)))
+    return buildHistoryRecords(receipts, ledgerEntries, query)
+  }
+
   return {
     backendName: 'sqlite',
     clearPendingExecution,
     findPendingExecution,
     findReceipt,
     initialize: ensureInitialized,
+    listChronicleRecords,
+    listHistoryRecords,
     listPendingExecutions,
     markPendingExecutionProgress,
     recordResult,
-    stagePendingExecution
+    stagePendingExecution,
+    syncWorldMemoryFromSnapshot
   }
 }
 
@@ -852,6 +1367,83 @@ function createExecutionStore({
     resolvedBackend.initialize()
   }
 
+  function syncWorldMemory() {
+    return resolvedBackend.syncWorldMemoryFromSnapshot(memoryStore.recallWorld())
+  }
+
+  function listChronicleRecords(query = {}) {
+    syncWorldMemory()
+    return resolvedBackend.listChronicleRecords(query || {})
+  }
+
+  function listHistoryRecords(query = {}) {
+    return resolvedBackend.listHistoryRecords(query || {})
+  }
+
+  function getTownHistorySummary({ townId, chronicleLimit = 5, historyLimit = 5 } = {}) {
+    const safeTownId = asText(townId, 80)
+    if (!safeTownId) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_INVALID_WORLD_MEMORY_QUERY',
+        message: 'townId is required.',
+        recoverable: false
+      })
+    }
+    const world = memoryStore.recallWorld()
+    syncWorldMemory()
+    const chronicleRecords = resolvedBackend.listChronicleRecords({
+      townId: safeTownId,
+      limit: MAX_WORLD_MEMORY_QUERY_LIMIT
+    })
+    const historyRecords = resolvedBackend.listHistoryRecords({
+      townId: safeTownId,
+      limit: MAX_EXECUTION_HISTORY_ENTRIES + MAX_EXECUTION_EVENT_LEDGER_ENTRIES
+    })
+    const summary = buildTownHistorySummary(world, chronicleRecords, historyRecords, safeTownId)
+    summary.recentChronicle = chronicleRecords.slice(0, normalizeQueryLimit(chronicleLimit, 5, 20))
+    summary.recentHistory = historyRecords.slice(0, normalizeQueryLimit(historyLimit, 5, 20))
+    return summary
+  }
+
+  function getFactionHistorySummary({ factionId, chronicleLimit = 5, historyLimit = 5 } = {}) {
+    const safeFactionId = asText(factionId, 80)
+    if (!safeFactionId) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_INVALID_WORLD_MEMORY_QUERY',
+        message: 'factionId is required.',
+        recoverable: false
+      })
+    }
+    const world = memoryStore.recallWorld()
+    const faction = isPlainObject(world?.factions?.[safeFactionId]) ? world.factions[safeFactionId] : null
+    const towns = Array.isArray(faction?.towns)
+      ? faction.towns.map((entry) => asText(entry, 80)).filter(Boolean)
+      : []
+    syncWorldMemory()
+    const chronicleRecords = resolvedBackend.listChronicleRecords({
+      factionId: safeFactionId,
+      limit: MAX_WORLD_MEMORY_QUERY_LIMIT
+    })
+    const townChronicleRecords = towns.flatMap((townId) => resolvedBackend.listChronicleRecords({
+      townId,
+      limit: MAX_WORLD_MEMORY_QUERY_LIMIT
+    }))
+    const mergedChronicleRecords = Array.from(new Map(
+      [...chronicleRecords, ...townChronicleRecords].map((record) => [record.recordId, record])
+    ).values()).sort(compareRecordsDesc)
+    const townHistoryRecords = towns.flatMap((townId) => resolvedBackend.listHistoryRecords({
+      townId,
+      limit: MAX_EXECUTION_HISTORY_ENTRIES + MAX_EXECUTION_EVENT_LEDGER_ENTRIES
+    }))
+    const mergedHistoryRecords = Array.from(new Map(
+      townHistoryRecords.map((record) => [record.recordId, record])
+    ).values()).sort(compareRecordsDesc)
+    const summary = buildFactionHistorySummary(world, mergedChronicleRecords, mergedHistoryRecords, safeFactionId)
+    summary.recentChronicle = mergedChronicleRecords.slice(0, normalizeQueryLimit(chronicleLimit, 5, 20))
+    summary.recentHistory = mergedHistoryRecords.slice(0, normalizeQueryLimit(historyLimit, 5, 20))
+    return summary
+  }
+
   return {
     backendName: resolvedBackend.backendName || asText(backend, 40) || 'memory',
     findPendingExecution(input) {
@@ -863,9 +1455,14 @@ function createExecutionStore({
     listPendingExecutions() {
       return resolvedBackend.listPendingExecutions()
     },
+    listChronicleRecords,
+    listHistoryRecords,
     readSnapshotSource() {
       return memoryStore.recallWorld()
     },
+    syncWorldMemory,
+    getTownHistorySummary,
+    getFactionHistorySummary,
     async stagePendingExecution(input) {
       return resolvedBackend.stagePendingExecution(input || {})
     },
