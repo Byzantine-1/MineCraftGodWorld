@@ -14,7 +14,11 @@ const {
 } = require('../src/executionStore')
 const { createGodCommandService } = require('../src/godCommands')
 const { createMemoryStore } = require('../src/memory')
-const { createWorldMemoryContext } = require('../src/worldMemoryContext')
+const {
+  createWorldMemoryContextForRequest,
+  createWorldMemoryRequest,
+  parseWorldMemoryRequestLine
+} = require('../src/worldMemoryContext')
 const { createAuthoritativeSnapshotProjection } = require('../src/worldSnapshotProjection')
 
 function createTempPaths(prefix) {
@@ -306,6 +310,28 @@ test('world memory chronicle queries return stable ordered records for memory ba
   assert.deepEqual(searchMatches.map((record) => record.recordId), ['chronicle:c_alpha_01'])
 })
 
+test('world memory request parsing recognizes canonical bounded JSON lines', () => {
+  const request = createWorldMemoryRequest({
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 2,
+    historyLimit: 3
+  })
+
+  assert.equal(parseWorldMemoryRequestLine('talk mara hello'), null)
+  assert.deepEqual(parseWorldMemoryRequestLine(JSON.stringify(request)), request)
+  assert.equal(parseWorldMemoryRequestLine(JSON.stringify({
+    type: 'world-memory-request.v1',
+    schemaVersion: 1,
+    scope: {
+      townId: 'alpha',
+      factionId: null,
+      chronicleLimit: 9,
+      historyLimit: 3
+    }
+  })), null)
+})
+
 test('world memory history and summaries are queryable through the store boundary', async () => {
   const context = createStoreContext('memory')
   const { executed, stale } = await seedWorldMemory(context)
@@ -408,12 +434,15 @@ test('world memory context keeps retrieval ordering stable and bounded', async (
   const context = createStoreContext('memory')
   await seedWorldMemory(context)
 
-  const worldMemoryContext = createWorldMemoryContext({
-    executionStore: context.executionStore,
+  const request = createWorldMemoryRequest({
     townId: 'alpha',
     factionId: 'iron_pact',
     chronicleLimit: 1,
     historyLimit: 2
+  })
+  const worldMemoryContext = createWorldMemoryContextForRequest({
+    executionStore: context.executionStore,
+    request
   })
 
   assert.deepEqual(worldMemoryContext.scope, {
@@ -447,19 +476,19 @@ test('world memory context shape stays aligned between memory and sqlite backend
   await seedWorldMemory(memoryContext)
   await seedWorldMemory(sqliteContext)
 
-  const memoryWorldMemory = createWorldMemoryContext({
-    executionStore: memoryContext.executionStore,
+  const request = createWorldMemoryRequest({
     townId: 'alpha',
     factionId: 'iron_pact',
     chronicleLimit: 3,
     historyLimit: 4
   })
-  const sqliteWorldMemory = createWorldMemoryContext({
+  const memoryWorldMemory = createWorldMemoryContextForRequest({
+    executionStore: memoryContext.executionStore,
+    request
+  })
+  const sqliteWorldMemory = createWorldMemoryContextForRequest({
     executionStore: sqliteContext.executionStore,
-    townId: 'alpha',
-    factionId: 'iron_pact',
-    chronicleLimit: 3,
-    historyLimit: 4
+    request
   })
 
   assert.deepEqual(

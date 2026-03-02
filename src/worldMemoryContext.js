@@ -1,3 +1,5 @@
+const WORLD_MEMORY_REQUEST_TYPE = 'world-memory-request.v1'
+const WORLD_MEMORY_REQUEST_SCHEMA_VERSION = 1
 const WORLD_MEMORY_CONTEXT_TYPE = 'world-memory-context.v1'
 const WORLD_MEMORY_CONTEXT_SCHEMA_VERSION = 1
 const MAX_CONTEXT_CHRONICLE_RECORDS = 5
@@ -37,6 +39,43 @@ function normalizeStringList(values, maxEntries = 12, maxLen = 80) {
     .slice(0, maxEntries)
 }
 
+function isValidScopeField(value) {
+  return value === null || (typeof value === 'string' && value.trim().length > 0)
+}
+
+function isValidLimit(value, maxValue) {
+  return Number.isInteger(value) && value >= 1 && value <= maxValue
+}
+
+function hasOnlyKeys(value, expectedKeys) {
+  return Object.keys(value).every((key) => expectedKeys.includes(key))
+}
+
+function normalizeWorldMemoryScope({
+  townId,
+  factionId,
+  chronicleLimit,
+  historyLimit
+} = {}) {
+  return {
+    townId: asText(townId, 80) || null,
+    factionId: asText(factionId, 80) || null,
+    chronicleLimit: normalizeLimit(chronicleLimit, 3, MAX_CONTEXT_CHRONICLE_RECORDS),
+    historyLimit: normalizeLimit(historyLimit, 4, MAX_CONTEXT_HISTORY_RECORDS)
+  }
+}
+
+function isValidWorldMemoryScope(scope) {
+  return Boolean(
+    isPlainObject(scope) &&
+    hasOnlyKeys(scope, ['townId', 'factionId', 'chronicleLimit', 'historyLimit']) &&
+    isValidScopeField(scope.townId) &&
+    isValidScopeField(scope.factionId) &&
+    isValidLimit(scope.chronicleLimit, MAX_CONTEXT_CHRONICLE_RECORDS) &&
+    isValidLimit(scope.historyLimit, MAX_CONTEXT_HISTORY_RECORDS)
+  )
+}
+
 function normalizeExecutionCounts(value) {
   const source = isPlainObject(value) ? value : {}
   return {
@@ -46,6 +85,62 @@ function normalizeExecutionCounts(value) {
     duplicate: Number(source.duplicate) || 0,
     failed: Number(source.failed) || 0
   }
+}
+
+function createWorldMemoryRequest({
+  townId,
+  factionId,
+  chronicleLimit,
+  historyLimit
+} = {}) {
+  return {
+    type: WORLD_MEMORY_REQUEST_TYPE,
+    schemaVersion: WORLD_MEMORY_REQUEST_SCHEMA_VERSION,
+    scope: normalizeWorldMemoryScope({
+      townId,
+      factionId,
+      chronicleLimit,
+      historyLimit
+    })
+  }
+}
+
+function isValidWorldMemoryRequest(request) {
+  return Boolean(
+    isPlainObject(request) &&
+    hasOnlyKeys(request, ['type', 'schemaVersion', 'scope']) &&
+    request.type === WORLD_MEMORY_REQUEST_TYPE &&
+    request.schemaVersion === WORLD_MEMORY_REQUEST_SCHEMA_VERSION &&
+    isValidWorldMemoryScope(request.scope)
+  )
+}
+
+function parseWorldMemoryRequestLine(line) {
+  if (typeof line !== 'string') {
+    return null
+  }
+
+  const trimmed = line.trim()
+  if (!trimmed.startsWith('{')) {
+    return null
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(trimmed)
+  } catch {
+    return null
+  }
+
+  if (parsed?.type !== WORLD_MEMORY_REQUEST_TYPE) {
+    return null
+  }
+
+  if (!isValidWorldMemoryRequest(parsed)) {
+    return null
+  }
+
+  return createWorldMemoryRequest(parsed.scope)
 }
 
 function projectChronicleRecord(record) {
@@ -150,10 +245,16 @@ function createScopedSelection(executionStore, {
   chronicleLimit,
   historyLimit
 }) {
-  const safeTownId = asText(townId, 80) || null
-  const safeFactionId = asText(factionId, 80) || null
-  const normalizedChronicleLimit = normalizeLimit(chronicleLimit, 3, MAX_CONTEXT_CHRONICLE_RECORDS)
-  const normalizedHistoryLimit = normalizeLimit(historyLimit, 4, MAX_CONTEXT_HISTORY_RECORDS)
+  const scope = normalizeWorldMemoryScope({
+    townId,
+    factionId,
+    chronicleLimit,
+    historyLimit
+  })
+  const safeTownId = scope.townId
+  const safeFactionId = scope.factionId
+  const normalizedChronicleLimit = scope.chronicleLimit
+  const normalizedHistoryLimit = scope.historyLimit
 
   const townSummary = safeTownId
     ? executionStore.getTownHistorySummary({
@@ -193,12 +294,7 @@ function createScopedSelection(executionStore, {
   }
 
   return {
-    scope: {
-      townId: safeTownId,
-      factionId: safeFactionId,
-      chronicleLimit: normalizedChronicleLimit,
-      historyLimit: normalizedHistoryLimit
-    },
+    scope,
     recentChronicle: normalizeChronicleSelection(chronicleRecords, normalizedChronicleLimit),
     recentHistory: normalizeHistorySelection(historyRecords, normalizedHistoryLimit),
     townSummary: projectTownSummary(townSummary),
@@ -241,10 +337,30 @@ function createWorldMemoryContext({
   })
 }
 
+function createWorldMemoryContextForRequest({
+  executionStore,
+  request
+} = {}) {
+  if (!isValidWorldMemoryRequest(request)) {
+    throw new Error('Invalid world memory request')
+  }
+
+  return createWorldMemoryContext({
+    executionStore,
+    ...request.scope
+  })
+}
+
 module.exports = {
   MAX_CONTEXT_CHRONICLE_RECORDS,
   MAX_CONTEXT_HISTORY_RECORDS,
   WORLD_MEMORY_CONTEXT_SCHEMA_VERSION,
   WORLD_MEMORY_CONTEXT_TYPE,
-  createWorldMemoryContext
+  WORLD_MEMORY_REQUEST_SCHEMA_VERSION,
+  WORLD_MEMORY_REQUEST_TYPE,
+  createWorldMemoryContext,
+  createWorldMemoryContextForRequest,
+  createWorldMemoryRequest,
+  isValidWorldMemoryRequest,
+  parseWorldMemoryRequestLine
 }

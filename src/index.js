@@ -12,6 +12,7 @@ const { createTurnEngine } = require('./turnEngine')
 const { createGodCommandService } = require('./godCommands')
 const { createExecutionAdapter, parseExecutionHandoffLine } = require('./executionAdapter')
 const { createExecutionStore, createExecutionPersistenceBackend } = require('./executionStore')
+const { createWorldMemoryContextForRequest, parseWorldMemoryRequestLine } = require('./worldMemoryContext')
 const { parseCliInput } = require('./commandParsers')
 const { createLogger } = require('./logger')
 const { installCrashHandlers } = require('./crashHandlers')
@@ -229,6 +230,7 @@ writeLine('--- WORLD ONLINE ---')
 writeLine('Commands:')
 writeLine(' talk <agent> <message>')
 writeLine(' god <command>')
+writeLine(' {"type":"world-memory-request.v1","schemaVersion":1,...}')
 writeLine(' {"schemaVersion":"execution-handoff.v1",...}')
 writeLine(' exit')
 writeLine('---------------------')
@@ -239,6 +241,20 @@ rl.prompt()
  */
 async function handleLine(rawInput) {
   await startupExecutionRecovery
+
+  const worldMemoryRequest = parseWorldMemoryRequestLine(rawInput)
+  if (worldMemoryRequest) {
+    const worldMemoryContext = createWorldMemoryContextForRequest({
+      executionStore,
+      request: worldMemoryRequest
+    })
+    writeLine(JSON.stringify(worldMemoryContext), {
+      schema: worldMemoryContext.type,
+      townId: worldMemoryContext.scope.townId || undefined,
+      factionId: worldMemoryContext.scope.factionId || undefined
+    })
+    return
+  }
 
   const handoff = parseExecutionHandoffLine(rawInput)
   if (handoff) {
