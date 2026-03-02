@@ -1,6 +1,8 @@
 const { createHash } = require('crypto')
 
 const { AppError } = require('./errors')
+const { createExecutionStore } = require('./executionStore')
+const { createAuthoritativeSnapshotProjection } = require('./worldSnapshotProjection')
 
 const EXECUTION_HANDOFF_SCHEMA = 'execution-handoff.v1'
 const EXECUTION_RESULT_TYPE = 'execution-result.v1'
@@ -424,7 +426,7 @@ function createPreconditionEvaluation(failures) {
   }
 }
 
-function createDuplicateEvaluation(handoff) {
+function createDuplicateEvaluation({ actualSnapshotHash, actualDecisionEpoch, duplicateOf }) {
   return {
     preconditions: {
       evaluated: false,
@@ -434,22 +436,23 @@ function createDuplicateEvaluation(handoff) {
     staleCheck: {
       evaluated: false,
       passed: false,
-      actualSnapshotHash: null,
-      actualDecisionEpoch: null
+      actualSnapshotHash: actualSnapshotHash || null,
+      actualDecisionEpoch: Number.isInteger(actualDecisionEpoch) ? actualDecisionEpoch : null
     },
     duplicateCheck: {
       evaluated: true,
       duplicate: true,
-      duplicateOf: handoff.handoffId
+      duplicateOf: duplicateOf || null
     }
   }
 }
 
-function createWorldState(world) {
-  const day = Number(world?.clock?.day)
+function createWorldStateFromProjection(projection) {
   return {
-    postExecutionSnapshotHash: null,
-    postExecutionDecisionEpoch: Number.isInteger(day) && day >= 0 ? day : null
+    postExecutionSnapshotHash: projection?.snapshotHash || null,
+    postExecutionDecisionEpoch: Number.isInteger(projection?.decisionEpoch) && projection.decisionEpoch >= 0
+      ? projection.decisionEpoch
+      : null
   }
 }
 
@@ -470,6 +473,12 @@ function createExecutionAdapter(deps) {
   }
 
   const logger = deps.logger || { info: () => {}, warn: () => {} }
+  const executionStore = deps.executionStore || createExecutionStore({
+    memoryStore: deps.memoryStore,
+    logger: typeof logger.child === 'function'
+      ? logger.child({ subsystem: 'execution_store' })
+      : logger
+  })
   const townIdAliases = normalizeStringMap(deps.townIdAliases)
   const salvageFocusMap = {
     ...DEFAULT_SALVAGE_FOCUS_MAP,
@@ -478,6 +487,19 @@ function createExecutionAdapter(deps) {
   const talkTypeMap = {
     ...DEFAULT_TALK_TYPE_MAP,
     ...normalizeStringMap(deps.talkTypeMap)
+  }
+
+  if (
+    !executionStore
+    || typeof executionStore.findReceipt !== 'function'
+    || typeof executionStore.readSnapshotSource !== 'function'
+    || typeof executionStore.recordResult !== 'function'
+  ) {
+    throw new AppError({
+      code: 'EXECUTION_ADAPTER_CONFIG_ERROR',
+      message: 'executionStore dependency is required.',
+      recoverable: false
+    })
   }
 
   function resolveTownId(townId) {
@@ -497,20 +519,51 @@ function createExecutionAdapter(deps) {
       })
     }
 
-    const beforeWorld = deps.memoryStore.recallWorld()
-    const authoritativeDay = Number(beforeWorld?.clock?.day)
-    const actualDecisionEpoch = Number.isInteger(authoritativeDay) && authoritativeDay >= 0
-      ? authoritativeDay
-      : null
+    const beforeWorld = executionStore.readSnapshotSource()
+    const beforeProjection = createAuthoritativeSnapshotProjection(beforeWorld)
+    const actualDecisionEpoch = beforeProjection.decisionEpoch
+    const actualSnapshotHash = beforeProjection.snapshotHash
     const translation = createTranslation(handoff, beforeWorld, {
       resolveTownId,
       salvageFocusMap,
       talkTypeMap
     })
-    const stale = actualDecisionEpoch !== handoff.decisionEpoch
+    const existingReceipt = executionStore.findReceipt({
+      handoffId: handoff.handoffId,
+      idempotencyKey: handoff.idempotencyKey
+    })
 
-    if (stale) {
-      return createExecutionResult({
+    if (existingReceipt) {
+      const duplicateResult = createExecutionResult({
+        handoff,
+        proposalType: translation.proposalType,
+        actorId: translation.actorId,
+        townId: translation.townId,
+        authorityCommands: translation.authorityCommands,
+        status: 'duplicate',
+        accepted: false,
+        executed: false,
+        reasonCode: 'DUPLICATE_HANDOFF',
+        evaluation: createDuplicateEvaluation({
+          actualSnapshotHash,
+          actualDecisionEpoch,
+          duplicateOf: existingReceipt.executionId || existingReceipt.handoffId || null
+        }),
+        worldState: createWorldStateFromProjection(beforeProjection)
+      })
+      await executionStore.recordResult(duplicateResult, {
+        kind: 'duplicate_replayed',
+        persistReceipt: false
+      })
+      return duplicateResult
+    }
+
+    const staleReasonCode = actualDecisionEpoch !== handoff.decisionEpoch
+      ? 'STALE_DECISION_EPOCH'
+      : (actualSnapshotHash !== handoff.snapshotHash ? 'STALE_SNAPSHOT_HASH' : null)
+
+    if (staleReasonCode) {
+      const staleResult = createExecutionResult({
         handoff,
         proposalType: translation.proposalType,
         actorId: translation.actorId,
@@ -519,7 +572,7 @@ function createExecutionAdapter(deps) {
         status: 'stale',
         accepted: false,
         executed: false,
-        reasonCode: 'STALE_DECISION_EPOCH',
+        reasonCode: staleReasonCode,
         evaluation: {
           preconditions: {
             evaluated: false,
@@ -529,7 +582,7 @@ function createExecutionAdapter(deps) {
           staleCheck: {
             evaluated: true,
             passed: false,
-            actualSnapshotHash: null,
+            actualSnapshotHash,
             actualDecisionEpoch
           },
           duplicateCheck: {
@@ -537,12 +590,15 @@ function createExecutionAdapter(deps) {
             duplicate: false,
             duplicateOf: null
           }
-        }
+        },
+        worldState: createWorldStateFromProjection(beforeProjection)
       })
+      await executionStore.recordResult(staleResult)
+      return staleResult
     }
 
     if (translation.failures.length > 0) {
-      return createExecutionResult({
+      const rejectedResult = createExecutionResult({
         handoff,
         proposalType: translation.proposalType,
         actorId: translation.actorId,
@@ -557,7 +613,7 @@ function createExecutionAdapter(deps) {
           staleCheck: {
             evaluated: true,
             passed: true,
-            actualSnapshotHash: null,
+            actualSnapshotHash,
             actualDecisionEpoch
           },
           duplicateCheck: {
@@ -565,8 +621,11 @@ function createExecutionAdapter(deps) {
             duplicate: false,
             duplicateOf: null
           }
-        }
+        },
+        worldState: createWorldStateFromProjection(beforeProjection)
       })
+      await executionStore.recordResult(rejectedResult)
+      return rejectedResult
     }
 
     let accepted = false
@@ -582,7 +641,13 @@ function createExecutionAdapter(deps) {
       if (!stepResult.applied) {
         const reasonCode = classifyEngineReason(stepResult.reason)
         if (reasonCode === 'DUPLICATE_HANDOFF') {
-          return createExecutionResult({
+          const currentWorld = executionStore.readSnapshotSource()
+          const currentProjection = createAuthoritativeSnapshotProjection(currentWorld)
+          const duplicateReceipt = executionStore.findReceipt({
+            handoffId: handoff.handoffId,
+            idempotencyKey: handoff.idempotencyKey
+          })
+          const duplicateResult = createExecutionResult({
             handoff,
             proposalType: translation.proposalType,
             actorId: translation.actorId,
@@ -592,8 +657,18 @@ function createExecutionAdapter(deps) {
             accepted: false,
             executed: false,
             reasonCode,
-            evaluation: createDuplicateEvaluation(handoff)
+            evaluation: createDuplicateEvaluation({
+              actualSnapshotHash: currentProjection.snapshotHash,
+              actualDecisionEpoch: currentProjection.decisionEpoch,
+              duplicateOf: duplicateReceipt?.executionId || handoff.handoffId
+            }),
+            worldState: createWorldStateFromProjection(currentProjection)
           })
+          await executionStore.recordResult(duplicateResult, {
+            kind: 'duplicate_step_replayed',
+            persistReceipt: false
+          })
+          return duplicateResult
         }
 
         logger.warn('execution_adapter_step_rejected', {
@@ -602,7 +677,9 @@ function createExecutionAdapter(deps) {
           reason: stepResult.reason || null
         })
 
-        return createExecutionResult({
+        const currentWorld = executionStore.readSnapshotSource()
+        const currentProjection = createAuthoritativeSnapshotProjection(currentWorld)
+        const rejectedResult = createExecutionResult({
           handoff,
           proposalType: translation.proposalType,
           actorId: translation.actorId,
@@ -623,7 +700,7 @@ function createExecutionAdapter(deps) {
             staleCheck: {
               evaluated: true,
               passed: true,
-              actualSnapshotHash: null,
+              actualSnapshotHash,
               actualDecisionEpoch
             },
             duplicateCheck: {
@@ -632,14 +709,17 @@ function createExecutionAdapter(deps) {
               duplicateOf: null
             }
           },
-          ...(accepted ? { worldState: createWorldState(deps.memoryStore.recallWorld()) } : {})
+          worldState: createWorldStateFromProjection(currentProjection)
         })
+        await executionStore.recordResult(rejectedResult)
+        return rejectedResult
       }
 
       accepted = true
     }
 
-    const afterWorld = deps.memoryStore.recallWorld()
+    const afterWorld = executionStore.readSnapshotSource()
+    const afterProjection = createAuthoritativeSnapshotProjection(afterWorld)
     const result = createExecutionResult({
       handoff,
       proposalType: translation.proposalType,
@@ -655,7 +735,7 @@ function createExecutionAdapter(deps) {
         staleCheck: {
           evaluated: true,
           passed: true,
-          actualSnapshotHash: null,
+          actualSnapshotHash,
           actualDecisionEpoch
         },
         duplicateCheck: {
@@ -664,8 +744,9 @@ function createExecutionAdapter(deps) {
           duplicateOf: null
         }
       },
-      worldState: createWorldState(afterWorld)
+      worldState: createWorldStateFromProjection(afterProjection)
     })
+    await executionStore.recordResult(result)
 
     logger.info('execution_adapter_handoff_executed', {
       handoffId: handoff.handoffId,

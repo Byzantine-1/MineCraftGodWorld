@@ -342,10 +342,14 @@ const MAX_TOWNSFOLK_QUESTS_PER_TOWN = 24
 const MAX_NETHER_EVENT_LEDGER_ENTRIES = 120
 const MAX_NETHER_EVENT_PAYLOAD_KEYS = 10
 const MAX_TOWN_RECENT_IMPACTS = 30
+const MAX_EXECUTION_AUTHORITY_COMMANDS = 12
+const MAX_EXECUTION_HISTORY_ENTRIES = 512
+const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
 const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
+const EXECUTION_RESULT_STATUSES = new Set(['executed', 'rejected', 'stale', 'duplicate', 'failed'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
   'nether_event',
   'mission_complete',
@@ -1681,6 +1685,155 @@ function normalizeTownsShape(townsInput) {
 }
 
 /**
+ * @param {unknown} commandsInput
+ */
+function normalizeExecutionAuthorityCommands(commandsInput) {
+  const commands = []
+  for (const rawCommand of (Array.isArray(commandsInput) ? commandsInput : [])) {
+    const command = asText(rawCommand, '', 240)
+    if (!command) continue
+    commands.push(command)
+    if (commands.length >= MAX_EXECUTION_AUTHORITY_COMMANDS) break
+  }
+  return commands
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeNullableExecutionHash(value) {
+  const hash = asText(value, '', 64)
+  return hash || null
+}
+
+/**
+ * @param {unknown} value
+ */
+function normalizeNullableExecutionDay(value) {
+  const day = Number(value)
+  if (!Number.isInteger(day) || day < 0) return null
+  return day
+}
+
+/**
+ * @param {unknown} entryInput
+ */
+function normalizeExecutionHistoryEntryShape(entryInput) {
+  if (!entryInput || typeof entryInput !== 'object' || Array.isArray(entryInput)) return null
+  const type = asText(entryInput.type, '', 80)
+  const schemaVersion = Number(entryInput.schemaVersion)
+  const executionId = asText(entryInput.executionId, '', 200)
+  const resultId = asText(entryInput.resultId, '', 200)
+  const handoffId = asText(entryInput.handoffId, '', 200)
+  const proposalId = asText(entryInput.proposalId, '', 200)
+  const idempotencyKey = asText(entryInput.idempotencyKey, '', 200)
+  const actorId = asText(entryInput.actorId, '', 80)
+  const townId = asText(entryInput.townId, '', 80)
+  const proposalType = asText(entryInput.proposalType, '', 80)
+  const command = asText(entryInput.command, '', 240)
+  const status = asText(entryInput.status, '', 40).toLowerCase()
+  const reasonCode = asText(entryInput.reasonCode, '', 80)
+
+  if (!type || !Number.isInteger(schemaVersion) || schemaVersion < 1) return null
+  if (!executionId || !resultId || !handoffId || !proposalId || !idempotencyKey) return null
+  if (!actorId || !townId || !proposalType || !command) return null
+  if (!EXECUTION_RESULT_STATUSES.has(status) || !reasonCode) return null
+
+  return {
+    type,
+    schemaVersion,
+    executionId,
+    resultId,
+    handoffId,
+    proposalId,
+    idempotencyKey,
+    actorId,
+    townId,
+    proposalType,
+    command,
+    authorityCommands: normalizeExecutionAuthorityCommands(entryInput.authorityCommands),
+    status,
+    accepted: entryInput.accepted === true,
+    executed: entryInput.executed === true,
+    reasonCode,
+    actualSnapshotHash: normalizeNullableExecutionHash(entryInput.actualSnapshotHash),
+    actualDecisionEpoch: normalizeNullableExecutionDay(entryInput.actualDecisionEpoch),
+    postExecutionSnapshotHash: normalizeNullableExecutionHash(entryInput.postExecutionSnapshotHash),
+    postExecutionDecisionEpoch: normalizeNullableExecutionDay(entryInput.postExecutionDecisionEpoch)
+  }
+}
+
+/**
+ * @param {unknown} historyInput
+ */
+function normalizeExecutionHistoryShape(historyInput) {
+  const history = (Array.isArray(historyInput) ? historyInput : [])
+    .map(normalizeExecutionHistoryEntryShape)
+    .filter(Boolean)
+  if (history.length > MAX_EXECUTION_HISTORY_ENTRIES) {
+    return history.slice(-MAX_EXECUTION_HISTORY_ENTRIES)
+  }
+  return history
+}
+
+/**
+ * @param {unknown} entryInput
+ */
+function normalizeExecutionEventLedgerEntryShape(entryInput) {
+  if (!entryInput || typeof entryInput !== 'object' || Array.isArray(entryInput)) return null
+  const id = asText(entryInput.id, '', 240)
+  const kind = asText(entryInput.kind, '', 80)
+  const handoffId = asText(entryInput.handoffId, '', 200)
+  const idempotencyKey = asText(entryInput.idempotencyKey, '', 200)
+  const status = asText(entryInput.status, '', 40).toLowerCase()
+  const reasonCode = asText(entryInput.reasonCode, '', 80)
+  const day = Number(entryInput.day)
+
+  if (!id || !kind || !handoffId || !idempotencyKey) return null
+  if (!EXECUTION_RESULT_STATUSES.has(status) || !reasonCode) return null
+  if (!Number.isInteger(day) || day < 0) return null
+
+  return {
+    id,
+    kind,
+    handoffId,
+    idempotencyKey,
+    executionId: asText(entryInput.executionId, '', 200) || null,
+    status,
+    reasonCode,
+    day,
+    actualSnapshotHash: normalizeNullableExecutionHash(entryInput.actualSnapshotHash),
+    postExecutionSnapshotHash: normalizeNullableExecutionHash(entryInput.postExecutionSnapshotHash)
+  }
+}
+
+/**
+ * @param {unknown} ledgerInput
+ */
+function normalizeExecutionEventLedgerShape(ledgerInput) {
+  const ledger = (Array.isArray(ledgerInput) ? ledgerInput : [])
+    .map(normalizeExecutionEventLedgerEntryShape)
+    .filter(Boolean)
+  if (ledger.length > MAX_EXECUTION_EVENT_LEDGER_ENTRIES) {
+    return ledger.slice(-MAX_EXECUTION_EVENT_LEDGER_ENTRIES)
+  }
+  return ledger
+}
+
+/**
+ * @param {unknown} executionInput
+ */
+function normalizeExecutionStateShape(executionInput) {
+  const source = (executionInput && typeof executionInput === 'object' && !Array.isArray(executionInput))
+    ? executionInput
+    : {}
+  return {
+    history: normalizeExecutionHistoryShape(source.history),
+    eventLedger: normalizeExecutionEventLedgerShape(source.eventLedger)
+  }
+}
+
+/**
  * @param {unknown} tag
  */
 function parseTownNameFromTag(tag) {
@@ -1804,6 +1957,7 @@ function freshMemoryShape(input) {
     salvageRuns: normalizeSalvageRunsShape(source.world?.salvageRuns),
     towns: normalizeTownsShape(source.world?.towns),
     nether: normalizeNetherShape(source.world?.nether, Number(source.world?.events?.seed)),
+    execution: normalizeExecutionStateShape(source.world?.execution),
     archive: Array.isArray(source.world?.archive) ? source.world.archive : [],
     processedEventIds: Array.isArray(source.world?.processedEventIds) ? source.world.processedEventIds : []
   }
@@ -2283,9 +2437,9 @@ function validateMemoryIntegritySnapshot(memory) {
   if (!world.nether || typeof world.nether !== 'object' || Array.isArray(world.nether)) {
     issues.push('world.nether must be an object.')
   } else {
-    if (!Array.isArray(world.nether.eventLedger)) {
-      issues.push('world.nether.eventLedger must be an array.')
-    } else {
+  if (!Array.isArray(world.nether.eventLedger)) {
+    issues.push('world.nether.eventLedger must be an array.')
+  } else {
       if (world.nether.eventLedger.length > MAX_NETHER_EVENT_LEDGER_ENTRIES) {
         issues.push(`world.nether.eventLedger exceeds max entries ${MAX_NETHER_EVENT_LEDGER_ENTRIES}.`)
       }
@@ -2343,6 +2497,45 @@ function validateMemoryIntegritySnapshot(memory) {
         } else {
           activeMissionByTown.set(key, normalizedMission.id)
         }
+      }
+    }
+  }
+
+  if (!world.execution || typeof world.execution !== 'object' || Array.isArray(world.execution)) {
+    issues.push('world.execution must be an object.')
+  } else {
+    if (!Array.isArray(world.execution.history)) {
+      issues.push('world.execution.history must be an array.')
+    } else {
+      if (world.execution.history.length > MAX_EXECUTION_HISTORY_ENTRIES) {
+        issues.push(`world.execution.history exceeds max entries ${MAX_EXECUTION_HISTORY_ENTRIES}.`)
+      }
+      for (const entry of world.execution.history) {
+        if (!normalizeExecutionHistoryEntryShape(entry)) {
+          issues.push('world.execution.history contains invalid entry.')
+          break
+        }
+      }
+    }
+
+    if (!Array.isArray(world.execution.eventLedger)) {
+      issues.push('world.execution.eventLedger must be an array.')
+    } else {
+      if (world.execution.eventLedger.length > MAX_EXECUTION_EVENT_LEDGER_ENTRIES) {
+        issues.push(`world.execution.eventLedger exceeds max entries ${MAX_EXECUTION_EVENT_LEDGER_ENTRIES}.`)
+      }
+      const seenExecutionLedgerIds = new Set()
+      for (const entry of world.execution.eventLedger) {
+        const normalizedEntry = normalizeExecutionEventLedgerEntryShape(entry)
+        if (!normalizedEntry) {
+          issues.push('world.execution.eventLedger contains invalid entry.')
+          break
+        }
+        const key = normalizedEntry.id.toLowerCase()
+        if (seenExecutionLedgerIds.has(key)) {
+          issues.push(`world.execution.eventLedger has duplicate id ${normalizedEntry.id}.`)
+        }
+        seenExecutionLedgerIds.add(key)
       }
     }
   }

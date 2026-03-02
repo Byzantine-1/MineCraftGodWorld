@@ -5,14 +5,18 @@ const path = require('path')
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { createExecutionAdapter, parseExecutionHandoffLine } = require('../src/executionAdapter')
+const { createExecutionAdapter, isValidExecutionResult, parseExecutionHandoffLine } = require('../src/executionAdapter')
 const { createGodCommandService } = require('../src/godCommands')
 const { createMemoryStore } = require('../src/memory')
+const { createAuthoritativeSnapshotProjection } = require('../src/worldSnapshotProjection')
 
-function createStore() {
+function createStoreContext() {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mvp-execution-adapter-'))
   const filePath = path.join(dir, 'memory.json')
-  return createMemoryStore({ filePath })
+  return {
+    filePath,
+    memoryStore: createMemoryStore({ filePath })
+  }
 }
 
 function createAgents() {
@@ -33,6 +37,7 @@ function createHandoff({
   townId = 'alpha',
   actorId = 'mara',
   decisionEpoch = 1,
+  snapshotHash = 'a'.repeat(64),
   preconditions = []
 }) {
   const proposalId = buildId('proposal', {
@@ -47,7 +52,6 @@ function createHandoff({
     proposalId,
     command
   })
-  const snapshotHash = 'a'.repeat(64)
 
   return {
     schemaVersion: 'execution-handoff.v1',
@@ -79,6 +83,10 @@ function createHandoff({
   }
 }
 
+function snapshotHashForStore(memoryStore) {
+  return createAuthoritativeSnapshotProjection(memoryStore.recallWorld()).snapshotHash
+}
+
 test('parseExecutionHandoffLine recognizes valid execution-handoff.v1 JSON lines', () => {
   const handoff = createHandoff({
     proposalType: 'PROJECT_ADVANCE',
@@ -91,7 +99,7 @@ test('parseExecutionHandoffLine recognizes valid execution-handoff.v1 JSON lines
 })
 
 test('execution adapter emits canonical executed results for direct project advancement', async () => {
-  const memoryStore = createStore()
+  const { memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })
   const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
   const agents = createAgents()
@@ -111,6 +119,7 @@ test('execution adapter emits canonical executed results for direct project adva
     proposalType: 'PROJECT_ADVANCE',
     command: `project advance alpha ${projectId}`,
     args: { projectId },
+    snapshotHash: snapshotHashForStore(memoryStore),
     preconditions: [{ kind: 'project_exists', targetId: projectId }]
   })
 
@@ -127,7 +136,10 @@ test('execution adapter emits canonical executed results for direct project adva
   assert.equal(result.townId, 'alpha')
   assert.equal(result.proposalType, 'PROJECT_ADVANCE')
   assert.equal(result.reasonCode, 'EXECUTED')
-  assert.equal(result.worldState.postExecutionSnapshotHash, null)
+  assert.equal(isValidExecutionResult(result), true)
+  assert.match(result.evaluation.staleCheck.actualSnapshotHash, /^[0-9a-f]{64}$/)
+  assert.match(result.worldState.postExecutionSnapshotHash, /^[0-9a-f]{64}$/)
+  assert.notEqual(result.worldState.postExecutionSnapshotHash, result.evaluation.staleCheck.actualSnapshotHash)
   assert.equal(result.worldState.postExecutionDecisionEpoch, 1)
 
   const advancedProject = memoryStore.getSnapshot().world.projects.find((entry) => entry.id === projectId)
@@ -135,7 +147,7 @@ test('execution adapter emits canonical executed results for direct project adva
 })
 
 test('execution adapter translates MAYOR_ACCEPT_MISSION into authoritative mayor talk + accept commands', async () => {
-  const memoryStore = createStore()
+  const { memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })
   const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
   const agents = createAgents()
@@ -149,6 +161,7 @@ test('execution adapter translates MAYOR_ACCEPT_MISSION into authoritative mayor
     proposalType: 'MAYOR_ACCEPT_MISSION',
     command: 'mission accept alpha sq-side-1',
     args: { missionId: 'sq-side-1' },
+    snapshotHash: snapshotHashForStore(memoryStore),
     preconditions: [{ kind: 'mission_absent' }, { kind: 'side_quest_exists', targetId: 'sq-side-1' }]
   })
 
@@ -160,7 +173,7 @@ test('execution adapter translates MAYOR_ACCEPT_MISSION into authoritative mayor
 })
 
 test('execution adapter classifies decision-epoch drift as stale before applying engine commands', async () => {
-  const memoryStore = createStore()
+  const { memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })
   const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
   const agents = createAgents()
@@ -172,11 +185,13 @@ test('execution adapter classifies decision-epoch drift as stale before applying
   })
 
   const before = memoryStore.getSnapshot()
+  const beforeAuthoritativeHash = snapshotHashForStore(memoryStore)
   const handoff = createHandoff({
     proposalType: 'SALVAGE_PLAN',
     command: 'salvage initiate alpha scarcity',
     args: { focus: 'scarcity' },
     decisionEpoch: 2,
+    snapshotHash: snapshotHashForStore(memoryStore),
     preconditions: [{ kind: 'salvage_focus_supported', expected: 'scarcity' }]
   })
 
@@ -186,11 +201,15 @@ test('execution adapter classifies decision-epoch drift as stale before applying
   assert.equal(result.reasonCode, 'STALE_DECISION_EPOCH')
   assert.equal(result.accepted, false)
   assert.equal(result.executed, false)
-  assert.deepEqual(memoryStore.getSnapshot(), before)
+  assert.match(result.evaluation.staleCheck.actualSnapshotHash, /^[0-9a-f]{64}$/)
+  assert.equal(result.worldState.postExecutionSnapshotHash, result.evaluation.staleCheck.actualSnapshotHash)
+  assert.equal(snapshotHashForStore(memoryStore), beforeAuthoritativeHash)
+  assert.deepEqual(memoryStore.getSnapshot().world.projects, before.world.projects)
+  assert.equal(memoryStore.getSnapshot().world.execution.history.length, before.world.execution.history.length + 1)
 })
 
-test('execution adapter classifies replayed handoffs as duplicate', async () => {
-  const memoryStore = createStore()
+test('execution adapter classifies replayed handoffs as duplicate using durable execution history', async () => {
+  const { filePath, memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })
   const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
   const agents = createAgents()
@@ -210,15 +229,24 @@ test('execution adapter classifies replayed handoffs as duplicate', async () => 
     proposalType: 'PROJECT_ADVANCE',
     command: `project advance alpha ${projectId}`,
     args: { projectId },
+    snapshotHash: snapshotHashForStore(memoryStore),
     preconditions: [{ kind: 'project_exists', targetId: projectId }]
   })
 
   const first = await executionAdapter.executeHandoff({ handoff, agents })
-  const duplicate = await executionAdapter.executeHandoff({ handoff, agents })
+  const reloadedStore = createMemoryStore({ filePath })
+  const reloadedService = createGodCommandService({ memoryStore: reloadedStore })
+  const reloadedAdapter = createExecutionAdapter({
+    memoryStore: reloadedStore,
+    godCommandService: reloadedService
+  })
+  const duplicate = await reloadedAdapter.executeHandoff({ handoff, agents })
 
   assert.equal(first.status, 'executed')
   assert.equal(duplicate.status, 'duplicate')
   assert.equal(duplicate.reasonCode, 'DUPLICATE_HANDOFF')
   assert.equal(duplicate.evaluation.duplicateCheck.duplicate, true)
-  assert.equal(duplicate.evaluation.duplicateCheck.duplicateOf, handoff.handoffId)
+  assert.equal(duplicate.evaluation.duplicateCheck.duplicateOf, first.executionId)
+  assert.match(duplicate.worldState.postExecutionSnapshotHash, /^[0-9a-f]{64}$/)
+  assert.equal(reloadedStore.getSnapshot().world.execution.history.length >= 1, true)
 })
