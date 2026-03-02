@@ -10,6 +10,7 @@ const { createDialogueService } = require('./dialogue')
 const { createActionEngine } = require('./actionEngine')
 const { createTurnEngine } = require('./turnEngine')
 const { createGodCommandService } = require('./godCommands')
+const { createExecutionAdapter, parseExecutionHandoffLine } = require('./executionAdapter')
 const { parseCliInput } = require('./commandParsers')
 const { createLogger } = require('./logger')
 const { installCrashHandlers } = require('./crashHandlers')
@@ -60,6 +61,24 @@ let shuttingDown = false
 function writeLine(text, context = {}) {
   process.stdout.write(`${text}\n`)
   logger.info('user_message', { text, ...context })
+}
+
+function parseJsonObjectEnv(name) {
+  const raw = process.env[name]
+  if (!raw) {
+    return undefined
+  }
+
+  try {
+    const parsed = JSON.parse(raw)
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : undefined
+  } catch (error) {
+    logger.warn('invalid_json_env', {
+      name,
+      error: error instanceof Error ? error.message : String(error)
+    })
+    return undefined
+  }
 }
 
 /**
@@ -134,6 +153,12 @@ const godCommandService = createGodCommandService({
   },
   getStatusSnapshot: () => buildGodStatusSnapshot()
 })
+const executionAdapter = createExecutionAdapter({
+  memoryStore,
+  godCommandService,
+  logger: logger.child({ subsystem: 'execution_adapter' }),
+  townIdAliases: parseJsonObjectEnv('EXECUTION_ADAPTER_TOWN_MAP')
+})
 
 memoryStore.loadAllMemory()
 
@@ -171,6 +196,7 @@ writeLine('--- WORLD ONLINE ---')
 writeLine('Commands:')
 writeLine(' talk <agent> <message>')
 writeLine(' god <command>')
+writeLine(' {"schemaVersion":"execution-handoff.v1",...}')
 writeLine(' exit')
 writeLine('---------------------')
 rl.prompt()
@@ -179,6 +205,20 @@ rl.prompt()
  * @param {string} rawInput
  */
 async function handleLine(rawInput) {
+  const handoff = parseExecutionHandoffLine(rawInput)
+  if (handoff) {
+    const result = await executionAdapter.executeHandoff({
+      handoff,
+      agents: Object.values(agents)
+    })
+    writeLine(JSON.stringify(result), {
+      schema: result.type,
+      executionId: result.executionId,
+      handoffId: result.handoffId
+    })
+    return
+  }
+
   const parsed = parseCliInput(rawInput)
   if (parsed.type === 'noop') return
 
