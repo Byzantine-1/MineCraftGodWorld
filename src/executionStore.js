@@ -1,3 +1,7 @@
+const fs = require('fs')
+const path = require('path')
+const { execFileSync } = require('child_process')
+
 const { AppError } = require('./errors')
 
 const MAX_EXECUTION_HISTORY_ENTRIES = 512
@@ -198,7 +202,20 @@ function createPendingIdentity(entry) {
   }
 }
 
-function createExecutionStore({ memoryStore, logger } = {}) {
+function validatePersistenceBackend(backend) {
+  if (!backend || typeof backend !== 'object') return false
+  return (
+    typeof backend.findReceipt === 'function'
+    && typeof backend.findPendingExecution === 'function'
+    && typeof backend.listPendingExecutions === 'function'
+    && typeof backend.stagePendingExecution === 'function'
+    && typeof backend.markPendingExecutionProgress === 'function'
+    && typeof backend.clearPendingExecution === 'function'
+    && typeof backend.recordResult === 'function'
+  )
+}
+
+function createMemoryExecutionPersistence({ memoryStore, logger } = {}) {
   if (!memoryStore || typeof memoryStore.recallWorld !== 'function' || typeof memoryStore.transact !== 'function') {
     throw new AppError({
       code: 'EXECUTION_STORE_CONFIG_ERROR',
@@ -208,10 +225,6 @@ function createExecutionStore({ memoryStore, logger } = {}) {
   }
 
   const safeLogger = logger || { info: () => {}, warn: () => {} }
-
-  function readSnapshotSource() {
-    return memoryStore.recallWorld()
-  }
 
   function findReceipt(input) {
     const world = memoryStore.recallWorld()
@@ -252,6 +265,7 @@ function createExecutionStore({ memoryStore, logger } = {}) {
 
     if (!tx.skipped) {
       safeLogger.info('execution_store_pending_staged', {
+        backend: 'memory',
         handoffId: pendingEntry.handoffId,
         idempotencyKey: pendingEntry.idempotencyKey,
         pendingSize: tx.result?.pendingSize
@@ -303,6 +317,7 @@ function createExecutionStore({ memoryStore, logger } = {}) {
 
     if (!tx.skipped && tx.result) {
       safeLogger.info('execution_store_pending_progress', {
+        backend: 'memory',
         handoffId: safeHandoffId,
         completedCommandCount: tx.result.completedCommandCount,
         totalCommandCount: tx.result.totalCommandCount
@@ -325,6 +340,7 @@ function createExecutionStore({ memoryStore, logger } = {}) {
 
     if (!tx.skipped && Number(tx.result) > 0) {
       safeLogger.info('execution_store_pending_cleared', {
+        backend: 'memory',
         handoffId: safeHandoffId || null,
         idempotencyKey: asText(identity?.idempotencyKey) || null,
         kind,
@@ -372,6 +388,7 @@ function createExecutionStore({ memoryStore, logger } = {}) {
 
     if (!tx.skipped) {
       safeLogger.info('execution_store_result_recorded', {
+        backend: 'memory',
         executionId: safeExecutionId,
         handoffId: receipt.handoffId,
         kind,
@@ -387,14 +404,480 @@ function createExecutionStore({ memoryStore, logger } = {}) {
   }
 
   return {
-    clearPendingExecution,
+    backendName: 'memory',
     findPendingExecution,
     findReceipt,
     listPendingExecutions,
     markPendingExecutionProgress,
-    readSnapshotSource,
+    recordResult,
+    clearPendingExecution,
+    stagePendingExecution
+  }
+}
+
+function createSqliteExecutionPersistence(options = {}) {
+  const dbPath = path.resolve(String(options.dbPath || ''))
+  const sqliteCommand = asText(options.sqliteCommand || 'sqlite3', 200) || 'sqlite3'
+  const safeLogger = options.logger || { info: () => {}, warn: () => {} }
+  const fsModule = options.fsModule || fs
+  const now = typeof options.now === 'function' ? options.now : () => Date.now()
+
+  if (!dbPath) {
+    throw new AppError({
+      code: 'EXECUTION_STORE_CONFIG_ERROR',
+      message: 'SQLite dbPath is required.',
+      recoverable: false
+    })
+  }
+
+  let initialized = false
+
+  function sqlValue(value) {
+    if (value === null || value === undefined) return 'NULL'
+    if (typeof value === 'boolean') return value ? '1' : '0'
+    if (typeof value === 'number') return Number.isFinite(value) ? String(Math.trunc(value)) : 'NULL'
+    const text = String(value)
+    return `'${text.replace(/'/g, "''")}'`
+  }
+
+  function runSql(sql, { json = false } = {}) {
+    try {
+      const dirPath = path.dirname(dbPath)
+      if (dirPath && dirPath !== '.') {
+        fsModule.mkdirSync(dirPath, { recursive: true })
+      }
+
+      const args = ['-bail', '-cmd', '.timeout 5000']
+      if (json) args.push('-json')
+      args.push(dbPath, sql)
+      const stdout = execFileSync(sqliteCommand, args, {
+        encoding: 'utf8',
+        windowsHide: true
+      })
+      if (!json) {
+        return stdout
+      }
+
+      if (!stdout.trim()) {
+        return []
+      }
+
+      const parsed = JSON.parse(stdout)
+      if (Array.isArray(parsed)) {
+        return parsed
+      }
+      if (parsed && typeof parsed === 'object') {
+        return [parsed]
+      }
+      return []
+    } catch (error) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_SQLITE_ERROR',
+        message: 'SQLite execution persistence command failed.',
+        recoverable: false,
+        metadata: {
+          dbPath,
+          sqliteCommand,
+          error: error instanceof Error ? error.message : String(error)
+        }
+      })
+    }
+  }
+
+  function ensureInitialized() {
+    if (initialized) return
+
+    runSql(`
+      PRAGMA journal_mode = WAL;
+      PRAGMA synchronous = NORMAL;
+      CREATE TABLE IF NOT EXISTS execution_receipts (
+        execution_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        proposal_id TEXT NOT NULL,
+        actor_id TEXT NOT NULL,
+        town_id TEXT NOT NULL,
+        proposal_type TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_execution_receipts_status ON execution_receipts(status, created_at DESC);
+      CREATE TABLE IF NOT EXISTS execution_pending (
+        pending_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL UNIQUE,
+        idempotency_key TEXT NOT NULL UNIQUE,
+        proposal_id TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_execution_pending_updated_at ON execution_pending(updated_at DESC);
+      CREATE TABLE IF NOT EXISTS execution_event_ledger (
+        event_id TEXT PRIMARY KEY,
+        handoff_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        execution_id TEXT,
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        reason_code TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+      );
+      CREATE INDEX IF NOT EXISTS idx_execution_event_ledger_handoff ON execution_event_ledger(handoff_id, created_at DESC);
+    `)
+
+    initialized = true
+    safeLogger.info('execution_store_sqlite_initialized', {
+      backend: 'sqlite',
+      dbPath
+    })
+  }
+
+  function findReceipt(input) {
+    ensureInitialized()
+    const safeHandoffId = asText(input?.handoffId)
+    const safeIdempotencyKey = asText(input?.idempotencyKey)
+    if (!safeHandoffId && !safeIdempotencyKey) return null
+
+    const rows = runSql(`
+      SELECT payload_json
+      FROM execution_receipts
+      WHERE handoff_id = ${sqlValue(safeHandoffId)} OR idempotency_key = ${sqlValue(safeIdempotencyKey)}
+      ORDER BY created_at DESC
+      LIMIT 1;
+    `, { json: true })
+
+    if (!Array.isArray(rows) || rows.length === 0) return null
+    return cloneValue(JSON.parse(rows[0].payload_json))
+  }
+
+  function findPendingExecution(input) {
+    ensureInitialized()
+    const safeHandoffId = asText(input?.handoffId)
+    const safeIdempotencyKey = asText(input?.idempotencyKey)
+    if (!safeHandoffId && !safeIdempotencyKey) return null
+
+    const rows = runSql(`
+      SELECT payload_json
+      FROM execution_pending
+      WHERE handoff_id = ${sqlValue(safeHandoffId)} OR idempotency_key = ${sqlValue(safeIdempotencyKey)}
+      ORDER BY updated_at DESC
+      LIMIT 1;
+    `, { json: true })
+
+    if (!Array.isArray(rows) || rows.length === 0) return null
+    return cloneValue(JSON.parse(rows[0].payload_json))
+  }
+
+  function listPendingExecutions() {
+    ensureInitialized()
+    const rows = runSql(`
+      SELECT payload_json
+      FROM execution_pending
+      ORDER BY updated_at ASC, pending_id ASC;
+    `, { json: true })
+    return rows.map((row) => cloneValue(JSON.parse(row.payload_json)))
+  }
+
+  async function stagePendingExecution(input) {
+    ensureInitialized()
+    const pendingEntry = createPendingExecutionRecord(input || {})
+    if (!pendingEntry.pendingId || !pendingEntry.handoffId || !pendingEntry.idempotencyKey) {
+      throw new AppError({
+        code: 'EXECUTION_STORE_INVALID_PENDING',
+        message: 'Pending execution identity is required.',
+        recoverable: false
+      })
+    }
+
+    const createdAt = Math.trunc(now())
+    runSql(`
+      BEGIN IMMEDIATE;
+      DELETE FROM execution_pending
+      WHERE handoff_id = ${sqlValue(pendingEntry.handoffId)} OR idempotency_key = ${sqlValue(pendingEntry.idempotencyKey)};
+      INSERT INTO execution_pending (
+        pending_id,
+        handoff_id,
+        idempotency_key,
+        proposal_id,
+        status,
+        payload_json,
+        created_at,
+        updated_at
+      ) VALUES (
+        ${sqlValue(pendingEntry.pendingId)},
+        ${sqlValue(pendingEntry.handoffId)},
+        ${sqlValue(pendingEntry.idempotencyKey)},
+        ${sqlValue(pendingEntry.proposalId)},
+        ${sqlValue(pendingEntry.status)},
+        ${sqlValue(JSON.stringify(pendingEntry))},
+        ${sqlValue(createdAt)},
+        ${sqlValue(createdAt)}
+      );
+      COMMIT;
+    `)
+
+    safeLogger.info('execution_store_pending_staged', {
+      backend: 'sqlite',
+      handoffId: pendingEntry.handoffId,
+      dbPath
+    })
+    return pendingEntry
+  }
+
+  async function markPendingExecutionProgress({
+    handoffId,
+    idempotencyKey,
+    completedCommandCount,
+    lastAppliedCommand,
+    lastKnownSnapshotHash,
+    lastKnownDecisionEpoch
+  } = {}) {
+    ensureInitialized()
+    const identity = { handoffId, idempotencyKey }
+    const current = findPendingExecution(identity)
+    if (!current) return null
+
+    current.completedCommandCount = Math.max(
+      0,
+      Math.min(
+        Number.isInteger(completedCommandCount) ? completedCommandCount : 0,
+        Number.isInteger(current.totalCommandCount) ? current.totalCommandCount : 0
+      )
+    )
+    current.lastAppliedCommand = asText(lastAppliedCommand, 240) || null
+    current.lastKnownSnapshotHash = asText(lastKnownSnapshotHash, 64) || current.lastKnownSnapshotHash || null
+    current.lastKnownDecisionEpoch = asNullableInteger(lastKnownDecisionEpoch) ?? current.lastKnownDecisionEpoch
+
+    const updatedAt = Math.trunc(now())
+    runSql(`
+      UPDATE execution_pending
+      SET payload_json = ${sqlValue(JSON.stringify(current))},
+          updated_at = ${sqlValue(updatedAt)}
+      WHERE handoff_id = ${sqlValue(asText(handoffId))} OR idempotency_key = ${sqlValue(asText(idempotencyKey))};
+    `)
+
+    safeLogger.info('execution_store_pending_progress', {
+      backend: 'sqlite',
+      handoffId: asText(handoffId),
+      completedCommandCount: current.completedCommandCount,
+      totalCommandCount: current.totalCommandCount,
+      dbPath
+    })
+
+    return current
+  }
+
+  async function clearPendingExecution(identity, { kind = 'pending_clear' } = {}) {
+    ensureInitialized()
+    const current = findPendingExecution(identity)
+    if (!current) return 0
+
+    runSql(`
+      DELETE FROM execution_pending
+      WHERE handoff_id = ${sqlValue(asText(identity?.handoffId))} OR idempotency_key = ${sqlValue(asText(identity?.idempotencyKey))};
+    `)
+
+    safeLogger.info('execution_store_pending_cleared', {
+      backend: 'sqlite',
+      handoffId: current.handoffId,
+      kind,
+      dbPath
+    })
+    return 1
+  }
+
+  async function recordResult(
+    result,
+    { kind = `result:${asText(result?.status, 40)}`, persistReceipt = true, clearPending = true } = {}
+  ) {
+    ensureInitialized()
+    const receipt = createReceiptFromResult(result)
+    const ledgerEntry = createLedgerEntryFromResult(result, kind)
+    const createdAt = Math.trunc(now())
+
+    const statements = [
+      'BEGIN IMMEDIATE;'
+    ]
+    if (persistReceipt) {
+      statements.push(`
+        INSERT OR REPLACE INTO execution_receipts (
+          execution_id,
+          handoff_id,
+          idempotency_key,
+          proposal_id,
+          actor_id,
+          town_id,
+          proposal_type,
+          status,
+          reason_code,
+          payload_json,
+          created_at
+        ) VALUES (
+          ${sqlValue(receipt.executionId)},
+          ${sqlValue(receipt.handoffId)},
+          ${sqlValue(receipt.idempotencyKey)},
+          ${sqlValue(receipt.proposalId)},
+          ${sqlValue(receipt.actorId)},
+          ${sqlValue(receipt.townId)},
+          ${sqlValue(receipt.proposalType)},
+          ${sqlValue(receipt.status)},
+          ${sqlValue(receipt.reasonCode)},
+          ${sqlValue(JSON.stringify(receipt))},
+          ${sqlValue(createdAt)}
+        );
+      `)
+    }
+    statements.push(`
+      INSERT OR REPLACE INTO execution_event_ledger (
+        event_id,
+        handoff_id,
+        idempotency_key,
+        execution_id,
+        kind,
+        status,
+        reason_code,
+        payload_json,
+        created_at
+      ) VALUES (
+        ${sqlValue(ledgerEntry.id)},
+        ${sqlValue(ledgerEntry.handoffId)},
+        ${sqlValue(ledgerEntry.idempotencyKey)},
+        ${sqlValue(ledgerEntry.executionId)},
+        ${sqlValue(ledgerEntry.kind)},
+        ${sqlValue(ledgerEntry.status)},
+        ${sqlValue(ledgerEntry.reasonCode)},
+        ${sqlValue(JSON.stringify(ledgerEntry))},
+        ${sqlValue(createdAt)}
+      );
+    `)
+    if (clearPending) {
+      statements.push(`
+        DELETE FROM execution_pending
+        WHERE handoff_id = ${sqlValue(receipt.handoffId)} OR idempotency_key = ${sqlValue(receipt.idempotencyKey)};
+      `)
+    }
+    statements.push('COMMIT;')
+
+    runSql(statements.join('\n'))
+
+    safeLogger.info('execution_store_result_recorded', {
+      backend: 'sqlite',
+      executionId: receipt.executionId,
+      handoffId: receipt.handoffId,
+      kind,
+      persistReceipt,
+      clearPending,
+      dbPath
+    })
+    return receipt
+  }
+
+  return {
+    backendName: 'sqlite',
+    clearPendingExecution,
+    findPendingExecution,
+    findReceipt,
+    initialize: ensureInitialized,
+    listPendingExecutions,
+    markPendingExecutionProgress,
     recordResult,
     stagePendingExecution
+  }
+}
+
+function createExecutionPersistenceBackend({
+  backend = 'memory',
+  memoryStore,
+  sqliteDbPath,
+  sqliteCommand,
+  logger,
+  now
+} = {}) {
+  const normalizedBackend = asText(String(backend || 'memory').toLowerCase(), 40) || 'memory'
+  if (normalizedBackend === 'sqlite') {
+    return createSqliteExecutionPersistence({
+      dbPath: sqliteDbPath,
+      sqliteCommand,
+      logger,
+      now
+    })
+  }
+
+  return createMemoryExecutionPersistence({
+    memoryStore,
+    logger
+  })
+}
+
+function createExecutionStore({
+  memoryStore,
+  logger,
+  persistenceBackend,
+  backend = 'memory',
+  sqliteDbPath,
+  sqliteCommand,
+  now
+} = {}) {
+  if (!memoryStore || typeof memoryStore.recallWorld !== 'function') {
+    throw new AppError({
+      code: 'EXECUTION_STORE_CONFIG_ERROR',
+      message: 'memoryStore dependency is required.',
+      recoverable: false
+    })
+  }
+
+  const safeLogger = logger || { info: () => {}, warn: () => {} }
+  const resolvedBackend = persistenceBackend || createExecutionPersistenceBackend({
+    backend,
+    memoryStore,
+    sqliteDbPath,
+    sqliteCommand,
+    logger: safeLogger,
+    now
+  })
+
+  if (!validatePersistenceBackend(resolvedBackend)) {
+    throw new AppError({
+      code: 'EXECUTION_STORE_CONFIG_ERROR',
+      message: 'Execution persistence backend is invalid.',
+      recoverable: false
+    })
+  }
+
+  if (typeof resolvedBackend.initialize === 'function') {
+    resolvedBackend.initialize()
+  }
+
+  return {
+    backendName: resolvedBackend.backendName || asText(backend, 40) || 'memory',
+    findPendingExecution(input) {
+      return resolvedBackend.findPendingExecution(input || {})
+    },
+    findReceipt(input) {
+      return resolvedBackend.findReceipt(input || {})
+    },
+    listPendingExecutions() {
+      return resolvedBackend.listPendingExecutions()
+    },
+    readSnapshotSource() {
+      return memoryStore.recallWorld()
+    },
+    async stagePendingExecution(input) {
+      return resolvedBackend.stagePendingExecution(input || {})
+    },
+    async markPendingExecutionProgress(input) {
+      return resolvedBackend.markPendingExecutionProgress(input || {})
+    },
+    async clearPendingExecution(identity, opts) {
+      return resolvedBackend.clearPendingExecution(identity || {}, opts || {})
+    },
+    async recordResult(result, opts) {
+      return resolvedBackend.recordResult(result, opts || {})
+    }
   }
 }
 
@@ -402,5 +885,8 @@ module.exports = {
   MAX_EXECUTION_EVENT_LEDGER_ENTRIES,
   MAX_EXECUTION_HISTORY_ENTRIES,
   MAX_PENDING_EXECUTION_ENTRIES,
-  createExecutionStore
+  createExecutionPersistenceBackend,
+  createExecutionStore,
+  createMemoryExecutionPersistence,
+  createSqliteExecutionPersistence
 }

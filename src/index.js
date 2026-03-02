@@ -11,6 +11,7 @@ const { createActionEngine } = require('./actionEngine')
 const { createTurnEngine } = require('./turnEngine')
 const { createGodCommandService } = require('./godCommands')
 const { createExecutionAdapter, parseExecutionHandoffLine } = require('./executionAdapter')
+const { createExecutionStore, createExecutionPersistenceBackend } = require('./executionStore')
 const { parseCliInput } = require('./commandParsers')
 const { createLogger } = require('./logger')
 const { installCrashHandlers } = require('./crashHandlers')
@@ -78,6 +79,19 @@ function parseJsonObjectEnv(name) {
       error: error instanceof Error ? error.message : String(error)
     })
     return undefined
+  }
+}
+
+function selectExecutionPersistenceConfig() {
+  const backend = String(process.env.EXECUTION_PERSISTENCE_BACKEND || 'memory').trim().toLowerCase() || 'memory'
+  return {
+    backend,
+    sqliteDbPath: backend === 'sqlite'
+      ? path.resolve(process.env.EXECUTION_PERSISTENCE_SQLITE_PATH || path.resolve(__dirname, './execution.sqlite3'))
+      : undefined,
+    sqliteCommand: backend === 'sqlite'
+      ? (String(process.env.EXECUTION_PERSISTENCE_SQLITE_COMMAND || 'sqlite3').trim() || 'sqlite3')
+      : undefined
   }
 }
 
@@ -153,8 +167,22 @@ const godCommandService = createGodCommandService({
   },
   getStatusSnapshot: () => buildGodStatusSnapshot()
 })
+const executionPersistenceConfig = selectExecutionPersistenceConfig()
+const executionPersistenceBackend = createExecutionPersistenceBackend({
+  backend: executionPersistenceConfig.backend,
+  memoryStore,
+  sqliteDbPath: executionPersistenceConfig.sqliteDbPath,
+  sqliteCommand: executionPersistenceConfig.sqliteCommand,
+  logger: logger.child({ subsystem: 'execution_persistence' })
+})
+const executionStore = createExecutionStore({
+  memoryStore,
+  logger: logger.child({ subsystem: 'execution_store' }),
+  persistenceBackend: executionPersistenceBackend
+})
 const executionAdapter = createExecutionAdapter({
   memoryStore,
+  executionStore,
   godCommandService,
   logger: logger.child({ subsystem: 'execution_adapter' }),
   townIdAliases: parseJsonObjectEnv('EXECUTION_ADAPTER_TOWN_MAP')
