@@ -6,6 +6,7 @@
     "engine:cli": "node ./src/index.js",
     "engine:test": "npm run test:public",
     "engine:smoke": "node ./scripts/smoke.js",
+    "engine:execution:live": "node ./scripts/liveExecutionCheck.js",
     "engine:world-memory:live": "node ./scripts/liveWorldMemoryCheck.js",
     "engine:stress": "node ./scripts/stressTest.js",
     "engine:scale": "node ./scripts/scaleValidation.js",
