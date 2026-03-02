@@ -14,6 +14,7 @@ const {
 } = require('../src/executionStore')
 const { createGodCommandService } = require('../src/godCommands')
 const { createMemoryStore } = require('../src/memory')
+const { createWorldMemoryContext } = require('../src/worldMemoryContext')
 const { createAuthoritativeSnapshotProjection } = require('../src/worldSnapshotProjection')
 
 function createTempPaths(prefix) {
@@ -175,6 +176,18 @@ function pickStableHistoryRecords(records) {
     `${left.sourceType}:${left.kind}:${left.proposalType}:${left.status}`
       .localeCompare(`${right.sourceType}:${right.kind}:${right.proposalType}:${right.status}`)
   ))
+}
+
+function pickStableWorldMemoryContext(context) {
+  return {
+    type: context.type,
+    schemaVersion: context.schemaVersion,
+    scope: context.scope,
+    recentChronicle: context.recentChronicle,
+    recentHistory: context.recentHistory,
+    townSummary: context.townSummary ?? null,
+    factionSummary: context.factionSummary ?? null
+  }
 }
 
 async function seedWorldMemory(context) {
@@ -389,4 +402,68 @@ test('sqlite-backed world memory projection stays aligned with memory backend qu
     { source_id: 'c_beta_01', town_id: 'beta', faction_id: 'veil_church' }
   ])
   assert.equal(memorySeed.executed.status, 'executed')
+})
+
+test('world memory context keeps retrieval ordering stable and bounded', async () => {
+  const context = createStoreContext('memory')
+  await seedWorldMemory(context)
+
+  const worldMemoryContext = createWorldMemoryContext({
+    executionStore: context.executionStore,
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 1,
+    historyLimit: 2
+  })
+
+  assert.deepEqual(worldMemoryContext.scope, {
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 1,
+    historyLimit: 2
+  })
+  assert.deepEqual(worldMemoryContext.recentChronicle, [
+    {
+      sourceRecordId: 'chronicle:c_alpha_02',
+      entryType: 'project',
+      message: 'Alpha raised the first lantern posts.',
+      at: 9000000000002,
+      townId: 'alpha',
+      factionId: 'iron_pact',
+      sourceRefId: 'pr_alpha_1',
+      tags: ['chronicle', 'faction:iron_pact', 'town:alpha', 'type:project']
+    }
+  ])
+  assert.equal(worldMemoryContext.recentHistory.length, 2)
+  assert.deepEqual(worldMemoryContext.recentHistory.map((entry) => entry.status), ['stale', 'executed'])
+  assert.equal(worldMemoryContext.townSummary.townId, 'alpha')
+  assert.equal(worldMemoryContext.factionSummary.factionId, 'iron_pact')
+})
+
+test('world memory context shape stays aligned between memory and sqlite backends', async () => {
+  const memoryContext = createStoreContext('memory')
+  const sqliteContext = createStoreContext('sqlite')
+
+  await seedWorldMemory(memoryContext)
+  await seedWorldMemory(sqliteContext)
+
+  const memoryWorldMemory = createWorldMemoryContext({
+    executionStore: memoryContext.executionStore,
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 3,
+    historyLimit: 4
+  })
+  const sqliteWorldMemory = createWorldMemoryContext({
+    executionStore: sqliteContext.executionStore,
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 3,
+    historyLimit: 4
+  })
+
+  assert.deepEqual(
+    pickStableWorldMemoryContext(sqliteWorldMemory),
+    pickStableWorldMemoryContext(memoryWorldMemory)
+  )
 })
