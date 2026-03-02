@@ -1,6 +1,7 @@
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
 const { getObservabilitySnapshot } = require('./runtimeMetrics')
+const { defaultTownNameFromId } = require('./worldRegistry')
 
 const SUPPORTED_GOD_COMMANDS = new Set(['declare_war', 'make_peace', 'bless_people'])
 const INTENT_TYPES = new Set(['idle', 'wander', 'follow', 'respond'])
@@ -274,6 +275,8 @@ const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
+const MAX_TOWN_REGISTRY_TAGS = 12
+const TOWN_REGISTRY_STATUSES = new Set(['active', 'distressed', 'dormant'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
   'nether_event',
   'mission_complete',
@@ -4380,15 +4383,47 @@ function normalizeTownRecentImpacts(impactsInput) {
 }
 
 /**
- * @param {unknown} townInput
+ * @param {unknown} tagsInput
  */
-function normalizeTownMissionState(townInput) {
+function normalizeTownRegistryTags(tagsInput) {
+  const tags = []
+  const seen = new Set()
+  for (const rawTag of (Array.isArray(tagsInput) ? tagsInput : [])) {
+    const tag = asText(rawTag, '', 80).toLowerCase()
+    if (!tag || seen.has(tag)) continue
+    seen.add(tag)
+    tags.push(tag)
+    if (tags.length >= MAX_TOWN_REGISTRY_TAGS) break
+  }
+  tags.sort((left, right) => left.localeCompare(right))
+  return tags
+}
+
+/**
+ * @param {unknown} statusInput
+ */
+function normalizeTownRegistryStatus(statusInput) {
+  const status = asText(statusInput, '', 24).toLowerCase()
+  return TOWN_REGISTRY_STATUSES.has(status) ? status : 'active'
+}
+
+/**
+ * @param {unknown} townInput
+ * @param {string} townIdHint
+ */
+function normalizeTownMissionState(townInput, townIdHint = '') {
   const source = (townInput && typeof townInput === 'object' && !Array.isArray(townInput))
     ? townInput
     : {}
   const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
   const cooldown = Number(source.majorMissionCooldownUntilDay)
+  const townId = asText(townIdHint, asText(source.townId, '', 80), 80)
   return {
+    townId,
+    name: asText(source.name, defaultTownNameFromId(townId), 80),
+    status: normalizeTownRegistryStatus(source.status),
+    region: asText(source.region, '', 80) || null,
+    tags: normalizeTownRegistryTags(source.tags),
     activeMajorMissionId,
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
     hope: normalizeTownPressureValue(source.hope, DEFAULT_TOWN_HOPE),
@@ -4409,7 +4444,7 @@ function normalizeWorldTownMissionStates(townsInput) {
   for (const [townRaw, townState] of Object.entries(source)) {
     const townName = asText(townRaw, '', 80)
     if (!townName) continue
-    towns[townName] = normalizeTownMissionState(townState)
+    towns[townName] = normalizeTownMissionState(townState, townName)
   }
   return towns
 }
@@ -4444,7 +4479,7 @@ function ensureWorldTownMissionStates(world) {
   world.towns = normalizeWorldTownMissionStates(world.towns)
   for (const townName of deriveTownNamesForMissionState(world)) {
     if (!Object.prototype.hasOwnProperty.call(world.towns, townName)) {
-      world.towns[townName] = normalizeTownMissionState(null)
+      world.towns[townName] = normalizeTownMissionState(null, townName)
     }
   }
   return world.towns
@@ -4473,6 +4508,11 @@ function enforceMajorMissionTownExclusivity(world) {
   }
 
   for (const townName of Object.keys(towns)) {
+    towns[townName].townId = asText(towns[townName].townId, townName, 80)
+    towns[townName].name = asText(towns[townName].name, defaultTownNameFromId(townName), 80)
+    towns[townName].status = normalizeTownRegistryStatus(towns[townName].status)
+    towns[townName].region = asText(towns[townName].region, '', 80) || null
+    towns[townName].tags = normalizeTownRegistryTags(towns[townName].tags)
     towns[townName].activeMajorMissionId = null
     towns[townName].hope = normalizeTownPressureValue(towns[townName].hope, DEFAULT_TOWN_HOPE)
     towns[townName].dread = normalizeTownPressureValue(towns[townName].dread, DEFAULT_TOWN_DREAD)
@@ -4484,7 +4524,7 @@ function enforceMajorMissionTownExclusivity(world) {
   for (const { townName, missionId } of activeByTown.values()) {
     const canonicalTown = resolveTownName(world, townName) || townName
     if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
-      towns[canonicalTown] = normalizeTownMissionState(null)
+      towns[canonicalTown] = normalizeTownMissionState(null, canonicalTown)
     }
     towns[canonicalTown].activeMajorMissionId = missionId
   }
@@ -4567,7 +4607,7 @@ function getTownMajorMissionView(world, townName) {
   const missions = ensureWorldMajorMissions(world)
   const towns = ensureWorldTownMissionStates(world)
   const clock = ensureWorldClock(world)
-  const townState = towns[canonicalTown] || normalizeTownMissionState(null)
+  const townState = towns[canonicalTown] || normalizeTownMissionState(null, canonicalTown)
   const missionsByTown = listMajorMissionsForTown(missions, canonicalTown)
 
   let activeMission = null
@@ -4688,7 +4728,7 @@ function appendTownCrier(memory, input) {
   if (!townName) return null
   const towns = ensureWorldTownMissionStates(memory.world)
   if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
-    towns[townName] = normalizeTownMissionState(null)
+    towns[townName] = normalizeTownMissionState(null, townName)
   }
   const queue = normalizeTownCrierQueue(towns[townName].crierQueue)
   const clock = ensureWorldClock(memory.world)
@@ -4733,7 +4773,7 @@ function appendTownImpact(memory, input) {
   if (!townName) return null
   const towns = ensureWorldTownMissionStates(memory.world)
   if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
-    towns[townName] = normalizeTownMissionState(null)
+    towns[townName] = normalizeTownMissionState(null, townName)
   }
   const clock = ensureWorldClock(memory.world)
   const day = Number.isInteger(Number(clock.day)) ? Number(clock.day) : 0
@@ -4795,7 +4835,7 @@ function applyTownPressureDelta(memory, input) {
   if (!townName) return null
   const towns = ensureWorldTownMissionStates(memory.world)
   if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
-    towns[townName] = normalizeTownMissionState(null)
+    towns[townName] = normalizeTownMissionState(null, townName)
   }
   const state = towns[townName]
   const currentHope = normalizeTownPressureValue(state.hope, DEFAULT_TOWN_HOPE)
@@ -8755,7 +8795,7 @@ function createGodCommandService(deps) {
           missions[idx] = mission
           const towns = ensureWorldTownMissionStates(memory.world)
           if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
-            towns[canonicalTown] = normalizeTownMissionState(null)
+            towns[canonicalTown] = normalizeTownMissionState(null, canonicalTown)
           }
           towns[canonicalTown].activeMajorMissionId = mission.id
           enforceMajorMissionTownExclusivity(memory.world)
@@ -8977,7 +9017,7 @@ function createGodCommandService(deps) {
           missions[idx] = mission
           const towns = ensureWorldTownMissionStates(memory.world)
           if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
-            towns[canonicalTown] = normalizeTownMissionState(null)
+            towns[canonicalTown] = normalizeTownMissionState(null, canonicalTown)
           }
           towns[canonicalTown].activeMajorMissionId = null
           towns[canonicalTown].majorMissionCooldownUntilDay = clock.day + MAJOR_MISSION_COOLDOWN_DAYS
@@ -9071,7 +9111,7 @@ function createGodCommandService(deps) {
           missions[idx] = mission
           const towns = ensureWorldTownMissionStates(memory.world)
           if (!Object.prototype.hasOwnProperty.call(towns, canonicalTown)) {
-            towns[canonicalTown] = normalizeTownMissionState(null)
+            towns[canonicalTown] = normalizeTownMissionState(null, canonicalTown)
           }
           towns[canonicalTown].activeMajorMissionId = null
           towns[canonicalTown].majorMissionCooldownUntilDay = clock.day + MAJOR_MISSION_COOLDOWN_DAYS

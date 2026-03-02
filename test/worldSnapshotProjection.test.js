@@ -210,6 +210,11 @@ function createRawWorldFixture() {
     ],
     towns: {
       beta: {
+        townId: 'beta',
+        name: 'Northwatch',
+        status: 'distressed',
+        region: 'frontier',
+        tags: ['watch', 'frontier'],
         activeMajorMissionId: 'mission-b',
         majorMissionCooldownUntilDay: 0,
         hope: 43,
@@ -224,12 +229,33 @@ function createRawWorldFixture() {
         ]
       },
       alpha: {
+        townId: 'alpha',
+        name: 'Ironvale',
+        status: 'active',
+        region: 'lowlands',
+        tags: ['capital', 'trade'],
         activeMajorMissionId: null,
         majorMissionCooldownUntilDay: 0,
         hope: 55,
         dread: 35,
         crierQueue: [],
         recentImpacts: []
+      }
+    },
+    actors: {
+      'beta.warden': {
+        actorId: 'beta.warden',
+        townId: 'beta',
+        name: 'Warden Sera Flint',
+        role: 'warden',
+        status: 'active'
+      },
+      'alpha.mayor': {
+        actorId: 'alpha.mayor',
+        townId: 'alpha',
+        name: 'Mayor Elira Vale',
+        role: 'mayor',
+        status: 'active'
       }
     },
     nether: {
@@ -261,6 +287,12 @@ test('authoritative snapshot projection hash is stable for equivalent world stat
   rightFixture.salvageRuns.reverse()
   rightFixture.towns.beta.crierQueue.reverse()
   rightFixture.towns.beta.recentImpacts.reverse()
+  rightFixture.towns.beta.tags.reverse()
+  rightFixture.towns.alpha.tags.reverse()
+  rightFixture.actors = {
+    'alpha.mayor': rightFixture.actors['alpha.mayor'],
+    'beta.warden': rightFixture.actors['beta.warden']
+  }
   rightFixture.nether.eventLedger.reverse()
   const right = buildWorld(rightFixture)
 
@@ -269,6 +301,9 @@ test('authoritative snapshot projection hash is stable for equivalent world stat
 
   assert.deepEqual(rightProjection.snapshot, leftProjection.snapshot)
   assert.equal(rightProjection.snapshotHash, leftProjection.snapshotHash)
+  assert.equal(leftProjection.snapshot.towns.alpha.name, 'Ironvale')
+  assert.deepEqual(leftProjection.snapshot.towns.beta.tags, ['frontier', 'watch'])
+  assert.equal(leftProjection.snapshot.actors['alpha.mayor'].name, 'Mayor Elira Vale')
 })
 
 test('authoritative snapshot projection excludes incidental logs and execution receipts', () => {

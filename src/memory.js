@@ -3,6 +3,11 @@ const path = require('path')
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
 const {
+  OFFICEHOLDER_ROLE_ORDER,
+  defaultActorName,
+  defaultTownNameFromId
+} = require('./worldRegistry')
+const {
   incrementMetric,
   getRuntimeMetrics,
   recordTransactionDuration,
@@ -350,6 +355,10 @@ const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
+const MAX_TOWN_REGISTRY_TAGS = 12
+const MAX_WORLD_ACTOR_ENTRIES = 256
+const TOWN_REGISTRY_STATUSES = new Set(['active', 'distressed', 'dormant'])
+const ACTOR_REGISTRY_STATUSES = new Set(['active', 'inactive'])
 const EXECUTION_RESULT_STATUSES = new Set(['executed', 'rejected', 'stale', 'duplicate', 'failed'])
 const PENDING_EXECUTION_STATUSES = new Set(['pending'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
@@ -1652,15 +1661,75 @@ function normalizeTownPressureValueShape(valueInput, fallback) {
 }
 
 /**
- * @param {unknown} townInput
+ * @param {unknown} tagsInput
  */
-function normalizeTownMissionStateShape(townInput) {
+function normalizeTownRegistryTagsShape(tagsInput) {
+  const tags = []
+  const seen = new Set()
+  for (const rawTag of (Array.isArray(tagsInput) ? tagsInput : [])) {
+    const tag = asText(rawTag, '', 80).toLowerCase()
+    if (!tag || seen.has(tag)) continue
+    seen.add(tag)
+    tags.push(tag)
+    if (tags.length >= MAX_TOWN_REGISTRY_TAGS) break
+  }
+  tags.sort((left, right) => left.localeCompare(right))
+  return tags
+}
+
+/**
+ * @param {unknown} statusInput
+ */
+function normalizeTownRegistryStatusShape(statusInput) {
+  const status = asText(statusInput, '', 24).toLowerCase()
+  return TOWN_REGISTRY_STATUSES.has(status) ? status : 'active'
+}
+
+/**
+ * @param {unknown} statusInput
+ */
+function normalizeActorRegistryStatusShape(statusInput) {
+  const status = asText(statusInput, '', 24).toLowerCase()
+  return ACTOR_REGISTRY_STATUSES.has(status) ? status : 'active'
+}
+
+/**
+ * @param {unknown} roleInput
+ */
+function normalizeActorRegistryRoleShape(roleInput) {
+  return asText(roleInput, '', 40).toLowerCase()
+}
+
+/**
+ * @param {unknown} townInput
+ * @param {string} townIdHint
+ */
+function normalizeTownIdentityShape(townInput, townIdHint = '') {
+  const source = (townInput && typeof townInput === 'object' && !Array.isArray(townInput))
+    ? townInput
+    : {}
+  const townId = asText(townIdHint, asText(source.townId, '', 80), 80)
+  return {
+    townId,
+    name: asText(source.name, defaultTownNameFromId(townId), 80),
+    status: normalizeTownRegistryStatusShape(source.status),
+    region: asText(source.region, '', 80) || null,
+    tags: normalizeTownRegistryTagsShape(source.tags)
+  }
+}
+
+/**
+ * @param {unknown} townInput
+ * @param {string} townIdHint
+ */
+function normalizeTownMissionStateShape(townInput, townIdHint = '') {
   const source = (townInput && typeof townInput === 'object' && !Array.isArray(townInput))
     ? townInput
     : {}
   const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
   const cooldown = Number(source.majorMissionCooldownUntilDay)
   return {
+    ...normalizeTownIdentityShape(source, townIdHint),
     activeMajorMissionId,
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
     hope: normalizeTownPressureValueShape(source.hope, DEFAULT_TOWN_HOPE),
@@ -1681,9 +1750,84 @@ function normalizeTownsShape(townsInput) {
   for (const [townRaw, townState] of Object.entries(source)) {
     const townName = asText(townRaw, '', 80)
     if (!townName) continue
-    towns[townName] = normalizeTownMissionStateShape(townState)
+    towns[townName] = normalizeTownMissionStateShape(townState, townName)
   }
   return towns
+}
+
+/**
+ * @param {unknown} actorInput
+ * @param {string} actorIdHint
+ */
+function normalizeActorRegistryEntryShape(actorInput, actorIdHint = '') {
+  if (!actorInput || typeof actorInput !== 'object' || Array.isArray(actorInput)) return null
+  const actorId = asText(actorInput.actorId, asText(actorIdHint, '', 120), 120)
+  const townId = asText(actorInput.townId, '', 80)
+  const role = normalizeActorRegistryRoleShape(actorInput.role)
+  if (!actorId || !townId || !role) return null
+  const townName = asText(actorInput.townName, defaultTownNameFromId(townId), 80)
+  return {
+    actorId,
+    townId,
+    name: asText(actorInput.name, defaultActorName({ role, townName }), 80),
+    role,
+    status: normalizeActorRegistryStatusShape(actorInput.status)
+  }
+}
+
+/**
+ * @param {Record<string, any>} actors
+ * @param {Record<string, any>} towns
+ */
+function ensureDefaultTownActorsShape(actors, towns) {
+  for (const [townId, townRecord] of Object.entries(towns || {})) {
+    const townName = asText(townRecord?.name, defaultTownNameFromId(townId), 80)
+    for (const role of [...OFFICEHOLDER_ROLE_ORDER, 'townsfolk']) {
+      const existing = Object.values(actors).find((actor) => (
+        actor
+        && actor.townId === townId
+        && actor.role === role
+      ))
+      if (existing) continue
+      const actorId = `${townId}.${role}`
+      actors[actorId] = {
+        actorId,
+        townId,
+        name: defaultActorName({ role, townName }),
+        role,
+        status: 'active'
+      }
+    }
+  }
+}
+
+/**
+ * @param {unknown} actorsInput
+ * @param {Record<string, any>} towns
+ */
+function normalizeWorldActorsShape(actorsInput, towns = {}) {
+  const source = (actorsInput && typeof actorsInput === 'object' && !Array.isArray(actorsInput))
+    ? actorsInput
+    : {}
+  const actors = {}
+  for (const [actorRaw, actorState] of Object.entries(source)) {
+    const actorId = asText(actorRaw, '', 120)
+    if (!actorId) continue
+    const normalized = normalizeActorRegistryEntryShape(actorState, actorId)
+    if (!normalized) continue
+    if (!Object.prototype.hasOwnProperty.call(towns, normalized.townId)) {
+      towns[normalized.townId] = normalizeTownMissionStateShape(null, normalized.townId)
+    }
+    actors[normalized.actorId] = normalized
+  }
+  ensureDefaultTownActorsShape(actors, towns)
+  const orderedActorIds = Object.keys(actors).sort((left, right) => left.localeCompare(right))
+  const boundedActorIds = orderedActorIds.slice(0, MAX_WORLD_ACTOR_ENTRIES)
+  const boundedActors = {}
+  for (const actorId of boundedActorIds) {
+    boundedActors[actorId] = actors[actorId]
+  }
+  return boundedActors
 }
 
 /**
@@ -1958,10 +2102,15 @@ function reconcileMajorMissionState(world) {
 
   for (const townName of collectTownNamesForMissionState(world)) {
     if (!Object.prototype.hasOwnProperty.call(world.towns, townName)) {
-      world.towns[townName] = normalizeTownMissionStateShape(null)
+      world.towns[townName] = normalizeTownMissionStateShape(null, townName)
     }
     const key = townName.toLowerCase()
     const expectedActiveId = activeByTown.get(key) || null
+    world.towns[townName].townId = asText(world.towns[townName].townId, townName, 80)
+    world.towns[townName].name = asText(world.towns[townName].name, defaultTownNameFromId(townName), 80)
+    world.towns[townName].status = normalizeTownRegistryStatusShape(world.towns[townName].status)
+    world.towns[townName].region = asText(world.towns[townName].region, '', 80) || null
+    world.towns[townName].tags = normalizeTownRegistryTagsShape(world.towns[townName].tags)
     world.towns[townName].activeMajorMissionId = expectedActiveId
     world.towns[townName].hope = normalizeTownPressureValueShape(world.towns[townName].hope, DEFAULT_TOWN_HOPE)
     world.towns[townName].dread = normalizeTownPressureValueShape(world.towns[townName].dread, DEFAULT_TOWN_DREAD)
@@ -1970,6 +2119,7 @@ function reconcileMajorMissionState(world) {
     const cooldown = Number(world.towns[townName].majorMissionCooldownUntilDay)
     world.towns[townName].majorMissionCooldownUntilDay = Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0
   }
+  world.actors = normalizeWorldActorsShape(world.actors, world.towns)
 }
 
 /**
@@ -2017,6 +2167,9 @@ function freshMemoryShape(input) {
     projects: normalizeProjectsShape(source.world?.projects),
     salvageRuns: normalizeSalvageRunsShape(source.world?.salvageRuns),
     towns: normalizeTownsShape(source.world?.towns),
+    actors: source.world?.actors && typeof source.world.actors === 'object' && !Array.isArray(source.world.actors)
+      ? source.world.actors
+      : {},
     nether: normalizeNetherShape(source.world?.nether, Number(source.world?.events?.seed)),
     execution: normalizeExecutionStateShape(source.world?.execution),
     archive: Array.isArray(source.world?.archive) ? source.world.archive : [],
@@ -2670,6 +2823,30 @@ function validateMemoryIntegritySnapshot(memory) {
         issues.push(`world.towns.${safeTownName} must be an object.`)
         continue
       }
+      if (asText(townState.townId, '', 80) !== safeTownName) {
+        issues.push(`world.towns.${safeTownName}.townId must match the town key.`)
+      }
+      if (!asText(townState.name, '', 80)) {
+        issues.push(`world.towns.${safeTownName}.name must be non-empty text.`)
+      }
+      if (!TOWN_REGISTRY_STATUSES.has(asText(townState.status, '', 24).toLowerCase())) {
+        issues.push(`world.towns.${safeTownName}.status must be one of ${Array.from(TOWN_REGISTRY_STATUSES).join(', ')}.`)
+      }
+      if (townState.region !== null && townState.region !== undefined && !asText(townState.region, '', 80)) {
+        issues.push(`world.towns.${safeTownName}.region must be text|null.`)
+      }
+      if (!Array.isArray(townState.tags)) {
+        issues.push(`world.towns.${safeTownName}.tags must be an array.`)
+      } else {
+        if (townState.tags.length > MAX_TOWN_REGISTRY_TAGS) {
+          issues.push(`world.towns.${safeTownName}.tags exceeds max entries ${MAX_TOWN_REGISTRY_TAGS}.`)
+        }
+        for (const tag of townState.tags) {
+          if (!asText(tag, '', 80)) {
+            issues.push(`world.towns.${safeTownName}.tags contains invalid tag.`)
+          }
+        }
+      }
       const activeMajorMissionId = asText(townState.activeMajorMissionId, '', 200) || null
       const cooldown = Number(townState.majorMissionCooldownUntilDay)
       if (townState.activeMajorMissionId !== null && activeMajorMissionId === null) {
@@ -2726,6 +2903,32 @@ function validateMemoryIntegritySnapshot(memory) {
     })
     if (!hasTownRecord) {
       issues.push(`world.towns is missing activeMajorMissionId mapping for town key ${townKey}.`)
+    }
+  }
+  if (!world.actors || typeof world.actors !== 'object' || Array.isArray(world.actors)) {
+    issues.push('world.actors must be an object.')
+  } else {
+    if (Object.keys(world.actors).length > MAX_WORLD_ACTOR_ENTRIES) {
+      issues.push(`world.actors exceeds max entries ${MAX_WORLD_ACTOR_ENTRIES}.`)
+    }
+    const seenActorIds = new Set()
+    for (const [actorKey, actorState] of Object.entries(world.actors)) {
+      const normalizedActor = normalizeActorRegistryEntryShape(actorState, actorKey)
+      if (!normalizedActor) {
+        issues.push(`world.actors.${actorKey || '?'} contains invalid actor entry.`)
+        continue
+      }
+      const actorIdKey = normalizedActor.actorId.toLowerCase()
+      if (seenActorIds.has(actorIdKey)) {
+        issues.push(`world.actors has duplicate actorId ${normalizedActor.actorId}.`)
+      }
+      seenActorIds.add(actorIdKey)
+      if (!Object.prototype.hasOwnProperty.call(world.towns || {}, normalizedActor.townId)) {
+        issues.push(`world.actors.${normalizedActor.actorId} references unknown town ${normalizedActor.townId}.`)
+      }
+      if (!ACTOR_REGISTRY_STATUSES.has(normalizedActor.status)) {
+        issues.push(`world.actors.${normalizedActor.actorId}.status must be one of ${Array.from(ACTOR_REGISTRY_STATUSES).join(', ')}.`)
+      }
     }
   }
   if (world.economy !== undefined) {

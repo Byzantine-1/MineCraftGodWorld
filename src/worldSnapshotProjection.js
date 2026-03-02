@@ -1,4 +1,5 @@
 const { createHash } = require('crypto')
+const { defaultActorName, defaultTownNameFromId } = require('./worldRegistry')
 
 const WORLD_SNAPSHOT_TYPE = 'world-snapshot.v1'
 const WORLD_SNAPSHOT_SCHEMA_VERSION = 1
@@ -310,13 +311,32 @@ function normalizeTownImpact(entry) {
 }
 
 function normalizeTown(entry) {
+  const townId = asText(entry?.townId)
   return {
+    townId,
+    name: asText(entry?.name, defaultTownNameFromId(townId)),
+    status: asText(entry?.status, 'active'),
+    region: asText(entry?.region) || null,
+    tags: sortStrings(entry?.tags),
     activeMajorMissionId: asText(entry?.activeMajorMissionId) || null,
     majorMissionCooldownUntilDay: asInteger(entry?.majorMissionCooldownUntilDay),
     hope: asInteger(entry?.hope),
     dread: asInteger(entry?.dread),
     crierQueue: sortObjects(entry?.crierQueue, normalizeTownCrierEntry, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
     recentImpacts: sortObjects(entry?.recentImpacts, normalizeTownImpact, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`)
+  }
+}
+
+function normalizeActor(entry) {
+  const actorId = asText(entry?.actorId)
+  const townId = asText(entry?.townId)
+  const role = asText(entry?.role)
+  return {
+    actorId,
+    townId,
+    name: asText(entry?.name, defaultActorName({ role, townName: defaultTownNameFromId(townId) })),
+    role,
+    status: asText(entry?.status, 'active')
   }
 }
 
@@ -378,6 +398,7 @@ function projectAuthoritativeSnapshot(world) {
     projects: sortObjects(source.projects, normalizeProject, (entry) => entry.id),
     salvageRuns: sortObjects(source.salvageRuns, normalizeSalvageRun, (entry) => entry.id),
     towns: sortRecord(source.towns, (entry) => normalizeTown(entry)),
+    actors: sortRecord(source.actors, (entry) => normalizeActor(entry)),
     nether: {
       eventLedger: sortObjects(source.nether?.eventLedger, normalizeNetherLedgerEntry, (entry) => `${String(entry.day).padStart(6, '0')}:${entry.id}`),
       modifiers: {

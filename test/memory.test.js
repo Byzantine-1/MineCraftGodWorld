@@ -372,6 +372,108 @@ test('memory store sanitizes additive major mission + town crier shapes on load'
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
+test('memory store sanitizes authoritative town and actor registry shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      towns: {
+        alpha: {
+          townId: 'wrong-alpha',
+          name: '',
+          status: 'broken',
+          region: '  ',
+          tags: ['Trade', 'trade', '', 'Capital'],
+          hope: 61,
+          dread: 34
+        }
+      },
+      actors: {
+        'alpha.mayor': {
+          actorId: 'alpha.mayor',
+          townId: 'alpha',
+          name: '',
+          role: 'MAYOR',
+          status: 'retired'
+        },
+        'beta.captain': {
+          actorId: 'beta.captain',
+          townId: 'beta',
+          name: 'Captain Rowan',
+          role: 'captain',
+          status: 'active'
+        },
+        invalid: {
+          actorId: '',
+          townId: 'alpha',
+          role: '',
+          status: 'active'
+        }
+      }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.towns.alpha, {
+    townId: 'alpha',
+    name: 'Alpha',
+    status: 'active',
+    region: null,
+    tags: ['capital', 'trade'],
+    activeMajorMissionId: null,
+    majorMissionCooldownUntilDay: 0,
+    hope: 61,
+    dread: 34,
+    crierQueue: [],
+    recentImpacts: []
+  })
+  assert.deepEqual(snapshot.world.towns.beta, {
+    townId: 'beta',
+    name: 'Beta',
+    status: 'active',
+    region: null,
+    tags: [],
+    activeMajorMissionId: null,
+    majorMissionCooldownUntilDay: 0,
+    hope: 50,
+    dread: 50,
+    crierQueue: [],
+    recentImpacts: []
+  })
+
+  assert.deepEqual(snapshot.world.actors['alpha.mayor'], {
+    actorId: 'alpha.mayor',
+    townId: 'alpha',
+    name: 'Mayor of Alpha',
+    role: 'mayor',
+    status: 'active'
+  })
+  assert.deepEqual(snapshot.world.actors['beta.captain'], {
+    actorId: 'beta.captain',
+    townId: 'beta',
+    name: 'Captain Rowan',
+    role: 'captain',
+    status: 'active'
+  })
+  assert.deepEqual(snapshot.world.actors['beta.mayor'], {
+    actorId: 'beta.mayor',
+    townId: 'beta',
+    name: 'Mayor of Beta',
+    role: 'mayor',
+    status: 'active'
+  })
+  assert.deepEqual(snapshot.world.actors['beta.warden'], {
+    actorId: 'beta.warden',
+    townId: 'beta',
+    name: 'Warden of Beta',
+    role: 'warden',
+    status: 'active'
+  })
+  assert.equal(Object.prototype.hasOwnProperty.call(snapshot.world.actors, 'invalid'), false)
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
 test('memory store defaults additive nether fields when missing', () => {
   const filePath = createTempMemoryPath()
   fs.writeFileSync(filePath, JSON.stringify({
