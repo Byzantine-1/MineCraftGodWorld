@@ -190,7 +190,9 @@ function pickStableWorldMemoryContext(context) {
     recentChronicle: context.recentChronicle,
     recentHistory: context.recentHistory,
     townSummary: context.townSummary ?? null,
-    factionSummary: context.factionSummary ?? null
+    factionSummary: context.factionSummary ?? null,
+    townIdentity: context.townIdentity ?? null,
+    keyActors: context.keyActors ?? null
   }
 }
 
@@ -467,6 +469,38 @@ test('world memory context keeps retrieval ordering stable and bounded', async (
   assert.deepEqual(worldMemoryContext.recentHistory.map((entry) => entry.status), ['stale', 'executed'])
   assert.equal(worldMemoryContext.townSummary.townId, 'alpha')
   assert.equal(worldMemoryContext.factionSummary.factionId, 'iron_pact')
+  assert.deepEqual(worldMemoryContext.townIdentity, {
+    townId: 'alpha',
+    name: 'Alpha',
+    status: 'active',
+    region: null,
+    tags: []
+  })
+  assert.equal(Array.isArray(worldMemoryContext.keyActors), true)
+  assert(worldMemoryContext.keyActors.length >= 3)
+  assert(worldMemoryContext.keyActors.length <= 6)
+  assert.deepEqual(worldMemoryContext.keyActors.map((actor) => actor.role).slice(0, 3), ['mayor', 'captain', 'warden'])
+  assert.deepEqual(worldMemoryContext.keyActors[0], {
+    actorId: 'alpha.mayor',
+    townId: 'alpha',
+    name: 'Mayor of Alpha',
+    role: 'mayor',
+    status: 'active'
+  })
+  assert.deepEqual(worldMemoryContext.keyActors[1], {
+    actorId: 'alpha.captain',
+    townId: 'alpha',
+    name: 'Captain of Alpha',
+    role: 'captain',
+    status: 'active'
+  })
+  assert.deepEqual(worldMemoryContext.keyActors[2], {
+    actorId: 'alpha.warden',
+    townId: 'alpha',
+    name: 'Warden of Alpha',
+    role: 'warden',
+    status: 'active'
+  })
 })
 
 test('world memory context shape stays aligned between memory and sqlite backends', async () => {
@@ -495,4 +529,29 @@ test('world memory context shape stays aligned between memory and sqlite backend
     pickStableWorldMemoryContext(sqliteWorldMemory),
     pickStableWorldMemoryContext(memoryWorldMemory)
   )
+})
+
+test('world memory context keeps identity slice deterministic for same seeded state', async () => {
+  const context = createStoreContext('memory')
+  await seedWorldMemory(context)
+
+  const request = createWorldMemoryRequest({
+    townId: 'alpha',
+    factionId: 'iron_pact',
+    chronicleLimit: 3,
+    historyLimit: 4
+  })
+
+  const first = createWorldMemoryContextForRequest({
+    executionStore: context.executionStore,
+    request
+  })
+  const second = createWorldMemoryContextForRequest({
+    executionStore: context.executionStore,
+    request
+  })
+
+  assert.deepEqual(first.townIdentity, second.townIdentity)
+  assert.deepEqual(first.keyActors, second.keyActors)
+  assert.deepEqual(first.keyActors.map((actor) => actor.role), second.keyActors.map((actor) => actor.role))
 })

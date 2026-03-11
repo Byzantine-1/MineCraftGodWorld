@@ -4,6 +4,15 @@ const WORLD_MEMORY_CONTEXT_TYPE = 'world-memory-context.v1'
 const WORLD_MEMORY_CONTEXT_SCHEMA_VERSION = 1
 const MAX_CONTEXT_CHRONICLE_RECORDS = 5
 const MAX_CONTEXT_HISTORY_RECORDS = 5
+const MAX_CONTEXT_KEY_ACTORS = 6
+const MAX_CONTEXT_TOWNSFOLK_REPRESENTATIVES = 2
+const MAX_CONTEXT_TAGS = 12
+
+const {
+  getTownRecord,
+  listActorRecords,
+  listTownOfficeholders
+} = require('./worldRegistry')
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -211,6 +220,71 @@ function projectFactionSummary(summary) {
   }
 }
 
+function projectTownIdentity(town) {
+  if (!isPlainObject(town)) return null
+  return {
+    townId: asText(town.townId, 80),
+    name: asText(town.name, 80),
+    status: asText(town.status, 24),
+    region: asText(town.region, 80) || null,
+    tags: normalizeStringList(town.tags, MAX_CONTEXT_TAGS, 80)
+  }
+}
+
+function projectActorIdentity(actor) {
+  if (!isPlainObject(actor)) return null
+  return {
+    actorId: asText(actor.actorId, 120),
+    townId: asText(actor.townId, 80),
+    name: asText(actor.name, 80),
+    role: asText(actor.role, 40).toLowerCase(),
+    status: asText(actor.status, 24).toLowerCase()
+  }
+}
+
+function projectTownActorIdentitySelection(executionStore, townId) {
+  const safeTownId = asText(townId, 80)
+  if (!safeTownId || typeof executionStore.readSnapshotSource !== 'function') {
+    return {
+      townIdentity: null,
+      keyActors: null
+    }
+  }
+
+  const world = executionStore.readSnapshotSource()
+  const townIdentity = projectTownIdentity(getTownRecord(world, safeTownId))
+  if (!townIdentity) {
+    return {
+      townIdentity: null,
+      keyActors: null
+    }
+  }
+
+  const officeholders = listTownOfficeholders(world, townIdentity.townId)
+  const townsfolkRepresentatives = listActorRecords(world, {
+    townId: townIdentity.townId,
+    role: 'townsfolk',
+    status: 'active'
+  }).slice(0, MAX_CONTEXT_TOWNSFOLK_REPRESENTATIVES)
+
+  const keyActors = []
+  const seenActorIds = new Set()
+  for (const actor of [...officeholders, ...townsfolkRepresentatives]) {
+    const projectedActor = projectActorIdentity(actor)
+    if (!projectedActor || !projectedActor.actorId) continue
+    const actorKey = projectedActor.actorId.toLowerCase()
+    if (seenActorIds.has(actorKey)) continue
+    seenActorIds.add(actorKey)
+    keyActors.push(projectedActor)
+    if (keyActors.length >= MAX_CONTEXT_KEY_ACTORS) break
+  }
+
+  return {
+    townIdentity,
+    keyActors
+  }
+}
+
 function normalizeChronicleSelection(records, limit) {
   return (Array.isArray(records) ? records : [])
     .map((record) => projectChronicleRecord(record))
@@ -255,6 +329,7 @@ function createScopedSelection(executionStore, {
   const safeFactionId = scope.factionId
   const normalizedChronicleLimit = scope.chronicleLimit
   const normalizedHistoryLimit = scope.historyLimit
+  const identitySelection = projectTownActorIdentitySelection(executionStore, safeTownId)
 
   const townSummary = safeTownId
     ? executionStore.getTownHistorySummary({
@@ -298,7 +373,9 @@ function createScopedSelection(executionStore, {
     recentChronicle: normalizeChronicleSelection(chronicleRecords, normalizedChronicleLimit),
     recentHistory: normalizeHistorySelection(historyRecords, normalizedHistoryLimit),
     townSummary: projectTownSummary(townSummary),
-    factionSummary: projectFactionSummary(factionSummary)
+    factionSummary: projectFactionSummary(factionSummary),
+    townIdentity: identitySelection.townIdentity,
+    keyActors: identitySelection.keyActors
   }
 }
 
@@ -333,7 +410,9 @@ function createWorldMemoryContext({
     recentChronicle: selection.recentChronicle,
     recentHistory: selection.recentHistory,
     ...(selection.townSummary ? { townSummary: selection.townSummary } : {}),
-    ...(selection.factionSummary ? { factionSummary: selection.factionSummary } : {})
+    ...(selection.factionSummary ? { factionSummary: selection.factionSummary } : {}),
+    ...(selection.townIdentity ? { townIdentity: selection.townIdentity } : {}),
+    ...(Array.isArray(selection.keyActors) ? { keyActors: selection.keyActors } : {})
   })
 }
 
