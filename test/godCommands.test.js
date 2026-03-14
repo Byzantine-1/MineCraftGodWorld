@@ -831,7 +831,11 @@ test('town list and town board are read-only', async () => {
   assert.equal(townList.applied, true)
   assert.equal(townBoard.applied, true)
   assert.equal(unknownTown.applied, false)
-  assert.ok(townList.outputLines.some(line => line.includes('GOD TOWN: name=alpha') && line.includes('tag=town:alpha')))
+  assert.ok(
+    townList.outputLines.some(
+      line => line.includes('GOD TOWN: townId=alpha') && line.includes('name=Alpha')
+    )
+  )
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD: town=alpha')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD MARKETS:')))
   assert.ok(townBoard.outputLines.some(line => line.includes('GOD TOWN BOARD OFFERS:')))
@@ -4328,4 +4332,35 @@ test('rumor side-quest completion awards Wanderer once and is replay-safe', asyn
   const wandererNews = afterReplay.world.news
     .filter(entry => entry.topic === 'title' && entry.meta?.title === 'Wanderer')
   assert.equal(wandererNews.length, 1)
+})
+
+test('town register provisions an authoritative town entry and default officeholders idempotently', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  const first = await service.applyGodCommand({
+    agents,
+    command: 'town register gamma',
+    operationId: 'town-register-gamma-1'
+  })
+  const second = await service.applyGodCommand({
+    agents,
+    command: 'town register gamma',
+    operationId: 'town-register-gamma-2'
+  })
+
+  assert.equal(first.applied, true)
+  assert.equal(second.applied, true)
+  assert.ok(first.outputLines.some((line) => line.includes('status=created')))
+  assert.ok(second.outputLines.some((line) => line.includes('status=existing')))
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.ok(snapshot.world.towns.gamma)
+  assert.equal(snapshot.world.towns.gamma.townId, 'gamma')
+  assert.equal(snapshot.world.towns.gamma.name, 'Gamma')
+  assert.ok(snapshot.world.actors['gamma.mayor'])
+  assert.ok(snapshot.world.actors['gamma.captain'])
+  assert.ok(snapshot.world.actors['gamma.warden'])
+  assert.ok(snapshot.world.actors['gamma.townsfolk'])
 })

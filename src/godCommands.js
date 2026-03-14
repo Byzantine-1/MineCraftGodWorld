@@ -3,7 +3,11 @@ const { AsyncLocalStorage } = require('async_hooks')
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
 const { getObservabilitySnapshot } = require('./runtimeMetrics')
-const { defaultTownNameFromId } = require('./worldRegistry')
+const {
+  OFFICEHOLDER_ROLE_ORDER,
+  defaultActorName,
+  defaultTownNameFromId
+} = require('./worldRegistry')
 const {
   getPlayerAssignment,
   normalizeTownSpawn,
@@ -4463,6 +4467,58 @@ function normalizeWorldTownMissionStates(townsInput) {
 }
 
 /**
+ * @param {unknown} actorsInput
+ * @param {Record<string, any>} towns
+ */
+function normalizeWorldActorRegistry(actorsInput, towns = {}) {
+  const source = (actorsInput && typeof actorsInput === 'object' && !Array.isArray(actorsInput))
+    ? actorsInput
+    : {}
+  const actors = {}
+
+  for (const [actorRaw, actorState] of Object.entries(source)) {
+    const actorId = asText(actorRaw, '', 120)
+    if (!actorId) continue
+    const record = (actorState && typeof actorState === 'object' && !Array.isArray(actorState))
+      ? actorState
+      : {}
+    const townId = asText(record.townId, '', 80)
+    const role = asText(record.role, '', 40).toLowerCase()
+    if (!townId || !role) continue
+    const townName = asText(record.townName, defaultTownNameFromId(townId), 80)
+    actors[actorId] = {
+      actorId,
+      townId,
+      name: asText(record.name, defaultActorName({ role, townName }), 80),
+      role,
+      status: asText(record.status, 'active', 24).toLowerCase() || 'active'
+    }
+  }
+
+  for (const [townId, townRecord] of Object.entries(towns || {})) {
+    const townName = asText(townRecord?.name, defaultTownNameFromId(townId), 80)
+    for (const role of [...OFFICEHOLDER_ROLE_ORDER, 'townsfolk']) {
+      const existing = Object.values(actors).find((actor) => (
+        actor
+        && sameText(actor.townId, townId, 80)
+        && sameText(actor.role, role, 40)
+      ))
+      if (existing) continue
+      const actorId = `${townId}.${role}`
+      actors[actorId] = {
+        actorId,
+        townId,
+        name: defaultActorName({ role, townName }),
+        role,
+        status: 'active'
+      }
+    }
+  }
+
+  return actors
+}
+
+/**
  * @param {any} world
  */
 function deriveTownNamesForMissionState(world) {
@@ -6088,6 +6144,13 @@ function parseGodCommand(rawCommand) {
   if (head === 'town') {
     const action = asText(words[1], '', 20).toLowerCase()
     if (action === 'list' && words.length === 2) return { type: 'town_list' }
+    if (action === 'register' && words.length === 3) {
+      const townName = asText(words[2], '', 80)
+      if (!townName) {
+        return { type: 'invalid', reason: 'Usage: god town list | god town register <townName> | god town board <townName> [N] | god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+      }
+      return { type: 'town_register', townName }
+    }
     if (action === 'spawn') {
       const spawnAction = asText(words[2], '', 20).toLowerCase()
       if (spawnAction === 'show' && words.length === 4) {
@@ -6136,7 +6199,7 @@ function parseGodCommand(rawCommand) {
       if (!townName) return { type: 'invalid', reason: 'Usage: god town board <townName> [N]' }
       return { type: 'town_board', townName, limit }
     }
-    return { type: 'invalid', reason: 'Usage: god town list | god town board <townName> [N] | god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+    return { type: 'invalid', reason: 'Usage: god town list | god town register <townName> | god town board <townName> [N] | god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
   }
 
   if (head === 'player') {
@@ -8385,26 +8448,83 @@ function createGodCommandService(deps) {
 
     if (parsed.type === 'town_list') {
       const snapshot = memoryStore.getSnapshot()
-      const towns = deriveTownsFromMarkers(snapshot.world?.markers || [])
-      const markets = normalizeWorldMarkets(snapshot.world?.markets)
+      const towns = Object.values(ensureWorldTownMissionStates(snapshot.world))
+        .map((town) => normalizeTownMissionState(town, town?.townId || ''))
+        .filter(Boolean)
+        .sort((left, right) => left.townId.localeCompare(right.townId))
       if (towns.length === 0) {
         return { applied: true, command, audit: false, outputLines: ['GOD TOWN LIST: (none)'] }
       }
       const lines = [`GOD TOWN LIST: count=${towns.length}`]
       for (const town of towns) {
-        let population = 0
-        for (const record of Object.values(snapshot.agents || {})) {
-          const homeMarker = asText(record?.profile?.job?.home_marker, '', 80)
-          if (sameText(homeMarker, town.marker.name, 80)) population += 1
-        }
-        const marketCount = markets
-          .filter(market => sameText(market.marker, town.marker.name, 80))
-          .length
+        const spawn = normalizeTownSpawn(town.spawn)
         lines.push(
-          `GOD TOWN: name=${town.townName} marker=${town.marker.name} x=${town.marker.x} y=${town.marker.y} z=${town.marker.z} tag=${town.marker.tag || '(none)'} population=${population} markets=${marketCount}`
+          `GOD TOWN: townId=${town.townId} name=${town.name} status=${town.status} region=${town.region || '-'} tags=${town.tags.length ? town.tags.join('|') : '-'} spawn=${spawn ? `${spawn.dimension}@${spawn.x},${spawn.y},${spawn.z}` : '-'}`
         )
       }
       return { applied: true, command, audit: false, outputLines: lines }
+    }
+
+    if (parsed.type === 'town_register') {
+      const snapshot = memoryStore.getSnapshot()
+      const existingTown = resolveTownName(snapshot.world, parsed.townName)
+      const canonicalTown = existingTown || asText(parsed.townName, '', 80)
+      if (!canonicalTown) return { applied: false, command, reason: 'Unknown town.' }
+
+      const tx = await memoryStore.transact((memory) => {
+        const towns = ensureWorldTownMissionStates(memory.world)
+        const actors = normalizeWorldActorRegistry(memory.world?.actors, towns)
+        memory.world.towns = towns
+        memory.world.actors = actors
+
+        const alreadyPresent = Object.prototype.hasOwnProperty.call(towns, canonicalTown)
+        if (!alreadyPresent) {
+          towns[canonicalTown] = normalizeTownMissionState(null, canonicalTown)
+        }
+        memory.world.actors = normalizeWorldActorRegistry(memory.world.actors, towns)
+
+        const at = now()
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:town_register:${canonicalTown.toLowerCase()}`,
+          type: 'town_register',
+          msg: alreadyPresent
+            ? `TOWN REGISTER: ${canonicalTown} already existed in the town registry.`
+            : `TOWN REGISTER: ${canonicalTown} added to the town registry.`,
+          at,
+          town: canonicalTown,
+          meta: {
+            status: towns[canonicalTown].status,
+            town_id: canonicalTown
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:town_register:${canonicalTown.toLowerCase()}`,
+          topic: 'town_registry',
+          msg: alreadyPresent
+            ? `TOWN REGISTER: ${canonicalTown} confirmed`
+            : `TOWN REGISTER: ${canonicalTown} provisioned`,
+          at,
+          town: canonicalTown,
+          meta: {
+            status: towns[canonicalTown].status,
+            town_id: canonicalTown
+          }
+        })
+        return {
+          status: alreadyPresent ? 'existing' : 'created',
+          town: towns[canonicalTown]
+        }
+      }, { eventId: `${operationId}:town_register:${canonicalTown.toLowerCase()}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD TOWN REGISTER: town=${tx.result.town.townId} status=${tx.result.status} name=${tx.result.town.name} registry_status=${tx.result.town.status}`
+        ]
+      }
     }
 
     if (parsed.type === 'town_spawn_show') {

@@ -240,15 +240,18 @@ installCrashHandlers({
   exitOnFatal: true
 })
 
-writeLine('--- WORLD ONLINE ---')
-writeLine('Commands:')
-writeLine(' talk <agent> <message>')
-writeLine(' god <command>')
-writeLine(' {"type":"world-memory-request.v1","schemaVersion":1,...}')
-writeLine(' {"schemaVersion":"execution-handoff.v1",...}')
-writeLine(' exit')
-writeLine('---------------------')
-rl.prompt()
+async function announceReady() {
+  await startupExecutionRecovery
+  writeLine('--- WORLD ONLINE ---')
+  writeLine('Commands:')
+  writeLine(' talk <agent> <message>')
+  writeLine(' god <command>')
+  writeLine(' {"type":"world-memory-request.v1","schemaVersion":1,...}')
+  writeLine(' {"schemaVersion":"execution-handoff.v1",...}')
+  writeLine(' exit')
+  writeLine('---------------------')
+  rl.prompt()
+}
 
 /**
  * @param {string} rawInput
@@ -402,3 +405,11 @@ rl.on('line', (input) => {
 rl.on('close', () => {
   logger.info('session_closed')
 })
+
+void announceReady()
+  .catch(async (error) => {
+    logger.errorWithStack('startup_failed', error)
+    writeLine('Internal fatal startup error occurred. Shutting down.')
+    await shutdown('fatal_startup_error')
+    process.exit(1)
+  })

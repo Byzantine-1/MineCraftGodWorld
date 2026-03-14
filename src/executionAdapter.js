@@ -383,6 +383,11 @@ function buildTownSpawnCommand(townId, spawn) {
   return `town spawn set ${safeTownId} ${normalizedSpawn.dimension} ${normalizedSpawn.x} ${normalizedSpawn.y} ${normalizedSpawn.z} ${yaw} ${pitch} ${radius} ${kind}`
 }
 
+function buildTownRegisterCommand(townId) {
+  const safeTownId = isNonEmptyString(townId) ? String(townId).trim() : ''
+  return safeTownId ? `town register ${safeTownId}` : ''
+}
+
 function createEmbodimentForResult({ proposal, world, townId }) {
   if (!isPlainObject(proposal) || proposal.type !== 'PLAYER_GET_SPAWN') {
     return undefined
@@ -483,11 +488,30 @@ function createTranslation(handoff, world, options) {
     }
   }
 
+  if (proposal.type === 'TOWN_REGISTER') {
+    validateResolvedTown = false
+    const requestedTownId = isNonEmptyString(proposal.args?.townId)
+      ? options.resolveTownId(proposal.args.townId)
+      : ''
+    const targetTownId = requestedTownId || resolveTownId(proposal.townId)
+    if (!isNonEmptyString(targetTownId)) {
+      failures.push(buildFailure('town_id_present', 'Missing townId.'))
+    } else {
+      translationTownId = targetTownId
+      const command = buildTownRegisterCommand(targetTownId)
+      if (command) {
+        authorityCommands.push(command)
+      }
+    }
+  }
+
   if (validateResolvedTown && (!isNonEmptyString(resolvedTownId) || !hasOwn(world.towns || {}, resolvedTownId))) {
     failures.push(buildFailure('town_exists', `Unknown authoritative town: ${proposal.townId}`))
   }
 
-  if (proposal.type === 'TOWN_SET_SPAWN') {
+  if (proposal.type === 'TOWN_REGISTER') {
+    // handled above
+  } else if (proposal.type === 'TOWN_SET_SPAWN') {
     // handled above
   } else if (
     proposal.type === 'PLAYER_ASSIGN_TOWN'

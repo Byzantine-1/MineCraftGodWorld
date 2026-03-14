@@ -450,3 +450,34 @@ test('execution adapter classifies replayed handoffs as duplicate using durable 
   assert.match(duplicate.worldState.postExecutionSnapshotHash, /^[0-9a-f]{64}$/)
   assert.equal(reloadedStore.getSnapshot().world.execution.history.length >= 1, true)
 })
+
+test('execution adapter provisions a new authoritative town through TOWN_REGISTER', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  const handoff = createHandoff({
+    proposalType: 'TOWN_REGISTER',
+    command: 'town register gamma',
+    townId: 'gamma',
+    args: { townId: 'gamma' },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+
+  const result = await executionAdapter.executeHandoff({ handoff, agents })
+
+  assert.equal(result.status, 'executed')
+  assert.equal(result.accepted, true)
+  assert.equal(result.executed, true)
+  assert.equal(result.reasonCode, 'EXECUTED')
+  assert.deepEqual(result.authorityCommands, ['town register gamma'])
+  assert.equal(result.townId, 'gamma')
+  assert.ok(isValidExecutionResult(result))
+
+  const snapshot = memoryStore.getSnapshot()
+  assert.ok(snapshot.world.towns.gamma)
+  assert.ok(snapshot.world.actors['gamma.mayor'])
+  assert.ok(snapshot.world.actors['gamma.captain'])
+  assert.ok(snapshot.world.actors['gamma.warden'])
+})
