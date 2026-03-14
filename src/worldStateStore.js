@@ -257,13 +257,15 @@ function createSqliteWorldStateStore({
 
   function runSql(sql, { json = false } = {}) {
     ensureParentDirectory()
-    const args = [resolvedDbPath]
+    const args = []
     if (json) args.push('-json')
-    args.push(sql)
+    args.push(resolvedDbPath)
     try {
       const stdout = execFileSync(resolvedSqliteCommand, args, {
         encoding: 'utf8',
-        windowsHide: true
+        windowsHide: true,
+        input: `${String(sql || '')}\n`,
+        maxBuffer: 10 * 1024 * 1024
       })
       if (!json) return stdout
       if (!stdout || !stdout.trim()) return []

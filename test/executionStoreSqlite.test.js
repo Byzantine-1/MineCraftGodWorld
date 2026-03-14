@@ -217,6 +217,7 @@ test('sqlite backend initializes schema and persists receipts for lookup', async
       'execution_receipts',
       'execution_pending',
       'execution_event_ledger',
+      'execution_meta',
       'world_state_snapshots',
       'world_towns',
       'world_actors',
@@ -228,6 +229,7 @@ test('sqlite backend initializes schema and persists receipts for lookup', async
 
   assert.deepEqual(tables.map((row) => row.name), [
     'execution_event_ledger',
+    'execution_meta',
     'execution_pending',
     'execution_receipts',
     'world_actors',
@@ -317,6 +319,92 @@ test('sqlite world-state bootstrap migrates authoritative towns/actors from memo
   assert(sqliteActorRows.some((row) => row.actor_id === 'alpha.mayor'))
   assert(sqliteActorRows.some((row) => row.actor_id === 'beta.captain'))
   assert(sqliteActorRows.some((row) => row.actor_id === 'beta.warden'))
+})
+
+test('sqlite world-state bootstrap tolerates large snapshots without command-line overflow', async () => {
+  const { memoryPath, sqlitePath } = createTempPaths('mvp-sqlite-large-bootstrap-')
+  const now = fixedNowFactory()
+  const memoryStore = createMemoryStore({ filePath: memoryPath, now })
+
+  await memoryStore.transact((memory) => {
+    memory.world.debugBlob = 'x'.repeat(50000)
+    memory.world.chronicle = Array.from({ length: 6 }, (_, index) => ({
+      id: `large-${index}`,
+      type: 'town-update',
+      town: 'alpha',
+      at: index + 1,
+      msg: `entry-${index}-` + 'y'.repeat(220)
+    }))
+  }, { eventId: 'sqlite-world-bootstrap-large-snapshot' })
+
+  const executionStore = createExecutionStore({
+    memoryStore,
+    persistenceBackend: createSqliteExecutionPersistence({ dbPath: sqlitePath, now })
+  })
+
+  const snapshotRow = sqliteJson(sqlitePath, `
+    SELECT LENGTH(payload_json) AS payload_length
+    FROM world_state_snapshots
+    ORDER BY snapshot_id DESC
+    LIMIT 1;
+  `)[0]
+
+  assert.equal(executionStore.worldStateBackendName, 'sqlite')
+  assert.equal(typeof memoryStore.getSnapshot().world.debugBlob, 'string')
+  assert.equal(memoryStore.getSnapshot().world.debugBlob.length, 50000)
+  assert(snapshotRow.payload_length > 50000)
+})
+
+test('sqlite world-memory sync reuses persisted chronicle projection when snapshot is unchanged', async () => {
+  const { memoryPath, sqlitePath } = createTempPaths('mvp-sqlite-world-memory-cache-')
+  const firstNow = () => Date.parse('2026-02-22T00:00:00.000Z')
+  const secondNow = () => Date.parse('2026-02-22T01:00:00.000Z')
+
+  const firstMemoryStore = createMemoryStore({ filePath: memoryPath, now: firstNow })
+  const firstExecutionStore = createExecutionStore({
+    memoryStore: firstMemoryStore,
+    persistenceBackend: createSqliteExecutionPersistence({ dbPath: sqlitePath, now: firstNow })
+  })
+
+  await firstMemoryStore.transact((memory) => {
+    memory.world.chronicle = [
+      {
+        id: 'chronicle-cache-01',
+        type: 'mission',
+        msg: 'Alpha posted a watch order.',
+        at: 9000000000010,
+        town: 'alpha',
+        meta: { factionId: 'iron_pact' }
+      }
+    ]
+  }, { eventId: 'sqlite-world-memory-cache-seed' })
+
+  const firstRows = firstExecutionStore.listChronicleRecords({ townId: 'alpha', limit: 10 })
+  const firstSyncMeta = sqliteJson(sqlitePath, `
+    SELECT meta_key, meta_value
+    FROM execution_meta
+    WHERE meta_key IN ('world_memory.snapshot_hash', 'world_memory.decision_epoch')
+    ORDER BY meta_key ASC;
+  `)
+  const firstTimestamp = sqliteJson(sqlitePath, `
+    SELECT MAX(updated_at) AS updated_at
+    FROM world_chronicle_records;
+  `)[0].updated_at
+
+  const secondMemoryStore = createMemoryStore({ filePath: memoryPath, now: secondNow })
+  const secondExecutionStore = createExecutionStore({
+    memoryStore: secondMemoryStore,
+    persistenceBackend: createSqliteExecutionPersistence({ dbPath: sqlitePath, now: secondNow })
+  })
+  const secondRows = secondExecutionStore.listChronicleRecords({ townId: 'alpha', limit: 10 })
+  const secondTimestamp = sqliteJson(sqlitePath, `
+    SELECT MAX(updated_at) AS updated_at
+    FROM world_chronicle_records;
+  `)[0].updated_at
+
+  assert.deepEqual(secondRows, firstRows)
+  assert.equal(firstSyncMeta.length, 2)
+  assert.equal(Number(secondTimestamp), Number(firstTimestamp))
 })
 
 test('sqlite authoritative world state preserves town spawn and player assignment across restart', async () => {

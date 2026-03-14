@@ -3,6 +3,7 @@ const path = require('path')
 const { execFileSync } = require('child_process')
 
 const { AppError } = require('./errors')
+const { createAuthoritativeSnapshotProjection } = require('./worldSnapshotProjection')
 const {
   WORLD_STATE_MIGRATION_META_KEY,
   createMemoryWorldStateStore,
@@ -16,6 +17,8 @@ const MAX_WORLD_MEMORY_QUERY_LIMIT = 200
 const CHRONICLE_RECORD_TYPE = 'chronicle-record.v1'
 const HISTORY_RECORD_TYPE = 'history-record.v1'
 const HISTORY_SUMMARY_SCHEMA_VERSION = 1
+const WORLD_MEMORY_SNAPSHOT_HASH_META_KEY = 'world_memory.snapshot_hash'
+const WORLD_MEMORY_DECISION_EPOCH_META_KEY = 'world_memory.decision_epoch'
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -833,6 +836,7 @@ function createSqliteExecutionPersistence(options = {}) {
   }
 
   let initialized = false
+  let cachedWorldMemorySyncState = null
 
   function sqlValue(value) {
     if (value === null || value === undefined) return 'NULL'
@@ -851,10 +855,12 @@ function createSqliteExecutionPersistence(options = {}) {
 
       const args = ['-bail', '-cmd', '.timeout 5000']
       if (json) args.push('-json')
-      args.push(dbPath, sql)
+      args.push(dbPath)
       const stdout = execFileSync(sqliteCommand, args, {
         encoding: 'utf8',
-        windowsHide: true
+        windowsHide: true,
+        input: `${String(sql || '')}\n`,
+        maxBuffer: 10 * 1024 * 1024
       })
       if (!json) {
         return stdout
@@ -929,6 +935,11 @@ function createSqliteExecutionPersistence(options = {}) {
         created_at INTEGER NOT NULL
       );
       CREATE INDEX IF NOT EXISTS idx_execution_event_ledger_handoff ON execution_event_ledger(handoff_id, created_at DESC);
+      CREATE TABLE IF NOT EXISTS execution_meta (
+        meta_key TEXT PRIMARY KEY,
+        meta_value TEXT NOT NULL,
+        updated_at INTEGER NOT NULL
+      );
       CREATE TABLE IF NOT EXISTS world_chronicle_records (
         record_id TEXT PRIMARY KEY,
         source_id TEXT NOT NULL UNIQUE,
@@ -951,6 +962,39 @@ function createSqliteExecutionPersistence(options = {}) {
       backend: 'sqlite',
       dbPath
     })
+  }
+
+  function readExecutionMeta(metaKey) {
+    ensureInitialized()
+    const safeMetaKey = asText(metaKey, 120)
+    if (!safeMetaKey) return null
+
+    const rows = runSql(`
+      SELECT meta_value
+      FROM execution_meta
+      WHERE meta_key = ${sqlValue(safeMetaKey)}
+      LIMIT 1;
+    `, { json: true })
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return null
+    }
+
+    return asText(rows[0].meta_value, 240) || null
+  }
+
+  function readWorldMemorySyncState() {
+    if (cachedWorldMemorySyncState !== null) {
+      return cachedWorldMemorySyncState
+    }
+
+    const snapshotHash = readExecutionMeta(WORLD_MEMORY_SNAPSHOT_HASH_META_KEY)
+    const decisionEpoch = asNullableInteger(readExecutionMeta(WORLD_MEMORY_DECISION_EPOCH_META_KEY))
+    cachedWorldMemorySyncState = {
+      snapshotHash,
+      decisionEpoch
+    }
+    return cachedWorldMemorySyncState
   }
 
   function findReceipt(input) {
@@ -1256,6 +1300,22 @@ function createSqliteExecutionPersistence(options = {}) {
 
   function syncWorldMemoryFromSnapshot(world) {
     ensureInitialized()
+    const projection = createAuthoritativeSnapshotProjection(isPlainObject(world) ? world : {})
+    const currentSyncState = readWorldMemorySyncState()
+    if (
+      currentSyncState?.snapshotHash
+      && currentSyncState.snapshotHash === projection.snapshotHash
+      && currentSyncState.decisionEpoch === projection.decisionEpoch
+    ) {
+      return {
+        backend: 'sqlite',
+        chronicleCount: null,
+        skipped: true,
+        snapshotHash: projection.snapshotHash,
+        decisionEpoch: projection.decisionEpoch
+      }
+    }
+
     const records = buildChronicleRecordsFromWorld(world)
     const timestamp = Math.trunc(now())
     const statements = [
@@ -1289,18 +1349,49 @@ function createSqliteExecutionPersistence(options = {}) {
         );
       `)
     }
+    statements.push(`
+      INSERT OR REPLACE INTO execution_meta (
+        meta_key,
+        meta_value,
+        updated_at
+      ) VALUES (
+        ${sqlValue(WORLD_MEMORY_SNAPSHOT_HASH_META_KEY)},
+        ${sqlValue(projection.snapshotHash)},
+        ${sqlValue(timestamp)}
+      );
+    `)
+    statements.push(`
+      INSERT OR REPLACE INTO execution_meta (
+        meta_key,
+        meta_value,
+        updated_at
+      ) VALUES (
+        ${sqlValue(WORLD_MEMORY_DECISION_EPOCH_META_KEY)},
+        ${sqlValue(String(projection.decisionEpoch))},
+        ${sqlValue(timestamp)}
+      );
+    `)
     statements.push('COMMIT;')
     runSql(statements.join('\n'))
+    cachedWorldMemorySyncState = {
+      snapshotHash: projection.snapshotHash,
+      decisionEpoch: projection.decisionEpoch
+    }
 
     safeLogger.info('execution_store_world_memory_synced', {
       backend: 'sqlite',
       chronicleCount: records.length,
+      snapshotHash: projection.snapshotHash,
+      decisionEpoch: projection.decisionEpoch,
       dbPath
     })
 
     return {
       backend: 'sqlite',
-      chronicleCount: records.length
+      chronicleCount: records.length,
+      skipped: false,
+      snapshotHash: projection.snapshotHash,
+      decisionEpoch: projection.decisionEpoch
     }
   }
 

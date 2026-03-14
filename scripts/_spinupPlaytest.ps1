@@ -30,7 +30,7 @@ function Wait-LogPattern {
   return $false
 }
 
-function First-LineMatch {
+function Select-FirstLineMatch {
   param(
     [string]$Path,
     [string]$Pattern
@@ -72,8 +72,8 @@ try {
     throw "Server did not reach ready state."
   }
 
-  $versionLine = First-LineMatch -Path $latestLog -Pattern "Loading Paper 1\.21\.11.*Minecraft 1\.21\.11"
-  $bindLine = First-LineMatch -Path $latestLog -Pattern "Starting Minecraft server on 127\.0\.0\.1:25565"
+  $versionLine = Select-FirstLineMatch -Path $latestLog -Pattern "Loading Paper 1\.21\.11.*Minecraft 1\.21\.11"
+  $bindLine = Select-FirstLineMatch -Path $latestLog -Pattern "Starting Minecraft server on 127\.0\.0\.1:25565"
 
   $server.StandardInput.WriteLine("difficulty peaceful")
   $server.StandardInput.WriteLine("gamerule domobspawning false")
@@ -91,7 +91,7 @@ try {
 
   $server.StandardInput.WriteLine("list")
   Start-Sleep -Seconds 2
-  $listLine = First-LineMatch -Path $latestLog -Pattern "players online"
+  $listLine = Select-FirstLineMatch -Path $latestLog -Pattern "players online"
 
   $testerScript = @'
 const mineflayer = require("mineflayer");
