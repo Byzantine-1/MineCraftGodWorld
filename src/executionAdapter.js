@@ -2,6 +2,12 @@ const { createHash } = require('crypto')
 
 const { AppError } = require('./errors')
 const { createExecutionStore } = require('./executionStore')
+const {
+  normalizeTownSpawn,
+  resolvePlayerSpawn,
+  resolvePlayerTownId,
+  selectStarterTownId
+} = require('./playerSpawn')
 const { createAuthoritativeSnapshotProjection } = require('./worldSnapshotProjection')
 
 const EXECUTION_HANDOFF_SCHEMA = 'execution-handoff.v1'
@@ -228,6 +234,8 @@ function classifyEngineReason(reason) {
   if (lower === 'unknown town.') return 'UNKNOWN_TOWN'
   if (lower === 'unknown project.') return 'UNKNOWN_PROJECT'
   if (lower === 'unknown salvage target.') return 'UNKNOWN_SALVAGE_TARGET'
+  if (lower === 'invalid spawn.') return 'INVALID_TOWN_SPAWN'
+  if (lower === 'no starter towns configured.') return 'NO_STARTER_TOWNS'
   if (lower === 'major mission already active.') return 'MAJOR_MISSION_ALREADY_ACTIVE'
   if (lower === 'no major mission briefing is available. talk to the mayor first.') {
     return 'MAYOR_BRIEFING_REQUIRED'
@@ -360,17 +368,134 @@ function isValidExecutionResult(result) {
   return result.executionId === expectedId
 }
 
+function isAutoTownToken(value) {
+  return isNonEmptyString(value) && String(value).trim().toLowerCase() === 'auto'
+}
+
+function buildTownSpawnCommand(townId, spawn) {
+  const safeTownId = isNonEmptyString(townId) ? String(townId).trim() : ''
+  const normalizedSpawn = normalizeTownSpawn(spawn)
+  if (!safeTownId || !normalizedSpawn) return ''
+  const yaw = Number.isFinite(Number(normalizedSpawn.yaw)) ? Number(normalizedSpawn.yaw) : 0
+  const pitch = Number.isFinite(Number(normalizedSpawn.pitch)) ? Number(normalizedSpawn.pitch) : 0
+  const radius = Number.isInteger(Number(normalizedSpawn.radius)) ? Number(normalizedSpawn.radius) : 2
+  const kind = isNonEmptyString(normalizedSpawn.kind) ? String(normalizedSpawn.kind).trim() : 'town_hub'
+  return `town spawn set ${safeTownId} ${normalizedSpawn.dimension} ${normalizedSpawn.x} ${normalizedSpawn.y} ${normalizedSpawn.z} ${yaw} ${pitch} ${radius} ${kind}`
+}
+
+function createEmbodimentForResult({ proposal, world, townId }) {
+  if (!isPlainObject(proposal) || proposal.type !== 'PLAYER_GET_SPAWN') {
+    return undefined
+  }
+  const playerId = isNonEmptyString(proposal.args?.playerId)
+    ? String(proposal.args.playerId).trim()
+    : ''
+  if (!playerId) return undefined
+
+  const resolution = resolvePlayerSpawn(world, {
+    playerId,
+    preferredTownId: townId
+  })
+  if (!resolution.townId) return undefined
+
+  const spawn = resolution.spawn || {}
+  const action = {
+    type: 'teleport',
+    target: {
+      kind: 'player',
+      id: playerId
+    },
+    dimension: spawn.dimension,
+    x: spawn.x,
+    y: spawn.y,
+    z: spawn.z,
+    meta: {
+      townId: resolution.townId,
+      source: resolution.source,
+      assigned: resolution.assigned,
+      radius: Number.isInteger(Number(spawn.radius)) ? Number(spawn.radius) : 2,
+      kind: isNonEmptyString(spawn.kind) ? String(spawn.kind).trim() : null
+    }
+  }
+  if (Number.isFinite(Number(spawn.yaw))) action.yaw = Number(spawn.yaw)
+  if (Number.isFinite(Number(spawn.pitch))) action.pitch = Number(spawn.pitch)
+
+  return {
+    backendHint: 'bridge',
+    actions: [action]
+  }
+}
+
 function createTranslation(handoff, world, options) {
   const proposal = handoff.proposal
   const failures = []
   const resolvedTownId = options.resolveTownId(proposal.townId)
   const authorityCommands = []
+  let translationTownId = resolvedTownId || proposal.townId
+  let validateResolvedTown = true
 
-  if (!isNonEmptyString(resolvedTownId) || !hasOwn(world.towns || {}, resolvedTownId)) {
+  if (proposal.type === 'PLAYER_ASSIGN_TOWN' || proposal.type === 'PLAYER_GET_TOWN' || proposal.type === 'PLAYER_GET_SPAWN') {
+    validateResolvedTown = false
+    const playerId = isNonEmptyString(proposal.args?.playerId)
+      ? String(proposal.args.playerId).trim()
+      : ''
+    const requestedTownId = isNonEmptyString(proposal.args?.townId)
+      ? options.resolveTownId(proposal.args.townId)
+      : ''
+    const preferredTownId = requestedTownId || (isAutoTownToken(proposal.townId) ? '' : resolvedTownId)
+    const hasExplicitTownPreference = Boolean(requestedTownId || (!isAutoTownToken(proposal.townId) && isNonEmptyString(resolvedTownId)))
+
+    if (!playerId) {
+      failures.push(buildFailure('player_id_present', 'Missing playerId.'))
+    } else if (hasExplicitTownPreference && !hasOwn(world.towns || {}, preferredTownId)) {
+      failures.push(buildFailure('town_exists', `Unknown authoritative town: ${preferredTownId || proposal.townId}`))
+    } else if (proposal.type === 'PLAYER_ASSIGN_TOWN') {
+      const targetTownId = preferredTownId || options.selectStarterTownId(world, playerId)
+      if (!targetTownId) {
+        failures.push(buildFailure('starter_town_exists', `No starter towns configured for ${playerId}.`))
+      } else {
+        translationTownId = targetTownId
+        authorityCommands.push(preferredTownId ? `player assign ${playerId} ${targetTownId}` : `player assign ${playerId}`)
+      }
+    } else {
+      const targetTownId = options.resolvePlayerTownId(world, playerId, preferredTownId)
+      if (!targetTownId) {
+        failures.push(buildFailure('starter_town_exists', `No starter towns configured for ${playerId}.`))
+      } else {
+        translationTownId = targetTownId
+        authorityCommands.push(proposal.type === 'PLAYER_GET_TOWN' ? `player town ${playerId}` : `player spawn ${playerId}`)
+      }
+    }
+  }
+
+  if (proposal.type === 'TOWN_SET_SPAWN') {
+    validateResolvedTown = false
+    const spawn = normalizeTownSpawn(proposal.args?.spawn || proposal.args)
+    if (!spawn) {
+      failures.push(buildFailure('town_spawn_valid', 'Spawn must include dimension + numeric x/y/z.'))
+    }
+    if (!isNonEmptyString(resolvedTownId) || !hasOwn(world.towns || {}, resolvedTownId)) {
+      failures.push(buildFailure('town_exists', `Unknown authoritative town: ${proposal.townId}`))
+    }
+    const command = buildTownSpawnCommand(resolvedTownId, spawn)
+    if (command) {
+      authorityCommands.push(command)
+    }
+  }
+
+  if (validateResolvedTown && (!isNonEmptyString(resolvedTownId) || !hasOwn(world.towns || {}, resolvedTownId))) {
     failures.push(buildFailure('town_exists', `Unknown authoritative town: ${proposal.townId}`))
   }
 
-  if (proposal.type === 'MAYOR_ACCEPT_MISSION') {
+  if (proposal.type === 'TOWN_SET_SPAWN') {
+    // handled above
+  } else if (
+    proposal.type === 'PLAYER_ASSIGN_TOWN'
+    || proposal.type === 'PLAYER_GET_TOWN'
+    || proposal.type === 'PLAYER_GET_SPAWN'
+  ) {
+    // handled above
+  } else if (proposal.type === 'MAYOR_ACCEPT_MISSION') {
     if (!isNonEmptyString(proposal.args?.missionId)) {
       failures.push(buildFailure('mission_id_present', 'Missing advisory missionId.'))
     }
@@ -381,6 +506,40 @@ function createTranslation(handoff, world, options) {
       }
     }
     authorityCommands.push(`mayor talk ${resolvedTownId}`, `mayor accept ${resolvedTownId}`)
+  } else if (proposal.type === 'MISSION_ADVANCE' || proposal.type === 'MISSION_COMPLETE' || proposal.type === 'MISSION_FAIL') {
+    const activeMajorMissionId = (
+      resolvedTownId
+      && hasOwn(world.towns || {}, resolvedTownId)
+      && isNonEmptyString(world.towns[resolvedTownId]?.activeMajorMissionId)
+    )
+      ? String(world.towns[resolvedTownId].activeMajorMissionId).trim()
+      : ''
+    const requestedMissionId = isNonEmptyString(proposal.args?.missionId)
+      ? String(proposal.args.missionId).trim()
+      : ''
+
+    if (!activeMajorMissionId) {
+      failures.push(buildFailure('mission_active', `No active major mission for ${resolvedTownId || proposal.townId}.`))
+    }
+    if (requestedMissionId && activeMajorMissionId && requestedMissionId.toLowerCase() !== activeMajorMissionId.toLowerCase()) {
+      failures.push(buildFailure(
+        'mission_matches_active',
+        `Active major mission for ${resolvedTownId} is ${activeMajorMissionId}, not ${requestedMissionId}.`
+      ))
+    }
+
+    if (isNonEmptyString(resolvedTownId)) {
+      if (proposal.type === 'MISSION_ADVANCE') {
+        authorityCommands.push(`mission advance ${resolvedTownId}`)
+      } else if (proposal.type === 'MISSION_COMPLETE') {
+        authorityCommands.push(`mission complete ${resolvedTownId}`)
+      } else {
+        const failReason = isNonEmptyString(proposal.args?.reason)
+          ? String(proposal.args.reason).trim()
+          : ''
+        authorityCommands.push(failReason ? `mission fail ${resolvedTownId} ${failReason}` : `mission fail ${resolvedTownId}`)
+      }
+    }
   } else if (proposal.type === 'PROJECT_ADVANCE') {
     const projectId = proposal.args?.projectId
     if (!isNonEmptyString(projectId)) {
@@ -413,7 +572,7 @@ function createTranslation(handoff, world, options) {
   return {
     proposalType: proposal.type,
     actorId: proposal.actorId,
-    townId: resolvedTownId || proposal.townId,
+    townId: translationTownId,
     authorityCommands,
     failures
   }
@@ -626,7 +785,9 @@ function createExecutionAdapter(deps) {
     const actualSnapshotHash = beforeProjection.snapshotHash
     const translation = createTranslation(handoff, beforeWorld, {
       resolveTownId,
+      resolvePlayerTownId,
       salvageFocusMap,
+      selectStarterTownId,
       talkTypeMap
     })
     const existingReceipt = executionStore.findReceipt({
@@ -738,6 +899,7 @@ function createExecutionAdapter(deps) {
       beforeProjection
     })
 
+    const useDeferredWorldDurability = executionStore.worldStateBackendName === 'sqlite'
     let accepted = false
     for (let index = 0; index < translation.authorityCommands.length; index += 1) {
       const authorityCommand = translation.authorityCommands[index]
@@ -745,7 +907,9 @@ function createExecutionAdapter(deps) {
       const stepResult = await deps.godCommandService.applyGodCommand({
         agents,
         command: authorityCommand,
-        operationId
+        operationId,
+        // Defer durability until terminal result persistence so world + receipt + pending clear commit atomically.
+        persistWorldState: !useDeferredWorldDurability
       })
 
       if (!stepResult.applied) {
@@ -788,7 +952,7 @@ function createExecutionAdapter(deps) {
           reason: stepResult.reason || null
         })
 
-        const currentWorld = executionStore.readSnapshotSource()
+        const currentWorld = deps.memoryStore.recallWorld()
         const currentProjection = createAuthoritativeSnapshotProjection(currentWorld)
         const rejectedResult = createExecutionResult({
           handoff,
@@ -829,12 +993,24 @@ function createExecutionAdapter(deps) {
             authorityCommands: translation.authorityCommands
           })
         }
-        await executionStore.recordResult(rejectedResult)
+        await executionStore.recordResult(
+          rejectedResult,
+          accepted && useDeferredWorldDurability
+            ? {
+              worldSnapshot: currentWorld,
+              persistWorldSnapshot: true
+            }
+            : {}
+        )
         return rejectedResult
       }
 
       accepted = true
-      const progressProjection = createAuthoritativeSnapshotProjection(executionStore.readSnapshotSource())
+      const progressProjection = createAuthoritativeSnapshotProjection(
+        useDeferredWorldDurability
+          ? deps.memoryStore.recallWorld()
+          : executionStore.readSnapshotSource()
+      )
       await executionStore.markPendingExecutionProgress({
         handoffId: handoff.handoffId,
         idempotencyKey: handoff.idempotencyKey,
@@ -845,7 +1021,9 @@ function createExecutionAdapter(deps) {
       })
     }
 
-    const afterWorld = executionStore.readSnapshotSource()
+    const afterWorld = useDeferredWorldDurability
+      ? deps.memoryStore.recallWorld()
+      : executionStore.readSnapshotSource()
     const afterProjection = createAuthoritativeSnapshotProjection(afterWorld)
     const result = createExecutionResult({
       handoff,
@@ -871,7 +1049,12 @@ function createExecutionAdapter(deps) {
           duplicateOf: null
         }
       },
-      worldState: createWorldStateFromProjection(afterProjection)
+      worldState: createWorldStateFromProjection(afterProjection),
+      embodiment: createEmbodimentForResult({
+        proposal: handoff.proposal,
+        world: afterWorld,
+        townId: translation.townId
+      })
     })
     if (typeof deps.beforeTerminalReceiptPersist === 'function') {
       await deps.beforeTerminalReceiptPersist({
@@ -880,7 +1063,15 @@ function createExecutionAdapter(deps) {
         authorityCommands: translation.authorityCommands
       })
     }
-    await executionStore.recordResult(result)
+    await executionStore.recordResult(
+      result,
+      useDeferredWorldDurability
+        ? {
+          worldSnapshot: afterWorld,
+          persistWorldSnapshot: true
+        }
+        : {}
+    )
 
     logger.info('execution_adapter_handoff_executed', {
       handoffId: handoff.handoffId,

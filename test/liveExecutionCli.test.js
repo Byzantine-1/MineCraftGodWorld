@@ -5,7 +5,7 @@ const { runLiveExecutionCheck } = require('../scripts/liveExecutionCheck')
 
 test('live CLI execution handoff yields canonical deterministic authoritative results', async () => {
   const result = await runLiveExecutionCheck({
-    backend: 'memory',
+    backend: 'sqlite',
     timeoutMs: 15000
   })
 

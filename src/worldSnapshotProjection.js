@@ -1,5 +1,6 @@
 const { createHash } = require('crypto')
 const { defaultActorName, defaultTownNameFromId } = require('./worldRegistry')
+const { normalizePlayerAssignment, normalizeTownSpawn } = require('./playerSpawn')
 
 const WORLD_SNAPSHOT_TYPE = 'world-snapshot.v1'
 const WORLD_SNAPSHOT_SCHEMA_VERSION = 1
@@ -312,6 +313,7 @@ function normalizeTownImpact(entry) {
 
 function normalizeTown(entry) {
   const townId = asText(entry?.townId)
+  const spawn = normalizeTownSpawn(entry?.spawn)
   return {
     townId,
     name: asText(entry?.name, defaultTownNameFromId(townId)),
@@ -323,7 +325,8 @@ function normalizeTown(entry) {
     hope: asInteger(entry?.hope),
     dread: asInteger(entry?.dread),
     crierQueue: sortObjects(entry?.crierQueue, normalizeTownCrierEntry, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
-    recentImpacts: sortObjects(entry?.recentImpacts, normalizeTownImpact, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`)
+    recentImpacts: sortObjects(entry?.recentImpacts, normalizeTownImpact, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
+    ...(spawn ? { spawn } : {})
   }
 }
 
@@ -337,6 +340,17 @@ function normalizeActor(entry) {
     name: asText(entry?.name, defaultActorName({ role, townName: defaultTownNameFromId(townId) })),
     role,
     status: asText(entry?.status, 'active')
+  }
+}
+
+function normalizePlayer(entry, playerIdHint) {
+  const normalized = normalizePlayerAssignment(entry, asText(playerIdHint))
+  if (!normalized) return null
+  return {
+    playerId: normalized.playerId,
+    townId: asText(normalized.townId),
+    assignedAtDay: asInteger(normalized.assignedAtDay),
+    spawnPolicy: asText(normalized.spawnPolicy)
   }
 }
 
@@ -354,6 +368,7 @@ function normalizeNetherLedgerEntry(entry) {
 
 function projectAuthoritativeSnapshot(world) {
   const source = isPlainObject(world) ? world : {}
+  const players = sortRecord(source.players, (entry, playerId) => normalizePlayer(entry, playerId))
   return {
     type: WORLD_SNAPSHOT_TYPE,
     schemaVersion: WORLD_SNAPSHOT_SCHEMA_VERSION,
@@ -398,6 +413,7 @@ function projectAuthoritativeSnapshot(world) {
     projects: sortObjects(source.projects, normalizeProject, (entry) => entry.id),
     salvageRuns: sortObjects(source.salvageRuns, normalizeSalvageRun, (entry) => entry.id),
     towns: sortRecord(source.towns, (entry) => normalizeTown(entry)),
+    ...(Object.keys(players).length > 0 ? { players } : {}),
     actors: sortRecord(source.actors, (entry) => normalizeActor(entry)),
     nether: {
       eventLedger: sortObjects(source.nether?.eventLedger, normalizeNetherLedgerEntry, (entry) => `${String(entry.day).padStart(6, '0')}:${entry.id}`),

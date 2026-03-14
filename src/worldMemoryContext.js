@@ -244,15 +244,19 @@ function projectActorIdentity(actor) {
 
 function projectTownActorIdentitySelection(executionStore, townId) {
   const safeTownId = asText(townId, 80)
-  if (!safeTownId || typeof executionStore.readSnapshotSource !== 'function') {
+  if (!safeTownId) {
     return {
       townIdentity: null,
       keyActors: null
     }
   }
 
-  const world = executionStore.readSnapshotSource()
-  const townIdentity = projectTownIdentity(getTownRecord(world, safeTownId))
+  const hasWorldSnapshotReader = typeof executionStore.readSnapshotSource === 'function'
+  const world = hasWorldSnapshotReader ? executionStore.readSnapshotSource() : {}
+  const townRecord = typeof executionStore.getTown === 'function'
+    ? executionStore.getTown(safeTownId)
+    : getTownRecord(world, safeTownId)
+  const townIdentity = projectTownIdentity(townRecord)
   if (!townIdentity) {
     return {
       townIdentity: null,
@@ -260,12 +264,17 @@ function projectTownActorIdentitySelection(executionStore, townId) {
     }
   }
 
-  const officeholders = listTownOfficeholders(world, townIdentity.townId)
-  const townsfolkRepresentatives = listActorRecords(world, {
-    townId: townIdentity.townId,
-    role: 'townsfolk',
-    status: 'active'
-  }).slice(0, MAX_CONTEXT_TOWNSFOLK_REPRESENTATIVES)
+  const officeholders = typeof executionStore.listOfficeholders === 'function'
+    ? executionStore.listOfficeholders(townIdentity.townId)
+    : listTownOfficeholders(world, townIdentity.townId)
+  const townActors = typeof executionStore.listActorsByTown === 'function'
+    ? executionStore.listActorsByTown(townIdentity.townId)
+    : listActorRecords(world, { townId: townIdentity.townId })
+  const townsfolkRepresentatives = (Array.isArray(townActors) ? townActors : [])
+    .filter((actor) => asText(actor?.role, 40).toLowerCase() === 'townsfolk')
+    .filter((actor) => asText(actor?.status, 24).toLowerCase() === 'active')
+    .sort((left, right) => asText(left?.actorId, 120).localeCompare(asText(right?.actorId, 120)))
+    .slice(0, MAX_CONTEXT_TOWNSFOLK_REPRESENTATIVES)
 
   const keyActors = []
   const seenActorIds = new Set()

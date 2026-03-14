@@ -8,6 +8,11 @@ const {
   defaultTownNameFromId
 } = require('./worldRegistry')
 const {
+  MAX_WORLD_PLAYER_ENTRIES,
+  normalizePlayerAssignment,
+  normalizeTownSpawn
+} = require('./playerSpawn')
+const {
   incrementMetric,
   getRuntimeMetrics,
   recordTransactionDuration,
@@ -1728,7 +1733,7 @@ function normalizeTownMissionStateShape(townInput, townIdHint = '') {
     : {}
   const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
   const cooldown = Number(source.majorMissionCooldownUntilDay)
-  return {
+  const normalized = {
     ...normalizeTownIdentityShape(source, townIdHint),
     activeMajorMissionId,
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
@@ -1737,6 +1742,9 @@ function normalizeTownMissionStateShape(townInput, townIdHint = '') {
     crierQueue: normalizeTownCrierQueueShape(source.crierQueue),
     recentImpacts: normalizeTownRecentImpactsShape(source.recentImpacts)
   }
+  const spawn = normalizeTownSpawn(source.spawn)
+  if (spawn) normalized.spawn = spawn
+  return normalized
 }
 
 /**
@@ -1828,6 +1836,37 @@ function normalizeWorldActorsShape(actorsInput, towns = {}) {
     boundedActors[actorId] = actors[actorId]
   }
   return boundedActors
+}
+
+/**
+ * @param {unknown} playersInput
+ * @param {Record<string, any>} towns
+ */
+function normalizeWorldPlayersShape(playersInput, towns = {}) {
+  const source = (playersInput && typeof playersInput === 'object' && !Array.isArray(playersInput))
+    ? playersInput
+    : {}
+  const players = {}
+  for (const [playerRaw, playerState] of Object.entries(source)) {
+    const playerId = asText(playerRaw, '', 120)
+    if (!playerId) continue
+    const normalized = normalizePlayerAssignment(playerState, playerId)
+    if (!normalized) continue
+    if (!Object.prototype.hasOwnProperty.call(towns, normalized.townId)) {
+      towns[normalized.townId] = normalizeTownMissionStateShape(null, normalized.townId)
+    }
+    players[normalized.playerId] = {
+      ...normalized,
+      townId: asText(normalized.townId, normalized.townId, 80)
+    }
+  }
+  const orderedPlayerIds = Object.keys(players).sort((left, right) => left.localeCompare(right))
+  const boundedPlayerIds = orderedPlayerIds.slice(0, MAX_WORLD_PLAYER_ENTRIES)
+  const boundedPlayers = {}
+  for (const playerId of boundedPlayerIds) {
+    boundedPlayers[playerId] = players[playerId]
+  }
+  return boundedPlayers
 }
 
 /**
@@ -2167,6 +2206,7 @@ function freshMemoryShape(input) {
     projects: normalizeProjectsShape(source.world?.projects),
     salvageRuns: normalizeSalvageRunsShape(source.world?.salvageRuns),
     towns: normalizeTownsShape(source.world?.towns),
+    players: normalizeWorldPlayersShape(source.world?.players),
     actors: source.world?.actors && typeof source.world.actors === 'object' && !Array.isArray(source.world.actors)
       ? source.world.actors
       : {},
@@ -2177,6 +2217,7 @@ function freshMemoryShape(input) {
   }
   world.nether = normalizeNetherShape(world.nether, Number(world.events?.seed))
   reconcileMajorMissionState(world)
+  world.players = normalizeWorldPlayersShape(world.players, world.towns)
 
   return {
     agents: normalizeAgentsShape(source.agents),
@@ -2847,6 +2888,11 @@ function validateMemoryIntegritySnapshot(memory) {
           }
         }
       }
+      if (Object.prototype.hasOwnProperty.call(townState, 'spawn') && townState.spawn !== undefined) {
+        if (!normalizeTownSpawn(townState.spawn)) {
+          issues.push(`world.towns.${safeTownName}.spawn must include dimension + numeric x/y/z when present.`)
+        }
+      }
       const activeMajorMissionId = asText(townState.activeMajorMissionId, '', 200) || null
       const cooldown = Number(townState.majorMissionCooldownUntilDay)
       if (townState.activeMajorMissionId !== null && activeMajorMissionId === null) {
@@ -2928,6 +2974,29 @@ function validateMemoryIntegritySnapshot(memory) {
       }
       if (!ACTOR_REGISTRY_STATUSES.has(normalizedActor.status)) {
         issues.push(`world.actors.${normalizedActor.actorId}.status must be one of ${Array.from(ACTOR_REGISTRY_STATUSES).join(', ')}.`)
+      }
+    }
+  }
+  if (!world.players || typeof world.players !== 'object' || Array.isArray(world.players)) {
+    issues.push('world.players must be an object.')
+  } else {
+    if (Object.keys(world.players).length > MAX_WORLD_PLAYER_ENTRIES) {
+      issues.push(`world.players exceeds max entries ${MAX_WORLD_PLAYER_ENTRIES}.`)
+    }
+    const seenPlayerIds = new Set()
+    for (const [playerKey, playerState] of Object.entries(world.players)) {
+      const normalizedPlayer = normalizePlayerAssignment(playerState, playerKey)
+      if (!normalizedPlayer) {
+        issues.push(`world.players.${playerKey || '?' } contains invalid player assignment.`)
+        continue
+      }
+      const playerIdKey = normalizedPlayer.playerId.toLowerCase()
+      if (seenPlayerIds.has(playerIdKey)) {
+        issues.push(`world.players has duplicate playerId ${normalizedPlayer.playerId}.`)
+      }
+      seenPlayerIds.add(playerIdKey)
+      if (!Object.prototype.hasOwnProperty.call(world.towns || {}, normalizedPlayer.townId)) {
+        issues.push(`world.players.${normalizedPlayer.playerId} references unknown town ${normalizedPlayer.townId}.`)
       }
     }
   }
@@ -3126,6 +3195,7 @@ function createMemoryStore(options = {}) {
   function transact(mutator, opts = {}) {
     const run = async () => {
       const eventId = opts.eventId ? asText(opts.eventId, '', 200) : ''
+      const shouldPersist = opts.persist !== false
       const startedAt = now()
       const phaseDurations = enableTxTimers
         ? {
@@ -3137,42 +3207,52 @@ function createMemoryStore(options = {}) {
           totalTxMs: 0
         }
         : null
+      const applyMutation = async (current) => {
+        if (eventId && hasEvent(current.world.processedEventIds, eventId)) {
+          incrementMetric('duplicateEventsSkipped')
+          incrementMetric('transactionsAborted')
+          logger.warn(`DUPLICATE_EVENT_SKIPPED: ${eventId}`)
+          return { skipped: true, result: null, persisted: false }
+        }
+
+        if (simulateCrash && Math.random() < 0.1) {
+          throw new AppError({
+            code: 'SIMULATED_CRASH',
+            message: 'Simulated crash after lock acquisition before commit.',
+            recoverable: false,
+            metadata: { eventId }
+          })
+        }
+
+        const cloneStartedAt = phaseDurations ? now() : 0
+        const working = cloneMemory(current)
+        if (phaseDurations) phaseDurations.cloneMs = now() - cloneStartedAt
+        const result = await mutator(working)
+
+        if (eventId) markEvent(working, eventId)
+        if (shouldPersist) await persistSnapshotAtomically(working, phaseDurations)
+        state = working
+
+        incrementMetric('transactionsCommitted')
+        if (eventId) incrementMetric('eventsProcessed')
+        return { skipped: false, result, persisted: shouldPersist }
+      }
       try {
-        const txResult = await withFileLock(async ({ lockWaitMs }) => {
-          if (phaseDurations) phaseDurations.lockWaitMs = lockWaitMs
-          // Always reload inside the lock so each writer mutates the latest committed snapshot.
-          const current = await loadFromDiskUnderLock()
+        let txResult
+        if (shouldPersist) {
+          txResult = await withFileLock(async ({ lockWaitMs }) => {
+            if (phaseDurations) phaseDurations.lockWaitMs = lockWaitMs
+            // Persisted writes always reload inside the lock so each writer sees the latest committed snapshot.
+            const current = await loadFromDiskUnderLock()
+            state = current
+            return applyMutation(current)
+          })
+        } else {
+          // Deferred writes intentionally mutate the in-memory working snapshot without touching durable storage.
+          const current = ensureLoaded()
           state = current
-
-          if (eventId && hasEvent(current.world.processedEventIds, eventId)) {
-            incrementMetric('duplicateEventsSkipped')
-            incrementMetric('transactionsAborted')
-            logger.warn(`DUPLICATE_EVENT_SKIPPED: ${eventId}`)
-            return { skipped: true, result: null }
-          }
-
-          if (simulateCrash && Math.random() < 0.1) {
-            throw new AppError({
-              code: 'SIMULATED_CRASH',
-              message: 'Simulated crash after lock acquisition before commit.',
-              recoverable: false,
-              metadata: { eventId }
-            })
-          }
-
-          const cloneStartedAt = phaseDurations ? now() : 0
-          const working = cloneMemory(current)
-          if (phaseDurations) phaseDurations.cloneMs = now() - cloneStartedAt
-          const result = await mutator(working)
-
-          if (eventId) markEvent(working, eventId)
-          if (opts.persist !== false) await persistSnapshotAtomically(working, phaseDurations)
-          state = working
-
-          incrementMetric('transactionsCommitted')
-          if (eventId) incrementMetric('eventsProcessed')
-          return { skipped: false, result }
-        })
+          txResult = await applyMutation(current)
+        }
 
         const durationMs = now() - startedAt
         if (phaseDurations) phaseDurations.totalTxMs = durationMs
@@ -3330,6 +3410,21 @@ function createMemoryStore(options = {}) {
     return getSnapshot().world
   }
 
+  /**
+   * Replace the in-memory world snapshot without forcing a disk write.
+   * Used by persistence adapters to hydrate authoritative world state on boot.
+   * @param {unknown} world
+   */
+  function replaceWorldSnapshot(world) {
+    const current = ensureLoaded()
+    state = freshMemoryShape({
+      agents: current.agents,
+      factions: current.factions,
+      world
+    })
+    return cloneMemory(state.world)
+  }
+
   async function saveAllMemory() {
     await transact(() => {}, { persist: true, eventId: undefined })
   }
@@ -3351,7 +3446,8 @@ function createMemoryStore(options = {}) {
     rememberWorld,
     recallAgent,
     recallFaction,
-    recallWorld
+    recallWorld,
+    replaceWorldSnapshot
   }
 }
 

@@ -5,7 +5,7 @@ const { runLiveWorldMemoryCheck } = require('../scripts/liveWorldMemoryCheck')
 
 test('live CLI world-memory retrieval responds with canonical bounded deterministic JSON', async () => {
   const result = await runLiveWorldMemoryCheck({
-    backend: 'memory',
+    backend: 'sqlite',
     timeoutMs: 15000
   })
 

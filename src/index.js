@@ -98,7 +98,7 @@ function parseJsonObjectEnv(name) {
 }
 
 function selectExecutionPersistenceConfig() {
-  const backend = String(process.env.EXECUTION_PERSISTENCE_BACKEND || 'memory').trim().toLowerCase() || 'memory'
+  const backend = String(process.env.EXECUTION_PERSISTENCE_BACKEND || 'sqlite').trim().toLowerCase() || 'sqlite'
   return {
     backend,
     sqliteDbPath: backend === 'sqlite'

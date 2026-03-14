@@ -234,12 +234,30 @@ function createRawWorldFixture() {
         status: 'active',
         region: 'lowlands',
         tags: ['capital', 'trade'],
+        spawn: {
+          dimension: 'overworld',
+          x: 8,
+          y: 80,
+          z: -6,
+          yaw: 90,
+          pitch: 0,
+          radius: 4,
+          kind: 'town_hub'
+        },
         activeMajorMissionId: null,
         majorMissionCooldownUntilDay: 0,
         hope: 55,
         dread: 35,
         crierQueue: [],
         recentImpacts: []
+      }
+    },
+    players: {
+      Builder01: {
+        playerId: 'Builder01',
+        townId: 'alpha',
+        assignedAtDay: 4,
+        spawnPolicy: 'explicit_town'
       }
     },
     actors: {
@@ -303,6 +321,24 @@ test('authoritative snapshot projection hash is stable for equivalent world stat
   assert.equal(rightProjection.snapshotHash, leftProjection.snapshotHash)
   assert.equal(leftProjection.snapshot.towns.alpha.name, 'Ironvale')
   assert.deepEqual(leftProjection.snapshot.towns.beta.tags, ['frontier', 'watch'])
+  assert.deepEqual(leftProjection.snapshot.towns.alpha.spawn, {
+    dimension: 'overworld',
+    x: 8,
+    y: 80,
+    z: -6,
+    yaw: 90,
+    pitch: 0,
+    radius: 4,
+    kind: 'town_hub'
+  })
+  assert.deepEqual(leftProjection.snapshot.players, {
+    Builder01: {
+      playerId: 'Builder01',
+      townId: 'alpha',
+      assignedAtDay: 4,
+      spawnPolicy: 'explicit_town'
+    }
+  })
   assert.equal(leftProjection.snapshot.actors['alpha.mayor'].name, 'Mayor Elira Vale')
 })
 

@@ -843,6 +843,123 @@ test('town list and town board are read-only', async () => {
   assert.deepEqual(after, before)
 })
 
+test('town spawn set persists authoritative spawn metadata and town spawn show stays read-only', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 10 64 10 town:alpha',
+    operationId: 'town-spawn-seed-alpha'
+  })
+
+  const setResult = await service.applyGodCommand({
+    agents,
+    command: 'town spawn set alpha overworld 8 80 -6 90 0 4 town_hub',
+    operationId: 'town-spawn-set-alpha'
+  })
+  const snapshotAfterSet = memoryStore.getSnapshot()
+  const showResult = await service.applyGodCommand({
+    agents,
+    command: 'town spawn show alpha',
+    operationId: 'town-spawn-show-alpha'
+  })
+  const snapshotAfterShow = memoryStore.getSnapshot()
+
+  assert.equal(setResult.applied, true)
+  assert.equal(showResult.applied, true)
+  assert.deepEqual(snapshotAfterShow, snapshotAfterSet)
+  assert.deepEqual(snapshotAfterSet.world.towns.alpha.spawn, {
+    dimension: 'overworld',
+    x: 8,
+    y: 80,
+    z: -6,
+    yaw: 90,
+    pitch: 0,
+    radius: 4,
+    kind: 'town_hub'
+  })
+  assert.ok(showResult.outputLines.some((line) => line.includes('GOD TOWN SPAWN: town=alpha')))
+  assert.ok(showResult.outputLines.some((line) => line.includes('dimension=overworld')))
+  assert.ok(showResult.outputLines.some((line) => line.includes('x=8 y=80 z=-6')))
+})
+
+test('player assignment chooses a deterministic starter town and player spawn returns the configured town hub', async () => {
+  async function runScenario(store) {
+    const service = createGodCommandService({ memoryStore: store })
+    const agents = createAgents()
+
+    await service.applyGodCommand({
+      agents,
+      command: 'mark add alpha_hall 0 64 0 town:alpha',
+      operationId: 'player-assign-seed-alpha'
+    })
+    await service.applyGodCommand({
+      agents,
+      command: 'mark add beta_gate 20 64 20 town:beta',
+      operationId: 'player-assign-seed-beta'
+    })
+    await service.applyGodCommand({
+      agents,
+      command: 'town spawn set alpha overworld 2 81 2 0 0 3 alpha_hub',
+      operationId: 'player-assign-spawn-alpha'
+    })
+    await service.applyGodCommand({
+      agents,
+      command: 'town spawn set beta overworld 22 82 22 180 0 5 beta_hub',
+      operationId: 'player-assign-spawn-beta'
+    })
+
+    const assign = await service.applyGodCommand({
+      agents,
+      command: 'player assign Builder01',
+      operationId: 'player-assign-builder01'
+    })
+    const snapshotAfterAssign = store.getSnapshot()
+    const townId = snapshotAfterAssign.world.players.Builder01.townId
+    const beforeRead = store.getSnapshot()
+    const town = await service.applyGodCommand({
+      agents,
+      command: 'player town Builder01',
+      operationId: 'player-town-builder01'
+    })
+    const spawn = await service.applyGodCommand({
+      agents,
+      command: 'player spawn Builder01',
+      operationId: 'player-spawn-builder01'
+    })
+    const afterRead = store.getSnapshot()
+
+    assert.equal(assign.applied, true)
+    assert.equal(town.applied, true)
+    assert.equal(spawn.applied, true)
+    assert.deepEqual(afterRead, beforeRead)
+
+    return {
+      townId,
+      assign,
+      town,
+      spawn
+    }
+  }
+
+  const first = await runScenario(createStore())
+  const second = await runScenario(createStore())
+
+  assert.equal(first.townId, second.townId)
+  assert.ok(first.assign.outputLines[0].includes(`town=${first.townId}`))
+  assert.ok(first.assign.outputLines[0].includes('policy=deterministic_starter_town'))
+  assert.ok(first.town.outputLines[0].includes(`town=${first.townId}`))
+  if (first.townId === 'alpha') {
+    assert.ok(first.spawn.outputLines[0].includes('x=2 y=81 z=2'))
+    assert.ok(first.spawn.outputLines[0].includes('kind=alpha_hub'))
+  } else {
+    assert.ok(first.spawn.outputLines[0].includes('x=22 y=82 z=22'))
+    assert.ok(first.spawn.outputLines[0].includes('kind=beta_hub'))
+  }
+})
+
 test('chronicle add is transactional and idempotent', async () => {
   const memoryStore = createStore()
   const service = createGodCommandService({ memoryStore })

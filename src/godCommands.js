@@ -1,7 +1,16 @@
+const { AsyncLocalStorage } = require('async_hooks')
+
 const { createLogger } = require('./logger')
 const { AppError } = require('./errors')
 const { getObservabilitySnapshot } = require('./runtimeMetrics')
 const { defaultTownNameFromId } = require('./worldRegistry')
+const {
+  getPlayerAssignment,
+  normalizeTownSpawn,
+  resolvePlayerSpawn,
+  resolveTownSpawn,
+  selectStarterTownId
+} = require('./playerSpawn')
 
 const SUPPORTED_GOD_COMMANDS = new Set(['declare_war', 'make_peace', 'bless_people'])
 const INTENT_TYPES = new Set(['idle', 'wander', 'follow', 'respond'])
@@ -443,6 +452,7 @@ const CONTRACT_ROUTE_TEMPLATES = [
 ]
 const NIGHT_TROUBLE_LANDMARKS = ['east well', 'north ridge', 'birch line', 'south bridge', 'old toll gate']
 const DECISION_DEPRECATION_NOTE = 'Deprecated in Trader Mode: decisions are no longer generated; use Contracts + Market Pulse.'
+const commandPersistenceContext = new AsyncLocalStorage()
 const MAJOR_MISSION_TEMPLATES = [
   {
     id: 'iron_convoy',
@@ -4418,7 +4428,7 @@ function normalizeTownMissionState(townInput, townIdHint = '') {
   const activeMajorMissionId = asText(source.activeMajorMissionId, '', 200) || null
   const cooldown = Number(source.majorMissionCooldownUntilDay)
   const townId = asText(townIdHint, asText(source.townId, '', 80), 80)
-  return {
+  const normalized = {
     townId,
     name: asText(source.name, defaultTownNameFromId(townId), 80),
     status: normalizeTownRegistryStatus(source.status),
@@ -4431,6 +4441,9 @@ function normalizeTownMissionState(townInput, townIdHint = '') {
     crierQueue: normalizeTownCrierQueue(source.crierQueue),
     recentImpacts: normalizeTownRecentImpacts(source.recentImpacts)
   }
+  const spawn = normalizeTownSpawn(source.spawn)
+  if (spawn) normalized.spawn = spawn
+  return normalized
 }
 
 /**
@@ -5858,6 +5871,62 @@ function findTownNameForMarker(markers, markerName) {
 }
 
 /**
+ * @param {any} world
+ */
+function ensureWorldPlayers(world) {
+  if (!world.players || typeof world.players !== 'object' || Array.isArray(world.players)) {
+    world.players = {}
+  }
+  return world.players
+}
+
+/**
+ * @param {{
+ *   playerId: string,
+ *   townId: string,
+ *   assignedAtDay: number,
+ *   spawnPolicy: string
+ * }} assignment
+ */
+function formatPlayerAssignmentLine(assignment, { assigned = true, status = 'assigned' } = {}) {
+  return (
+    `GOD PLAYER TOWN: player=${assignment.playerId} town=${assignment.townId} `
+    + `assigned=${assigned ? 'true' : 'false'} policy=${assignment.spawnPolicy} `
+    + `assigned_day=${assignment.assignedAtDay} status=${status}`
+  )
+}
+
+/**
+ * @param {{
+ *   playerId: string,
+ *   townId: string,
+ *   assigned: boolean,
+ *   assignment?: {spawnPolicy?: string, assignedAtDay?: number} | null,
+ *   spawn: {dimension: string, x: number, y: number, z: number, yaw?: number, pitch?: number, radius?: number, kind?: string},
+ *   source: string,
+ *   usedFallback: boolean
+ * }} resolution
+ */
+function formatPlayerSpawnLine(resolution) {
+  const spawn = resolution.spawn || {}
+  const assignedAtDay = Number.isInteger(resolution.assignment?.assignedAtDay)
+    ? resolution.assignment.assignedAtDay
+    : 0
+  const policy = asText(resolution.assignment?.spawnPolicy, 'deterministic_starter_town', 40)
+  return (
+    `GOD PLAYER SPAWN: player=${resolution.playerId} town=${resolution.townId || '-'} `
+    + `assigned=${resolution.assigned ? 'true' : 'false'} policy=${policy} `
+    + `assigned_day=${assignedAtDay} source=${resolution.source} fallback=${resolution.usedFallback ? 'true' : 'false'} `
+    + `dimension=${asText(spawn.dimension, 'overworld', 40)} `
+    + `x=${Number(spawn.x || 0)} y=${Number(spawn.y || 0)} z=${Number(spawn.z || 0)} `
+    + `yaw=${Number.isFinite(Number(spawn.yaw)) ? Number(spawn.yaw) : 0} `
+    + `pitch=${Number.isFinite(Number(spawn.pitch)) ? Number(spawn.pitch) : 0} `
+    + `radius=${Number.isInteger(Number(spawn.radius)) ? Number(spawn.radius) : 2} `
+    + `kind=${asText(spawn.kind, 'town_hub', 40)}`
+  )
+}
+
+/**
  * @param {any} entry
  * @param {string} townName
  */
@@ -6019,6 +6088,39 @@ function parseGodCommand(rawCommand) {
   if (head === 'town') {
     const action = asText(words[1], '', 20).toLowerCase()
     if (action === 'list' && words.length === 2) return { type: 'town_list' }
+    if (action === 'spawn') {
+      const spawnAction = asText(words[2], '', 20).toLowerCase()
+      if (spawnAction === 'show' && words.length === 4) {
+        const townName = asText(words[3], '', 80)
+        if (!townName) return { type: 'invalid', reason: 'Usage: god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+        return { type: 'town_spawn_show', townName }
+      }
+      if (spawnAction === 'set' && words.length >= 8) {
+        const townName = asText(words[3], '', 80)
+        const dimension = asText(words[4], '', 40)
+        const x = asNumber(words[5])
+        const y = asNumber(words[6])
+        const z = asNumber(words[7])
+        const yaw = words[8] === undefined ? null : asNumber(words[8])
+        const pitch = words[9] === undefined ? null : asNumber(words[9])
+        const radius = words[10] === undefined ? null : Number(words[10])
+        const kind = words.length > 11 ? asText(words.slice(11).join(' '), '', 40) || null : null
+        if (
+          !townName
+          || !dimension
+          || x === null
+          || y === null
+          || z === null
+          || (words[8] !== undefined && yaw === null)
+          || (words[9] !== undefined && pitch === null)
+          || (words[10] !== undefined && (!Number.isInteger(radius) || radius < 0))
+        ) {
+          return { type: 'invalid', reason: 'Usage: god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+        }
+        return { type: 'town_spawn_set', townName, spawn: { dimension, x, y, z, ...(yaw === null ? {} : { yaw }), ...(pitch === null ? {} : { pitch }), ...(radius === null ? {} : { radius }), ...(kind ? { kind } : {}) } }
+      }
+      return { type: 'invalid', reason: 'Usage: god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+    }
     if (action === 'board') {
       if (words.length < 3) return { type: 'invalid', reason: 'Usage: god town board <townName> [N]' }
       let limit = 10
@@ -6034,7 +6136,20 @@ function parseGodCommand(rawCommand) {
       if (!townName) return { type: 'invalid', reason: 'Usage: god town board <townName> [N]' }
       return { type: 'town_board', townName, limit }
     }
-    return { type: 'invalid', reason: 'Usage: god town list | god town board <townName> [N]' }
+    return { type: 'invalid', reason: 'Usage: god town list | god town board <townName> [N] | god town spawn show <townName> | god town spawn set <townName> <dimension> <x> <y> <z> [yaw] [pitch] [radius] [kind]' }
+  }
+
+  if (head === 'player') {
+    const action = asText(words[1], '', 20).toLowerCase()
+    const playerId = asText(words[2], '', 120)
+    if (action === 'assign') {
+      if (!playerId) return { type: 'invalid', reason: 'Usage: god player assign <playerId> [townName] | god player town <playerId> | god player spawn <playerId>' }
+      const townName = asText(words.slice(3).join(' '), '', 80) || null
+      return { type: 'player_assign_town', playerId, townName }
+    }
+    if (action === 'town' && words.length === 3 && playerId) return { type: 'player_get_town', playerId }
+    if (action === 'spawn' && words.length === 3 && playerId) return { type: 'player_get_spawn', playerId }
+    return { type: 'invalid', reason: 'Usage: god player assign <playerId> [townName] | god player town <playerId> | god player spawn <playerId>' }
   }
 
   if (head === 'mayor') {
@@ -6730,43 +6845,68 @@ function createGodCommandService(deps) {
   const runtimeJob = typeof deps.runtimeJob === 'function' ? deps.runtimeJob : null
   const getStatusSnapshot = typeof deps.getStatusSnapshot === 'function' ? deps.getStatusSnapshot : null
   const providedNow = typeof deps.now === 'function' ? deps.now : null
+  const GOD_TRANSACT_WRAP_FLAG = '__godCommandPersistContextWrapped'
+
+  if (typeof memoryStore.transact !== 'function') {
+    throw new AppError({
+      code: 'GOD_SERVICE_CONFIG_ERROR',
+      message: 'memoryStore.transact is required for god command service.',
+      recoverable: false
+    })
+  }
+
+  if (memoryStore[GOD_TRANSACT_WRAP_FLAG] !== true) {
+    const baseTransact = memoryStore.transact.bind(memoryStore)
+    memoryStore.transact = (mutator, opts = {}) => {
+      const ctx = commandPersistenceContext.getStore()
+      const persistFromContext = !(ctx && ctx.persistWorldState === false)
+      const persist = opts?.persist === false ? false : persistFromContext
+      return baseTransact(mutator, {
+        ...opts,
+        persist
+      })
+    }
+    memoryStore[GOD_TRANSACT_WRAP_FLAG] = true
+  }
 
   /**
-   * @param {{agents: unknown[], command: string, operationId: string}} input
+   * @param {{agents: unknown[], command: string, operationId: string, persistWorldState?: boolean}} input
    */
   async function applyGodCommand(input) {
-    const command = asText(input?.command, '', 240)
-    const operationId = asText(input?.operationId, '', 200)
-    const runtimeAgents = Array.isArray(input?.agents) ? input.agents.filter(isRuntimeAgentShape) : []
-    const legacyAgents = runtimeAgents.filter(isLegacyGodAgentShape)
-    const parsed = parseGodCommand(command)
+    const persistWorldState = input?.persistWorldState !== false
+    return commandPersistenceContext.run({ persistWorldState }, async () => {
+      const command = asText(input?.command, '', 240)
+      const operationId = asText(input?.operationId, '', 200)
+      const runtimeAgents = Array.isArray(input?.agents) ? input.agents.filter(isRuntimeAgentShape) : []
+      const legacyAgents = runtimeAgents.filter(isLegacyGodAgentShape)
+      const parsed = parseGodCommand(command)
 
-    if (parsed.type === 'invalid') {
-      throw new AppError({
-        code: 'INVALID_GOD_COMMAND',
-        message: parsed.reason,
-        recoverable: true
-      })
-    }
-    if (!operationId) {
-      throw new AppError({
-        code: 'INVALID_GOD_OPERATION',
-        message: 'God command requires operationId for idempotency.',
-        recoverable: true
-      })
-    }
-    const deterministicNow = createDeterministicCommandNow(
-      memoryStore.getSnapshot().world,
-      operationId,
-      `${parsed.type}:${command}`
-    )
-    const now = () => {
-      if (providedNow) {
-        const candidate = Number(providedNow())
-        if (Number.isFinite(candidate) && candidate >= 0) return candidate
+      if (parsed.type === 'invalid') {
+        throw new AppError({
+          code: 'INVALID_GOD_COMMAND',
+          message: parsed.reason,
+          recoverable: true
+        })
       }
-      return deterministicNow()
-    }
+      if (!operationId) {
+        throw new AppError({
+          code: 'INVALID_GOD_OPERATION',
+          message: 'God command requires operationId for idempotency.',
+          recoverable: true
+        })
+      }
+      const deterministicNow = createDeterministicCommandNow(
+        memoryStore.getSnapshot().world,
+        operationId,
+        `${parsed.type}:${command}`
+      )
+      const now = () => {
+        if (providedNow) {
+          const candidate = Number(providedNow())
+          if (Number.isFinite(candidate) && candidate >= 0) return candidate
+        }
+        return deterministicNow()
+      }
 
     if (parsed.type === 'legacy_world') {
       const tx = await memoryStore.transact((memory) => {
@@ -8265,6 +8405,179 @@ function createGodCommandService(deps) {
         )
       }
       return { applied: true, command, audit: false, outputLines: lines }
+    }
+
+    if (parsed.type === 'town_spawn_show') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const resolution = resolveTownSpawn(snapshot.world, townName)
+      const spawn = resolution.spawn
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          `GOD TOWN SPAWN: town=${townName} source=${resolution.source} fallback=${resolution.usedFallback ? 'true' : 'false'} dimension=${spawn.dimension} x=${spawn.x} y=${spawn.y} z=${spawn.z} yaw=${Number.isFinite(Number(spawn.yaw)) ? Number(spawn.yaw) : 0} pitch=${Number.isFinite(Number(spawn.pitch)) ? Number(spawn.pitch) : 0} radius=${Number.isInteger(Number(spawn.radius)) ? Number(spawn.radius) : 2} kind=${asText(spawn.kind, 'town_hub', 40)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'town_spawn_set') {
+      const snapshot = memoryStore.getSnapshot()
+      const townName = resolveTownName(snapshot.world, parsed.townName)
+      if (!townName) return { applied: false, command, reason: 'Unknown town.' }
+      const normalizedSpawn = normalizeTownSpawn(parsed.spawn)
+      if (!normalizedSpawn) return { applied: false, command, reason: 'Invalid spawn.' }
+
+      const tx = await memoryStore.transact((memory) => {
+        const towns = normalizeWorldTownMissionStates(memory.world?.towns)
+        memory.world.towns = towns
+        if (!towns[townName]) towns[townName] = normalizeTownMissionState(null, townName)
+        const existingSpawn = normalizeTownSpawn(towns[townName].spawn)
+        if (existingSpawn && JSON.stringify(existingSpawn) === JSON.stringify(normalizedSpawn)) {
+          return { status: 'existing', spawn: existingSpawn }
+        }
+        towns[townName].spawn = normalizedSpawn
+        const at = now()
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:town_spawn_set:${townName.toLowerCase()}`,
+          type: 'town_spawn_set',
+          msg: `TOWN SPAWN: ${townName} -> ${normalizedSpawn.dimension} ${normalizedSpawn.x} ${normalizedSpawn.y} ${normalizedSpawn.z}`,
+          at,
+          town: townName,
+          meta: {
+            dimension: normalizedSpawn.dimension,
+            x: normalizedSpawn.x,
+            y: normalizedSpawn.y,
+            z: normalizedSpawn.z,
+            kind: normalizedSpawn.kind || ''
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:town_spawn_set:${townName.toLowerCase()}`,
+          topic: 'town_spawn',
+          msg: `TOWN SPAWN: ${townName} hub set`,
+          at,
+          town: townName,
+          meta: {
+            dimension: normalizedSpawn.dimension,
+            x: normalizedSpawn.x,
+            y: normalizedSpawn.y,
+            z: normalizedSpawn.z
+          }
+        })
+        return { status: 'updated', spawn: normalizedSpawn }
+      }, { eventId: `${operationId}:town_spawn_set:${townName.toLowerCase()}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD TOWN SPAWN SET: town=${townName} status=${tx.result.status} dimension=${tx.result.spawn.dimension} x=${tx.result.spawn.x} y=${tx.result.spawn.y} z=${tx.result.spawn.z} yaw=${Number.isFinite(Number(tx.result.spawn.yaw)) ? Number(tx.result.spawn.yaw) : 0} pitch=${Number.isFinite(Number(tx.result.spawn.pitch)) ? Number(tx.result.spawn.pitch) : 0} radius=${Number.isInteger(Number(tx.result.spawn.radius)) ? Number(tx.result.spawn.radius) : 2} kind=${asText(tx.result.spawn.kind, 'town_hub', 40)}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'player_assign_town') {
+      const snapshot = memoryStore.getSnapshot()
+      const explicitTown = parsed.townName ? resolveTownName(snapshot.world, parsed.townName) : ''
+      if (parsed.townName && !explicitTown) return { applied: false, command, reason: 'Unknown town.' }
+      const targetTown = explicitTown || selectStarterTownId(snapshot.world, parsed.playerId)
+      if (!targetTown) return { applied: false, command, reason: 'No starter towns configured.' }
+      const spawnPolicy = explicitTown ? 'explicit_town' : 'deterministic_starter_town'
+
+      const tx = await memoryStore.transact((memory) => {
+        const players = ensureWorldPlayers(memory.world)
+        const existing = getPlayerAssignment(memory.world, parsed.playerId)
+        const assignedAtDay = Number(memory.world?.clock?.day || 0)
+        if (
+          existing
+          && sameText(existing.townId, targetTown, 80)
+          && asText(existing.spawnPolicy, '', 40).toLowerCase() === spawnPolicy
+        ) {
+          return { status: 'existing', assignment: existing }
+        }
+        const assignment = {
+          playerId: parsed.playerId,
+          townId: targetTown,
+          assignedAtDay,
+          spawnPolicy
+        }
+        players[parsed.playerId] = assignment
+        const at = now()
+        appendChronicle(memory, {
+          id: `${operationId}:chronicle:player_assign:${parsed.playerId.toLowerCase()}`,
+          type: 'player_assign',
+          msg: `PLAYER ASSIGN: ${parsed.playerId} -> ${targetTown}`,
+          at,
+          town: targetTown,
+          meta: {
+            player_id: parsed.playerId,
+            spawn_policy: spawnPolicy
+          }
+        })
+        appendNews(memory, {
+          id: `${operationId}:news:player_assign:${parsed.playerId.toLowerCase()}`,
+          topic: 'player_assign',
+          msg: `PLAYER ASSIGN: ${parsed.playerId} -> ${targetTown}`,
+          at,
+          town: targetTown,
+          meta: {
+            player_id: parsed.playerId,
+            spawn_policy: spawnPolicy
+          }
+        })
+        return { status: 'assigned', assignment }
+      }, { eventId: `${operationId}:player_assign:${parsed.playerId.toLowerCase()}` })
+
+      if (tx.skipped) return { applied: false, command, reason: 'Duplicate operation ignored.' }
+      return {
+        applied: true,
+        command,
+        audit: true,
+        outputLines: [
+          `GOD PLAYER ASSIGN: player=${tx.result.assignment.playerId} town=${tx.result.assignment.townId} policy=${tx.result.assignment.spawnPolicy} assigned_day=${tx.result.assignment.assignedAtDay} status=${tx.result.status}`
+        ]
+      }
+    }
+
+    if (parsed.type === 'player_get_town') {
+      const snapshot = memoryStore.getSnapshot()
+      const assignment = getPlayerAssignment(snapshot.world, parsed.playerId)
+      const suggestedTown = assignment?.townId || selectStarterTownId(snapshot.world, parsed.playerId)
+      if (!suggestedTown) return { applied: false, command, reason: 'No starter towns configured.' }
+      const outputAssignment = assignment || {
+        playerId: parsed.playerId,
+        townId: suggestedTown,
+        assignedAtDay: 0,
+        spawnPolicy: 'deterministic_starter_town'
+      }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [
+          formatPlayerAssignmentLine(outputAssignment, {
+            assigned: Boolean(assignment),
+            status: assignment ? 'assigned' : 'suggested'
+          })
+        ]
+      }
+    }
+
+    if (parsed.type === 'player_get_spawn') {
+      const snapshot = memoryStore.getSnapshot()
+      const resolution = resolvePlayerSpawn(snapshot.world, { playerId: parsed.playerId })
+      if (!resolution.townId) return { applied: false, command, reason: 'No starter towns configured.' }
+      return {
+        applied: true,
+        command,
+        audit: false,
+        outputLines: [formatPlayerSpawnLine(resolution)]
+      }
     }
 
     if (parsed.type === 'town_board') {
@@ -11880,6 +12193,7 @@ function createGodCommandService(deps) {
       code: 'INVALID_GOD_COMMAND',
       message: `Unsupported god command: ${command || '(empty)'}`,
       recoverable: true
+    })
     })
   }
 

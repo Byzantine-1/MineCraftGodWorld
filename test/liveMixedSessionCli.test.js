@@ -5,7 +5,7 @@ const { runLiveMixedSessionCheck } = require('../scripts/liveMixedSessionCheck')
 
 test('live CLI mixed session keeps retrieval and execution coherent in one engine process', async () => {
   const result = await runLiveMixedSessionCheck({
-    backend: 'memory',
+    backend: 'sqlite',
     timeoutMs: 15000
   })
 

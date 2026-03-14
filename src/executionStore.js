@@ -3,6 +3,11 @@ const path = require('path')
 const { execFileSync } = require('child_process')
 
 const { AppError } = require('./errors')
+const {
+  WORLD_STATE_MIGRATION_META_KEY,
+  createMemoryWorldStateStore,
+  createSqliteWorldStateStore
+} = require('./worldStateStore')
 
 const MAX_EXECUTION_HISTORY_ENTRIES = 512
 const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
@@ -812,7 +817,8 @@ function createMemoryExecutionPersistence({ memoryStore, logger } = {}) {
 }
 
 function createSqliteExecutionPersistence(options = {}) {
-  const dbPath = path.resolve(String(options.dbPath || ''))
+  const safeDbPathInput = asText(options.dbPath, 400)
+  const dbPath = safeDbPathInput ? path.resolve(safeDbPathInput) : ''
   const sqliteCommand = asText(options.sqliteCommand || 'sqlite3', 200) || 'sqlite3'
   const safeLogger = options.logger || { info: () => {}, warn: () => {} }
   const fsModule = options.fsModule || fs
@@ -1101,18 +1107,14 @@ function createSqliteExecutionPersistence(options = {}) {
     return 1
   }
 
-  async function recordResult(
-    result,
-    { kind = `result:${asText(result?.status, 40)}`, persistReceipt = true, clearPending = true } = {}
-  ) {
-    ensureInitialized()
-    const receipt = createReceiptFromResult(result)
-    const ledgerEntry = createLedgerEntryFromResult(result, kind)
-    const createdAt = Math.trunc(now())
-
-    const statements = [
-      'BEGIN IMMEDIATE;'
-    ]
+  function buildResultPersistenceStatements({
+    receipt,
+    ledgerEntry,
+    createdAt,
+    persistReceipt,
+    clearPending
+  }) {
+    const statements = []
     if (persistReceipt) {
       statements.push(`
         INSERT OR REPLACE INTO execution_receipts (
@@ -1171,7 +1173,28 @@ function createSqliteExecutionPersistence(options = {}) {
         WHERE handoff_id = ${sqlValue(receipt.handoffId)} OR idempotency_key = ${sqlValue(receipt.idempotencyKey)};
       `)
     }
-    statements.push('COMMIT;')
+    return statements
+  }
+
+  async function recordResult(
+    result,
+    { kind = `result:${asText(result?.status, 40)}`, persistReceipt = true, clearPending = true } = {}
+  ) {
+    ensureInitialized()
+    const receipt = createReceiptFromResult(result)
+    const ledgerEntry = createLedgerEntryFromResult(result, kind)
+    const createdAt = Math.trunc(now())
+    const statements = [
+      'BEGIN IMMEDIATE;',
+      ...buildResultPersistenceStatements({
+        receipt,
+        ledgerEntry,
+        createdAt,
+        persistReceipt,
+        clearPending
+      }),
+      'COMMIT;'
+    ]
 
     runSql(statements.join('\n'))
 
@@ -1182,6 +1205,50 @@ function createSqliteExecutionPersistence(options = {}) {
       kind,
       persistReceipt,
       clearPending,
+      dbPath
+    })
+    return receipt
+  }
+
+  async function recordResultWithWorldSnapshot(
+    result,
+    {
+      worldStateStatements = [],
+      kind = `result:${asText(result?.status, 40)}`,
+      persistReceipt = true,
+      clearPending = true
+    } = {}
+  ) {
+    ensureInitialized()
+    const receipt = createReceiptFromResult(result)
+    const ledgerEntry = createLedgerEntryFromResult(result, kind)
+    const createdAt = Math.trunc(now())
+    const worldStatements = Array.isArray(worldStateStatements)
+      ? worldStateStatements.filter((entry) => asText(entry, 160000))
+      : []
+    const statements = [
+      'BEGIN IMMEDIATE;',
+      ...worldStatements,
+      ...buildResultPersistenceStatements({
+        receipt,
+        ledgerEntry,
+        createdAt,
+        persistReceipt,
+        clearPending
+      }),
+      'COMMIT;'
+    ]
+
+    runSql(statements.join('\n'))
+
+    safeLogger.info('execution_store_result_with_world_recorded', {
+      backend: 'sqlite',
+      executionId: receipt.executionId,
+      handoffId: receipt.handoffId,
+      kind,
+      persistReceipt,
+      clearPending,
+      worldStateStatements: worldStatements.length,
       dbPath
     })
     return receipt
@@ -1290,6 +1357,8 @@ function createSqliteExecutionPersistence(options = {}) {
 
   return {
     backendName: 'sqlite',
+    dbPath,
+    sqliteCommand,
     clearPendingExecution,
     findPendingExecution,
     findReceipt,
@@ -1299,6 +1368,7 @@ function createSqliteExecutionPersistence(options = {}) {
     listPendingExecutions,
     markPendingExecutionProgress,
     recordResult,
+    recordResultWithWorldSnapshot,
     stagePendingExecution,
     syncWorldMemoryFromSnapshot
   }
@@ -1328,10 +1398,24 @@ function createExecutionPersistenceBackend({
   })
 }
 
+function validateWorldStateStore(store) {
+  if (!store || typeof store !== 'object') return false
+  return (
+    typeof store.loadWorldSnapshot === 'function'
+    && typeof store.replaceWorldSnapshot === 'function'
+    && typeof store.listTowns === 'function'
+    && typeof store.getTown === 'function'
+    && typeof store.listActorsByTown === 'function'
+    && typeof store.getActor === 'function'
+    && typeof store.listOfficeholders === 'function'
+  )
+}
+
 function createExecutionStore({
   memoryStore,
   logger,
   persistenceBackend,
+  worldStateStore,
   backend = 'memory',
   sqliteDbPath,
   sqliteCommand,
@@ -1345,6 +1429,7 @@ function createExecutionStore({
     })
   }
 
+  const safeNow = typeof now === 'function' ? now : () => Date.now()
   const safeLogger = logger || { info: () => {}, warn: () => {} }
   const resolvedBackend = persistenceBackend || createExecutionPersistenceBackend({
     backend,
@@ -1352,7 +1437,7 @@ function createExecutionStore({
     sqliteDbPath,
     sqliteCommand,
     logger: safeLogger,
-    now
+    now: safeNow
   })
 
   if (!validatePersistenceBackend(resolvedBackend)) {
@@ -1363,12 +1448,81 @@ function createExecutionStore({
     })
   }
 
+  const resolvedWorldStateStore = worldStateStore || (
+    resolvedBackend.backendName === 'sqlite'
+      ? createSqliteWorldStateStore({
+        dbPath: resolvedBackend.dbPath || sqliteDbPath,
+        sqliteCommand: resolvedBackend.sqliteCommand || sqliteCommand,
+        logger: typeof safeLogger.child === 'function'
+          ? safeLogger.child({ subsystem: 'world_state_store' })
+          : safeLogger,
+        now: safeNow
+      })
+      : createMemoryWorldStateStore({ memoryStore })
+  )
+
+  if (!validateWorldStateStore(resolvedWorldStateStore)) {
+    throw new AppError({
+      code: 'EXECUTION_STORE_CONFIG_ERROR',
+      message: 'WorldStateStore backend is invalid.',
+      recoverable: false
+    })
+  }
+
   if (typeof resolvedBackend.initialize === 'function') {
     resolvedBackend.initialize()
   }
+  if (typeof resolvedWorldStateStore.initialize === 'function') {
+    resolvedWorldStateStore.initialize()
+  }
+
+  const usingSqliteWorldState = resolvedWorldStateStore.backendName === 'sqlite'
+  if (usingSqliteWorldState) {
+    const sqliteWorldSnapshot = resolvedWorldStateStore.loadWorldSnapshot()
+    if (isPlainObject(sqliteWorldSnapshot) && Object.keys(sqliteWorldSnapshot).length > 0) {
+      if (typeof memoryStore.replaceWorldSnapshot === 'function') {
+        memoryStore.replaceWorldSnapshot(sqliteWorldSnapshot)
+      }
+      if (typeof resolvedWorldStateStore.setMeta === 'function') {
+        resolvedWorldStateStore.setMeta(WORLD_STATE_MIGRATION_META_KEY, 'complete')
+      }
+    } else {
+      const memoryWorldSnapshot = memoryStore.recallWorld()
+      resolvedWorldStateStore.replaceWorldSnapshot(memoryWorldSnapshot, { includeMigrationMeta: true })
+      if (typeof resolvedWorldStateStore.setMeta === 'function') {
+        resolvedWorldStateStore.setMeta(WORLD_STATE_MIGRATION_META_KEY, 'imported_from_memory')
+      }
+    }
+  }
+
+  const WORLD_SYNC_WRAP_FLAG = '__worldStateSyncWrapped'
+  if (
+    usingSqliteWorldState
+    && typeof memoryStore.transact === 'function'
+    && memoryStore[WORLD_SYNC_WRAP_FLAG] !== true
+  ) {
+    const baseTransact = memoryStore.transact.bind(memoryStore)
+    memoryStore.transact = async (mutator, opts = {}) => {
+      const tx = await baseTransact(mutator, opts)
+      const shouldSyncWorldState = tx?.persisted === true && opts?.skipWorldStateSync !== true && tx?.skipped !== true
+      if (shouldSyncWorldState) {
+        resolvedWorldStateStore.replaceWorldSnapshot(memoryStore.recallWorld())
+      }
+      return tx
+    }
+    memoryStore[WORLD_SYNC_WRAP_FLAG] = true
+  }
+
+  function readSnapshotSource() {
+    const authoritativeWorld = resolvedWorldStateStore.loadWorldSnapshot()
+    if (isPlainObject(authoritativeWorld) && Object.keys(authoritativeWorld).length > 0) {
+      return authoritativeWorld
+    }
+    return memoryStore.recallWorld()
+  }
 
   function syncWorldMemory() {
-    return resolvedBackend.syncWorldMemoryFromSnapshot(memoryStore.recallWorld())
+    return resolvedBackend.syncWorldMemoryFromSnapshot(readSnapshotSource())
   }
 
   function listChronicleRecords(query = {}) {
@@ -1389,7 +1543,7 @@ function createExecutionStore({
         recoverable: false
       })
     }
-    const world = memoryStore.recallWorld()
+    const world = readSnapshotSource()
     syncWorldMemory()
     const chronicleRecords = resolvedBackend.listChronicleRecords({
       townId: safeTownId,
@@ -1414,7 +1568,7 @@ function createExecutionStore({
         recoverable: false
       })
     }
-    const world = memoryStore.recallWorld()
+    const world = readSnapshotSource()
     const faction = isPlainObject(world?.factions?.[safeFactionId]) ? world.factions[safeFactionId] : null
     const towns = Array.isArray(faction?.towns)
       ? faction.towns.map((entry) => asText(entry, 80)).filter(Boolean)
@@ -1444,8 +1598,44 @@ function createExecutionStore({
     return summary
   }
 
+  async function recordResult(result, opts = {}) {
+    const safeOpts = opts || {}
+    const shouldPersistWorldSnapshot = safeOpts.persistWorldSnapshot !== false
+      && isPlainObject(safeOpts.worldSnapshot)
+
+    if (
+      shouldPersistWorldSnapshot
+      && usingSqliteWorldState
+      && typeof resolvedBackend.recordResultWithWorldSnapshot === 'function'
+      && typeof resolvedWorldStateStore.buildReplaceWorldStatements === 'function'
+    ) {
+      const worldSnapshot = cloneValue(safeOpts.worldSnapshot)
+      const worldStateStatements = resolvedWorldStateStore.buildReplaceWorldStatements(worldSnapshot, {
+        timestamp: Math.trunc(safeNow())
+      })
+      const receipt = await resolvedBackend.recordResultWithWorldSnapshot(result, {
+        ...safeOpts,
+        worldStateStatements
+      })
+      if (typeof memoryStore.replaceWorldSnapshot === 'function') {
+        memoryStore.replaceWorldSnapshot(worldSnapshot)
+      }
+      return receipt
+    }
+
+    const receipt = await resolvedBackend.recordResult(result, safeOpts)
+    if (shouldPersistWorldSnapshot) {
+      await resolvedWorldStateStore.replaceWorldSnapshot(cloneValue(safeOpts.worldSnapshot))
+      if (typeof memoryStore.replaceWorldSnapshot === 'function') {
+        memoryStore.replaceWorldSnapshot(cloneValue(safeOpts.worldSnapshot))
+      }
+    }
+    return receipt
+  }
+
   return {
     backendName: resolvedBackend.backendName || asText(backend, 40) || 'memory',
+    worldStateBackendName: resolvedWorldStateStore.backendName || 'memory',
     findPendingExecution(input) {
       return resolvedBackend.findPendingExecution(input || {})
     },
@@ -1455,11 +1645,29 @@ function createExecutionStore({
     listPendingExecutions() {
       return resolvedBackend.listPendingExecutions()
     },
+    listTowns() {
+      return resolvedWorldStateStore.listTowns()
+    },
+    getTown(townId) {
+      return resolvedWorldStateStore.getTown(townId)
+    },
+    listActorsByTown(townId) {
+      return resolvedWorldStateStore.listActorsByTown(townId)
+    },
+    getActor(actorId) {
+      return resolvedWorldStateStore.getActor(actorId)
+    },
+    listOfficeholders(townId) {
+      return resolvedWorldStateStore.listOfficeholders(townId)
+    },
+    getWorldStateMigrationMeta() {
+      return typeof resolvedWorldStateStore.getMeta === 'function'
+        ? resolvedWorldStateStore.getMeta(WORLD_STATE_MIGRATION_META_KEY)
+        : null
+    },
     listChronicleRecords,
     listHistoryRecords,
-    readSnapshotSource() {
-      return memoryStore.recallWorld()
-    },
+    readSnapshotSource,
     syncWorldMemory,
     getTownHistorySummary,
     getFactionHistorySummary,
@@ -1472,9 +1680,7 @@ function createExecutionStore({
     async clearPendingExecution(identity, opts) {
       return resolvedBackend.clearPendingExecution(identity || {}, opts || {})
     },
-    async recordResult(result, opts) {
-      return resolvedBackend.recordResult(result, opts || {})
-    }
+    recordResult
   }
 }
 
@@ -1484,6 +1690,8 @@ module.exports = {
   MAX_PENDING_EXECUTION_ENTRIES,
   createExecutionPersistenceBackend,
   createExecutionStore,
+  createMemoryWorldStateStore,
   createMemoryExecutionPersistence,
+  createSqliteWorldStateStore,
   createSqliteExecutionPersistence
 }

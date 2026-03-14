@@ -172,6 +172,206 @@ test('execution adapter translates MAYOR_ACCEPT_MISSION into authoritative mayor
   assert.equal(memoryStore.getSnapshot().world.towns.alpha.activeMajorMissionId !== null, true)
 })
 
+test('execution adapter translates MISSION_ADVANCE into the authoritative mission advance command', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'execution-adapter-mission-advance-seed-town'
+  })
+  await executionAdapter.executeHandoff({
+    handoff: createHandoff({
+      proposalType: 'MAYOR_ACCEPT_MISSION',
+      command: 'mission accept alpha sq-side-1',
+      args: { missionId: 'sq-side-1' },
+      snapshotHash: snapshotHashForStore(memoryStore),
+      preconditions: [{ kind: 'mission_absent' }]
+    }),
+    agents
+  })
+
+  const beforeMission = memoryStore.getSnapshot().world.majorMissions.find((entry) => entry.status === 'active' && entry.townId === 'alpha')
+  assert(beforeMission)
+
+  const handoff = createHandoff({
+    proposalType: 'MISSION_ADVANCE',
+    command: 'mission advance alpha',
+    args: { missionId: beforeMission.id },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+
+  const result = await executionAdapter.executeHandoff({ handoff, agents })
+
+  assert.equal(result.status, 'executed')
+  assert.equal(result.accepted, true)
+  assert.equal(result.executed, true)
+  assert.equal(result.reasonCode, 'EXECUTED')
+  assert.deepEqual(result.authorityCommands, ['mission advance alpha'])
+  assert.equal(result.proposalType, 'MISSION_ADVANCE')
+  assert.equal(isValidExecutionResult(result), true)
+
+  const afterMission = memoryStore.getSnapshot().world.majorMissions.find((entry) => entry.id === beforeMission.id)
+  assert(afterMission)
+  assert.equal(afterMission.phase, Number(beforeMission.phase) + 1)
+  assert.equal(memoryStore.getSnapshot().world.towns.alpha.activeMajorMissionId, beforeMission.id)
+})
+
+test('execution adapter translates MISSION_COMPLETE into the authoritative mission complete command and pressure update', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'execution-adapter-mission-complete-seed-town'
+  })
+  await executionAdapter.executeHandoff({
+    handoff: createHandoff({
+      proposalType: 'MAYOR_ACCEPT_MISSION',
+      command: 'mission accept alpha sq-side-2',
+      args: { missionId: 'sq-side-2' },
+      snapshotHash: snapshotHashForStore(memoryStore),
+      preconditions: [{ kind: 'mission_absent' }]
+    }),
+    agents
+  })
+
+  const activeMissionId = memoryStore.getSnapshot().world.towns.alpha.activeMajorMissionId
+  assert(activeMissionId)
+
+  const handoff = createHandoff({
+    proposalType: 'MISSION_COMPLETE',
+    command: 'mission complete alpha',
+    args: { missionId: activeMissionId },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+
+  const result = await executionAdapter.executeHandoff({ handoff, agents })
+
+  assert.equal(result.status, 'executed')
+  assert.equal(result.accepted, true)
+  assert.equal(result.executed, true)
+  assert.equal(result.reasonCode, 'EXECUTED')
+  assert.deepEqual(result.authorityCommands, ['mission complete alpha'])
+  assert.equal(result.proposalType, 'MISSION_COMPLETE')
+  assert.equal(isValidExecutionResult(result), true)
+
+  const snapshot = memoryStore.getSnapshot()
+  const completedMission = snapshot.world.majorMissions.find((entry) => entry.id === activeMissionId)
+  assert(completedMission)
+  assert.equal(completedMission.status, 'completed')
+  assert.equal(snapshot.world.towns.alpha.activeMajorMissionId, null)
+  assert(snapshot.world.towns.alpha.majorMissionCooldownUntilDay > 0)
+  assert(snapshot.world.towns.alpha.hope > 50)
+  assert(snapshot.world.towns.alpha.dread < 50)
+})
+
+test('execution adapter returns a teleport embodiment hint for PLAYER_GET_SPAWN after authoritative assignment', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'execution-adapter-spawn-seed-town'
+  })
+
+  const setSpawn = await executionAdapter.executeHandoff({
+    handoff: createHandoff({
+      proposalType: 'TOWN_SET_SPAWN',
+      actorId: 'ops',
+      townId: 'alpha',
+      command: 'town spawn set alpha overworld 4 81 -2 90 0 3 starter_hub',
+      args: {
+        townId: 'alpha',
+        spawn: {
+          dimension: 'overworld',
+          x: 4,
+          y: 81,
+          z: -2,
+          yaw: 90,
+          pitch: 0,
+          radius: 3,
+          kind: 'starter_hub'
+        }
+      },
+      snapshotHash: snapshotHashForStore(memoryStore)
+    }),
+    agents
+  })
+
+  const assignTown = await executionAdapter.executeHandoff({
+    handoff: createHandoff({
+      proposalType: 'PLAYER_ASSIGN_TOWN',
+      actorId: 'ops',
+      townId: 'alpha',
+      command: 'player assign Builder01 alpha',
+      args: {
+        playerId: 'Builder01',
+        townId: 'alpha'
+      },
+      snapshotHash: snapshotHashForStore(memoryStore)
+    }),
+    agents
+  })
+
+  const getSpawn = await executionAdapter.executeHandoff({
+    handoff: createHandoff({
+      proposalType: 'PLAYER_GET_SPAWN',
+      actorId: 'Builder01',
+      townId: 'auto',
+      command: 'player spawn Builder01',
+      args: {
+        playerId: 'Builder01'
+      },
+      snapshotHash: snapshotHashForStore(memoryStore)
+    }),
+    agents
+  })
+
+  assert.equal(setSpawn.status, 'executed')
+  assert.equal(assignTown.status, 'executed')
+  assert.equal(getSpawn.status, 'executed')
+  assert.equal(getSpawn.townId, 'alpha')
+  assert.equal(isValidExecutionResult(getSpawn), true)
+  assert.deepEqual(memoryStore.getSnapshot().world.players.Builder01, {
+    playerId: 'Builder01',
+    townId: 'alpha',
+    assignedAtDay: 1,
+    spawnPolicy: 'explicit_town'
+  })
+  assert.deepEqual(memoryStore.getSnapshot().world.towns.alpha.spawn, {
+    dimension: 'overworld',
+    x: 4,
+    y: 81,
+    z: -2,
+    yaw: 90,
+    pitch: 0,
+    radius: 3,
+    kind: 'starter_hub'
+  })
+  assert.equal(getSpawn.embodiment.backendHint, 'bridge')
+  assert.equal(getSpawn.embodiment.actions[0].type, 'teleport')
+  assert.deepEqual(getSpawn.embodiment.actions[0].target, {
+    kind: 'player',
+    id: 'Builder01'
+  })
+  assert.equal(getSpawn.embodiment.actions[0].dimension, 'overworld')
+  assert.equal(getSpawn.embodiment.actions[0].x, 4)
+  assert.equal(getSpawn.embodiment.actions[0].y, 81)
+  assert.equal(getSpawn.embodiment.actions[0].z, -2)
+  assert.equal(getSpawn.embodiment.actions[0].yaw, 90)
+  assert.equal(getSpawn.embodiment.actions[0].meta.townId, 'alpha')
+})
+
 test('execution adapter classifies decision-epoch drift as stale before applying engine commands', async () => {
   const { memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })

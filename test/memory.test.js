@@ -474,6 +474,68 @@ test('memory store sanitizes authoritative town and actor registry shapes on loa
   assert.equal(store.validateMemoryIntegrity().ok, true)
 })
 
+test('memory store sanitizes additive town spawn and player assignment shapes on load', () => {
+  const filePath = createTempMemoryPath()
+  fs.writeFileSync(filePath, JSON.stringify({
+    world: {
+      towns: {
+        alpha: {
+          townId: 'alpha',
+          name: 'Alpha',
+          status: 'active',
+          spawn: {
+            dimension: 'overworld',
+            x: 12,
+            y: 78,
+            z: -4,
+            yaw: 90,
+            pitch: 10,
+            radius: 5,
+            kind: 'hub_pad'
+          }
+        }
+      },
+      players: {
+        Builder01: {
+          playerId: 'Builder01',
+          townId: 'alpha',
+          assignedAtDay: 4,
+          spawnPolicy: 'explicit_town'
+        },
+        BrokenPlayer: {
+          playerId: '',
+          townId: '',
+          assignedAtDay: -1,
+          spawnPolicy: '???'
+        }
+      }
+    }
+  }, null, 2), 'utf-8')
+
+  const store = createMemoryStore({ filePath })
+  const snapshot = store.loadAllMemory()
+
+  assert.deepEqual(snapshot.world.towns.alpha.spawn, {
+    dimension: 'overworld',
+    x: 12,
+    y: 78,
+    z: -4,
+    yaw: 90,
+    pitch: 10,
+    radius: 5,
+    kind: 'hub_pad'
+  })
+  assert.deepEqual(snapshot.world.players, {
+    Builder01: {
+      playerId: 'Builder01',
+      townId: 'alpha',
+      assignedAtDay: 4,
+      spawnPolicy: 'explicit_town'
+    }
+  })
+  assert.equal(store.validateMemoryIntegrity().ok, true)
+})
+
 test('memory store defaults additive nether fields when missing', () => {
   const filePath = createTempMemoryPath()
   fs.writeFileSync(filePath, JSON.stringify({

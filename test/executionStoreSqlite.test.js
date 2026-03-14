@@ -213,19 +213,181 @@ test('sqlite backend initializes schema and persists receipts for lookup', async
   const tables = sqliteJson(sqlitePath, `
     SELECT name
     FROM sqlite_master
-    WHERE type = 'table' AND name IN ('execution_receipts', 'execution_pending', 'execution_event_ledger')
+    WHERE type = 'table' AND name IN (
+      'execution_receipts',
+      'execution_pending',
+      'execution_event_ledger',
+      'world_state_snapshots',
+      'world_towns',
+      'world_actors',
+      'world_meta',
+      'world_chronicle_records'
+    )
     ORDER BY name;
   `)
 
   assert.deepEqual(tables.map((row) => row.name), [
     'execution_event_ledger',
     'execution_pending',
-    'execution_receipts'
+    'execution_receipts',
+    'world_actors',
+    'world_chronicle_records',
+    'world_meta',
+    'world_state_snapshots',
+    'world_towns'
   ])
   assert.equal(executionStore.findPendingExecution({
     handoffId: fakeResult.handoffId,
     idempotencyKey: fakeResult.idempotencyKey
   }), null)
+})
+
+test('sqlite world-state bootstrap migrates authoritative towns/actors from memory on first init', async () => {
+  const { memoryPath, sqlitePath } = createTempPaths('mvp-sqlite-world-bootstrap-')
+  const now = fixedNowFactory()
+  const memoryStore = createMemoryStore({ filePath: memoryPath, now })
+
+  await memoryStore.transact((memory) => {
+    memory.world.towns.alpha = {
+      ...memory.world.towns.alpha,
+      townId: 'alpha',
+      name: 'Alpha',
+      status: 'active',
+      region: 'north',
+      tags: ['harbor']
+    }
+    memory.world.towns.beta = {
+      ...memory.world.towns.beta,
+      townId: 'beta',
+      name: 'Beta',
+      status: 'distressed',
+      region: 'south',
+      tags: ['frontier']
+    }
+    memory.world.actors = {
+      ...memory.world.actors,
+      'alpha.mayor': {
+        actorId: 'alpha.mayor',
+        townId: 'alpha',
+        name: 'Mayor Elara',
+        role: 'mayor',
+        status: 'active'
+      },
+      'beta.captain': {
+        actorId: 'beta.captain',
+        townId: 'beta',
+        name: 'Captain Rook',
+        role: 'captain',
+        status: 'active'
+      },
+      'beta.warden': {
+        actorId: 'beta.warden',
+        townId: 'beta',
+        name: 'Warden Hale',
+        role: 'warden',
+        status: 'active'
+      }
+    }
+  }, { eventId: 'sqlite-world-bootstrap-seed' })
+
+  const executionStore = createExecutionStore({
+    memoryStore,
+    persistenceBackend: createSqliteExecutionPersistence({ dbPath: sqlitePath, now })
+  })
+
+  const towns = executionStore.listTowns()
+  const betaOfficeholders = executionStore.listOfficeholders('beta')
+  const migrationMeta = executionStore.getWorldStateMigrationMeta()
+  const sqliteTownRows = sqliteJson(sqlitePath, `
+    SELECT town_id, name, status
+    FROM world_towns
+    ORDER BY town_id ASC;
+  `)
+  const sqliteActorRows = sqliteJson(sqlitePath, `
+    SELECT actor_id, town_id, role
+    FROM world_actors
+    ORDER BY actor_id ASC;
+  `)
+
+  assert.equal(executionStore.worldStateBackendName, 'sqlite')
+  assert.deepEqual(towns.map((town) => town.townId), ['alpha', 'beta'])
+  assert.deepEqual(betaOfficeholders.map((actor) => actor.role), ['mayor', 'captain', 'warden'])
+  assert.equal(migrationMeta?.value, 'imported_from_memory')
+  assert.deepEqual(sqliteTownRows.map((row) => row.town_id), ['alpha', 'beta'])
+  assert(sqliteActorRows.some((row) => row.actor_id === 'alpha.mayor'))
+  assert(sqliteActorRows.some((row) => row.actor_id === 'beta.captain'))
+  assert(sqliteActorRows.some((row) => row.actor_id === 'beta.warden'))
+})
+
+test('sqlite authoritative world state preserves town spawn and player assignment across restart', async () => {
+  const { memoryPath, sqlitePath } = createTempPaths('mvp-sqlite-starter-spawn-')
+  const agents = createAgents()
+  const first = createStoreAndAdapter({
+    memoryPath,
+    sqlitePath,
+    backendName: 'sqlite'
+  })
+
+  await first.godCommandService.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'sqlite-starter-spawn-seed-alpha'
+  })
+  await first.godCommandService.applyGodCommand({
+    agents,
+    command: 'town spawn set alpha overworld 5 81 -3 45 0 4 starter_hub',
+    operationId: 'sqlite-starter-spawn-set-alpha'
+  })
+  await first.godCommandService.applyGodCommand({
+    agents,
+    command: 'player assign Builder01 alpha',
+    operationId: 'sqlite-starter-spawn-assign-builder01'
+  })
+
+  const firstSnapshot = first.memoryStore.getSnapshot().world
+  const townStateRow = sqliteJson(sqlitePath, `
+    SELECT state_json
+    FROM world_towns
+    WHERE town_id = 'alpha'
+    LIMIT 1;
+  `)[0]
+  const snapshotRow = sqliteJson(sqlitePath, `
+    SELECT payload_json
+    FROM world_state_snapshots
+    ORDER BY snapshot_id DESC
+    LIMIT 1;
+  `)[0]
+  const townState = JSON.parse(townStateRow.state_json)
+  const worldSnapshot = JSON.parse(snapshotRow.payload_json)
+
+  assert.deepEqual(firstSnapshot.towns.alpha.spawn, {
+    dimension: 'overworld',
+    x: 5,
+    y: 81,
+    z: -3,
+    yaw: 45,
+    pitch: 0,
+    radius: 4,
+    kind: 'starter_hub'
+  })
+  assert.deepEqual(firstSnapshot.players.Builder01, {
+    playerId: 'Builder01',
+    townId: 'alpha',
+    assignedAtDay: 1,
+    spawnPolicy: 'explicit_town'
+  })
+  assert.equal(townState.spawn.dimension, 'overworld')
+  assert.equal(townState.spawn.x, 5)
+  assert.equal(worldSnapshot.players.Builder01.townId, 'alpha')
+
+  const restarted = createStoreAndAdapter({
+    memoryPath,
+    sqlitePath,
+    backendName: 'sqlite'
+  })
+
+  assert.deepEqual(restarted.memoryStore.getSnapshot().world.towns.alpha.spawn, firstSnapshot.towns.alpha.spawn)
+  assert.deepEqual(restarted.memoryStore.getSnapshot().world.players.Builder01, firstSnapshot.players.Builder01)
 })
 
 test('sqlite backend persists pending marker and recovery classification across restart', async () => {
@@ -256,12 +418,18 @@ test('sqlite backend persists pending marker and recovery classification across 
 
   await assert.rejects(crashingAdapter.executeHandoff({ handoff, agents }), /sqlite crash window/)
   assert.equal(first.executionStore.listPendingExecutions().length, 1)
+  assert.equal(first.memoryStore.getSnapshot().world.projects.find((project) => project.id === projectId)?.stage, 2)
 
   const restarted = createStoreAndAdapter({
     memoryPath,
     sqlitePath,
     backendName: 'sqlite'
   })
+  assert.equal(restarted.memoryStore.getSnapshot().world.projects.find((project) => project.id === projectId)?.stage, 1)
+  assert.equal(restarted.executionStore.findReceipt({
+    handoffId: handoff.handoffId,
+    idempotencyKey: handoff.idempotencyKey
+  }), null)
   const recovered = await restarted.executionAdapter.recoverInterruptedExecutions()
 
   assert.equal(recovered.length, 1)
@@ -269,6 +437,7 @@ test('sqlite backend persists pending marker and recovery classification across 
   assert.equal(recovered[0].reasonCode, 'INTERRUPTED_EXECUTION_RECOVERY')
   assert.equal(isValidExecutionResult(recovered[0]), true)
   assert.equal(restarted.executionStore.listPendingExecutions().length, 0)
+  assert.equal(restarted.memoryStore.getSnapshot().world.projects.find((project) => project.id === projectId)?.stage, 1)
   assert.equal(restarted.executionStore.findReceipt({
     handoffId: handoff.handoffId,
     idempotencyKey: handoff.idempotencyKey
