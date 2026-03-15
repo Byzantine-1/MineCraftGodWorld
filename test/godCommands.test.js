@@ -1935,6 +1935,188 @@ test('clock advance auto-sustains allied towns while home-town work orders stay 
   assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
 })
 
+test('clock advance resolves deterministic nightly raids and replay is safe', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'raid-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'threat set alpha 90',
+    operationId: 'raid-threat-alpha'
+  })
+
+  const first = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'raid-clock-a'
+  })
+  assert.equal(first.applied, true)
+
+  const afterFirst = memoryStore.getSnapshot()
+  const alpha = afterFirst.world.towns.alpha
+  assert.ok(alpha.recentImpacts.some((entry) => entry.type === 'raid' && entry.summary === 'raid_breached'))
+  assert.ok(alpha.crierQueue.some((entry) => entry.type === 'raid' && String(entry.message || '').includes('NIGHT BREACH')))
+  assert.equal(alpha.status, 'distressed')
+  assert.ok(alpha.dread > 50)
+  assert.ok(alpha.readiness.defense < 46)
+  assert.ok(alpha.stockpiles.munitions < 44)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'raid-clock-a'
+  })
+  assert.equal(replay.applied, false)
+
+  const afterReplay = memoryStore.getSnapshot()
+  assert.deepEqual(afterReplay.world.towns.alpha, afterFirst.world.towns.alpha)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('clock advance escalates town gates deterministically under nether and breach pressure', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'gate-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_hall 50 64 0 town:beta',
+    operationId: 'gate-seed-beta'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'threat set alpha 92',
+    operationId: 'gate-threat-alpha'
+  })
+  await memoryStore.transact((memory) => {
+    memory.world.towns.alpha.readiness.gate = 28
+    memory.world.towns.alpha.readiness.shelter = 34
+    memory.world.towns.alpha.armory.distribution = 20
+    memory.world.towns.alpha.stockpiles.lampOil = 18
+    memory.world.towns.alpha.stockpiles.sanctity = 22
+    memory.world.nether = {
+      eventLedger: [
+        {
+          id: 'ne_gate_surge',
+          day: 1,
+          type: 'THREAT_SURGE',
+          payload: { threat: 4 },
+          applied: true
+        }
+      ],
+      modifiers: { longNight: 0, omen: 0, scarcity: 0, threat: 4 },
+      deckState: { seed: 1337, cursor: 1 },
+      lastTickDay: 1
+    }
+  }, { eventId: 'gate-nether-surge' })
+
+  const first = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'gate-clock-a'
+  })
+  assert.equal(first.applied, true)
+
+  const afterFirst = memoryStore.getSnapshot()
+  const alpha = afterFirst.world.towns.alpha
+  const beta = afterFirst.world.towns.beta
+  assert.ok(alpha.gate.pressure > beta.gate.pressure)
+  assert.ok(['unstable', 'breach_risk'].includes(alpha.gate.status))
+  assert.ok(['surge_breakout', 'incursion_imminent'].includes(alpha.gate.criticalEvent))
+  assert.ok(['dangerous', 'forbidden'].includes(alpha.gate.travelRisk))
+  assert.ok(alpha.recentImpacts.some((entry) => entry.type === 'gate_event'))
+  assert.ok(alpha.crierQueue.some((entry) => entry.type === 'gate' && String(entry.message || '').includes('GATE')))
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 1',
+    operationId: 'gate-clock-a'
+  })
+  assert.equal(replay.applied, false)
+  assert.deepEqual(memoryStore.getSnapshot(), afterFirst)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
+test('clock advance maintains autonomous town economy, armory, and queued civic builds deterministically', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'phase3-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_hall 10 64 10 town:beta',
+    operationId: 'phase3-seed-beta'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'threat set beta 70',
+    operationId: 'phase3-threat-beta'
+  })
+  await memoryStore.transact((memory) => {
+    const towns = memory.world.towns
+    towns.beta.stockpiles.food = 34
+    towns.beta.stockpiles.lampOil = 38
+  }, { eventId: 'phase3-low-supply-beta' })
+
+  const first = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'phase3-clock-a'
+  })
+  assert.equal(first.applied, true)
+
+  const afterFirst = memoryStore.getSnapshot()
+  const beta = afterFirst.world.towns.beta
+  const betaOrder = afterFirst.world.projects.find((project) => (
+    project.townId === 'beta' && (project.status === 'active' || project.status === 'planned')
+  ))
+
+  assert.ok(betaOrder)
+  assert.equal(beta.autonomy.mode, 'allied_autonomy')
+  assert.equal(Number.isInteger(beta.economy.market), true)
+  assert.equal(Number.isInteger(beta.economy.labor), true)
+  assert.equal(Number.isInteger(beta.economy.build), true)
+  assert.equal(Number.isInteger(beta.economy.caravan), true)
+  assert.equal(Number.isInteger(beta.economy.wealth), true)
+  assert.equal(Number.isInteger(beta.armory.reserve), true)
+  assert.equal(Number.isInteger(beta.armory.issued), true)
+  assert.equal(Number.isInteger(beta.armory.repair), true)
+  assert.equal(Number.isInteger(beta.armory.distribution), true)
+  assert.ok(beta.economy.market > 0)
+  assert.ok(beta.armory.reserve > 0)
+  assert.ok(Array.isArray(beta.buildQueue))
+  assert.ok(beta.buildQueue.some((entry) => entry.projectType === 'ration_depot'))
+  assert.equal(typeof beta.buildQueue[0].reason, 'string')
+  assert.ok(beta.stockpiles.food < 55)
+
+  const replay = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'phase3-clock-a'
+  })
+  assert.equal(replay.applied, false)
+
+  const afterReplay = memoryStore.getSnapshot()
+  assert.deepEqual(afterReplay.world.towns.beta, afterFirst.world.towns.beta)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
 test('mood commands are read-only and town board includes mood section', async () => {
   const memoryStore = createStore()
   const seedService = createGodCommandService({ memoryStore })
@@ -3213,6 +3395,7 @@ test('townsfolk talk creates deterministic side quests with dedupe and major mis
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR FRONTLINE STATUS:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR HOPE DREAD:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR RATIONS STRAIN:')))
+  assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD GATE STATUS:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR WHAT CHANGED TODAY:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD WAR ORDERS OF THE DAY:')))
   assert.ok(board.outputLines.some(line => line.includes('GOD TOWN BOARD MAJOR MISSION')))

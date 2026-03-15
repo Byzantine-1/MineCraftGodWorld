@@ -291,11 +291,28 @@ const TOWN_STOCKPILE_MIN = 0
 const TOWN_STOCKPILE_MAX = 100
 const TOWN_READINESS_MIN = 0
 const TOWN_READINESS_MAX = 100
+const TOWN_ECONOMY_MIN = 0
+const TOWN_ECONOMY_MAX = 100
+const TOWN_ARMORY_MIN = 0
+const TOWN_ARMORY_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
 const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
 const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const TOWN_ECONOMY_KEYS = ['market', 'labor', 'build', 'caravan', 'wealth']
+const TOWN_ARMORY_KEYS = ['reserve', 'issued', 'repair', 'distribution']
 const TOWN_AUTONOMY_MODES = new Set(['home_priority', 'allied_autonomy'])
+const TOWN_GATE_STATUSES = new Set(['quiet', 'watch', 'strained', 'unstable', 'breach_risk'])
+const TOWN_GATE_CRITICAL_EVENTS = new Set([
+  'none',
+  'ash_omens',
+  'hunger_rites',
+  'surge_breakout',
+  'long_night_press',
+  'incursion_imminent'
+])
+const TOWN_GATE_TRAVEL_RISKS = new Set(['low', 'guarded', 'dangerous', 'forbidden'])
+const TOWN_BUILD_QUEUE_PRIORITIES = new Set(['defense', 'sustain', 'faith', 'watch', 'industry'])
 const DEFAULT_TOWN_STOCKPILES = Object.freeze({
   food: 55,
   tools: 48,
@@ -312,10 +329,34 @@ const DEFAULT_TOWN_READINESS = Object.freeze({
   gate: 45,
   shelter: 47
 })
+const DEFAULT_TOWN_ECONOMY = Object.freeze({
+  market: 48,
+  labor: 50,
+  build: 46,
+  caravan: 44,
+  wealth: 47
+})
+const DEFAULT_TOWN_ARMORY = Object.freeze({
+  reserve: 46,
+  issued: 24,
+  repair: 42,
+  distribution: 34
+})
+const DEFAULT_TOWN_GATE = Object.freeze({
+  pressure: 18,
+  status: 'quiet',
+  criticalEvent: 'none',
+  travelRisk: 'low',
+  lastEventDay: 0,
+  lastEventId: null
+})
+const MAX_TOWN_BUILD_QUEUE_ENTRIES = 6
 const MAX_TOWN_REGISTRY_TAGS = 12
 const TOWN_REGISTRY_STATUSES = new Set(['active', 'distressed', 'dormant'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
   'nether_event',
+  'gate_event',
+  'raid',
   'mission_complete',
   'mission_fail',
   'townsfolk_complete',
@@ -2362,6 +2403,620 @@ function deriveRationsStrain(input) {
 }
 
 /**
+ * @param {{
+ *   readiness?: Record<string, number>,
+ *   stockpiles?: Record<string, number>,
+ *   frontlineScore?: number,
+ *   rationsStrain?: {strain?: number},
+ *   projectFrontlineShield?: number,
+ *   projectScouting?: number,
+ *   hope?: number,
+ *   dread?: number
+ * }} input
+ */
+function deriveMilitiaStrength(input) {
+  const readiness = normalizeTownReadiness(input?.readiness)
+  const stockpiles = normalizeTownStockpiles(input?.stockpiles)
+  const frontlineScore = clamp(Math.trunc(Number(input?.frontlineScore || 0)), 0, 200)
+  const strain = clamp(Math.trunc(Number(input?.rationsStrain?.strain || 0)), 0, 100)
+  const hope = clamp(Math.trunc(Number(input?.hope || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const dread = clamp(Math.trunc(Number(input?.dread || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const projectFrontlineShield = Math.max(0, Math.trunc(Number(input?.projectFrontlineShield || 0)))
+  const projectScouting = Math.max(0, Math.trunc(Number(input?.projectScouting || 0)))
+  return clamp(Math.trunc(
+    (readiness.defense * 0.34)
+      + (readiness.gate * 0.18)
+      + (readiness.morale * 0.14)
+      + (stockpiles.munitions * 0.16)
+      + (stockpiles.food * 0.05)
+      + (stockpiles.sanctity * 0.05)
+      + (projectFrontlineShield * 2)
+      + projectScouting
+      + Math.trunc((hope - dread) / 4)
+      - Math.trunc(frontlineScore / 5)
+      - Math.trunc(strain / 7)
+  ), 0, 100)
+}
+
+/**
+ * @param {{
+ *   stockpiles?: Record<string, number>,
+ *   readiness?: Record<string, number>,
+ *   mood?: {prosperity?: number, unrest?: number},
+ *   townThreatLevel?: number,
+ *   scarcity?: number,
+ *   hope?: number,
+ *   dread?: number
+ * }} input
+ */
+function deriveTownEconomyState(input) {
+  const stockpiles = normalizeTownStockpiles(input?.stockpiles)
+  const readiness = normalizeTownReadiness(input?.readiness)
+  const prosperity = clamp(Math.trunc(Number(input?.mood?.prosperity || 0)), 0, 100)
+  const unrest = clamp(Math.trunc(Number(input?.mood?.unrest || 0)), 0, 100)
+  const threatLevel = clamp(Math.trunc(Number(input?.townThreatLevel || 0)), 0, 100)
+  const scarcity = clamp(Math.trunc(Number(input?.scarcity || 0)), -9, 9)
+  const hope = clamp(Math.trunc(Number(input?.hope || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const dread = clamp(Math.trunc(Number(input?.dread || 0)), TOWN_PRESSURE_MIN, TOWN_PRESSURE_MAX)
+  const market = clamp(Math.trunc(
+    14
+      + (stockpiles.food * 0.18)
+      + (stockpiles.tools * 0.12)
+      + (readiness.economy * 0.30)
+      + (prosperity * 0.40)
+      - (unrest * 0.18)
+      - (threatLevel * 0.22)
+      - (scarcity * 6)
+  ), 0, 100)
+  const labor = clamp(Math.trunc(
+    18
+      + (readiness.morale * 0.24)
+      + (readiness.economy * 0.14)
+      + (hope * 0.16)
+      - (dread * 0.12)
+      - (threatLevel * 0.08)
+  ), 0, 100)
+  const build = clamp(Math.trunc(
+    12
+      + (labor * 0.32)
+      + (stockpiles.tools * 0.20)
+      + (stockpiles.timber * 0.14)
+      + (stockpiles.stone * 0.14)
+      - (threatLevel * 0.10)
+  ), 0, 100)
+  const caravan = clamp(Math.trunc(
+    16
+      + (market * 0.24)
+      + (stockpiles.sanctity * 0.08)
+      - (threatLevel * 0.18)
+      - (scarcity * 7)
+  ), 0, 100)
+  const wealth = clamp(Math.trunc(
+    12
+      + (market * 0.38)
+      + (caravan * 0.18)
+      + (stockpiles.food * 0.08)
+      + (stockpiles.tools * 0.10)
+      - Math.max(0, Math.trunc((dread - hope) / 3))
+  ), 0, 100)
+  return { market, labor, build, caravan, wealth }
+}
+
+/**
+ * @param {{
+ *   stockpiles?: Record<string, number>,
+ *   readiness?: Record<string, number>,
+ *   economy?: Record<string, number>,
+ *   frontlineScore?: number,
+ *   rationsStrain?: {strain?: number}
+ * }} input
+ */
+function deriveTownArmoryState(input) {
+  const stockpiles = normalizeTownStockpiles(input?.stockpiles)
+  const readiness = normalizeTownReadiness(input?.readiness)
+  const economy = normalizeTownEconomy(input?.economy)
+  const frontlineScore = clamp(Math.trunc(Number(input?.frontlineScore || 0)), 0, 200)
+  const strain = clamp(Math.trunc(Number(input?.rationsStrain?.strain || 0)), 0, 100)
+  const reserve = clamp(Math.trunc(
+    10
+      + (stockpiles.munitions * 0.62)
+      + (stockpiles.tools * 0.10)
+      + (economy.build * 0.08)
+      - (frontlineScore * 0.12)
+  ), 0, 100)
+  const issued = clamp(Math.trunc(
+    8
+      + (readiness.defense * 0.24)
+      + (frontlineScore * 0.22)
+      + (economy.labor * 0.10)
+      - (strain * 0.12)
+  ), 0, 100)
+  const repair = clamp(Math.trunc(
+    12
+      + (stockpiles.tools * 0.34)
+      + (stockpiles.stone * 0.12)
+      + (economy.build * 0.18)
+      - (frontlineScore * 0.06)
+  ), 0, 100)
+  const distribution = clamp(Math.trunc(
+    10
+      + (economy.labor * 0.18)
+      + (economy.market * 0.10)
+      + (reserve * 0.12)
+      - (frontlineScore * 0.08)
+      - (strain * 0.10)
+  ), 0, 100)
+  return { reserve, issued, repair, distribution }
+}
+
+/**
+ * @param {number} frontlineScore
+ */
+function deriveRaidStatus(frontlineScore) {
+  const score = clamp(Math.trunc(Number(frontlineScore || 0)), 0, 200)
+  if (score >= 120) return 'breach'
+  if (score >= 85) return 'assault'
+  if (score >= 55) return 'skirmish'
+  if (score >= 35) return 'watch'
+  return 'calm'
+}
+
+/**
+ * @param {string} status
+ */
+function gateStatusRank(status) {
+  switch (asText(status, '', 40).toLowerCase()) {
+    case 'breach_risk':
+      return 4
+    case 'unstable':
+      return 3
+    case 'strained':
+      return 2
+    case 'watch':
+      return 1
+    default:
+      return 0
+  }
+}
+
+/**
+ * @param {any} input
+ */
+function deriveTownGateState(input) {
+  const current = normalizeTownGate(input?.gate)
+  const readiness = normalizeTownReadiness(input?.readiness)
+  const stockpiles = normalizeTownStockpiles(input?.stockpiles)
+  const economy = normalizeTownEconomy(input?.economy)
+  const armory = normalizeTownArmory(input?.armory)
+  const hope = normalizeTownPressureValue(input?.hope, DEFAULT_TOWN_HOPE)
+  const dread = normalizeTownPressureValue(input?.dread, DEFAULT_TOWN_DREAD)
+  const threatLevel = clamp(Math.trunc(Number(input?.townThreatLevel || 0)), 0, 100)
+  const frontlineScore = clamp(Math.trunc(Number(input?.frontlineScore || 0)), 0, 200)
+  const rationStrain = clamp(Math.trunc(Number(input?.rationsStrain?.strain || 0)), 0, 100)
+  const latestNetherType = asText(input?.latestNetherEvent?.type, '', 40).toUpperCase()
+  const lastRaidOutcome = asText(input?.lastRaidOutcome, '', 40).toLowerCase()
+  const phase = asText(input?.phase, 'day', 20).toLowerCase()
+  const projectVisibility = Math.max(0, Math.trunc(Number(input?.projectVisibility || 0)))
+  const projectSanctity = Math.max(0, Math.trunc(Number(input?.projectSanctity || 0)))
+
+  const netherPressure = latestNetherType === 'THREAT_SURGE'
+    ? 24
+    : latestNetherType === 'LONG_NIGHT'
+      ? 18
+      : latestNetherType === 'SCARCITY'
+        ? 12
+        : latestNetherType === 'OMEN'
+          ? 10
+          : latestNetherType === 'CALM_BEFORE_STORM'
+            ? -12
+            : 0
+  const raidPressure = lastRaidOutcome === 'breached'
+    ? 18
+    : lastRaidOutcome === 'held'
+      ? 8
+      : lastRaidOutcome === 'repelled'
+        ? -6
+        : 0
+  const computedPressure = 8
+    + Math.trunc(threatLevel * 0.24)
+    + Math.trunc(frontlineScore * 0.14)
+    + Math.trunc(Math.max(0, 55 - readiness.gate) * 0.72)
+    + Math.trunc(Math.max(0, 50 - readiness.shelter) * 0.22)
+    + Math.trunc(Math.max(0, 48 - stockpiles.lampOil) * 0.18)
+    + Math.trunc(Math.max(0, 52 - stockpiles.sanctity) * 0.16)
+    + Math.trunc(Math.max(0, 40 - armory.distribution) * 0.16)
+    + Math.trunc(Math.max(0, dread - hope) * 0.85)
+    + Math.trunc(Math.max(0, 52 - economy.build) * 0.10)
+    + Math.trunc(rationStrain * 0.08)
+    + (phase === 'night' ? 6 : -2)
+    + netherPressure
+    + raidPressure
+    - Math.trunc(projectVisibility * 1.5)
+    - Math.trunc(projectSanctity * 1.2)
+  const pressure = clamp(Math.trunc((current.pressure * 0.4) + (computedPressure * 0.6)), 0, 100)
+  const status = pressure >= 86
+    ? 'breach_risk'
+    : pressure >= 68
+      ? 'unstable'
+      : pressure >= 50
+        ? 'strained'
+        : pressure >= 30
+          ? 'watch'
+          : 'quiet'
+  const criticalEvent = pressure >= 90 || (lastRaidOutcome === 'breached' && threatLevel >= 78)
+    ? 'incursion_imminent'
+    : latestNetherType === 'THREAT_SURGE' && pressure >= 66
+      ? 'surge_breakout'
+      : latestNetherType === 'LONG_NIGHT' && pressure >= 58
+        ? 'long_night_press'
+        : latestNetherType === 'SCARCITY' && pressure >= 52
+          ? 'hunger_rites'
+          : latestNetherType === 'OMEN' && pressure >= 42
+            ? 'ash_omens'
+            : 'none'
+  const travelRisk = pressure >= 90
+    ? 'forbidden'
+    : pressure >= 66
+      ? 'dangerous'
+      : pressure >= 36
+        ? 'guarded'
+        : 'low'
+  return {
+    pressure,
+    status,
+    criticalEvent,
+    travelRisk,
+    lastEventDay: current.lastEventDay,
+    lastEventId: current.lastEventId
+  }
+}
+
+/**
+ * @param {string} criticalEvent
+ */
+function describeGateCriticalEvent(criticalEvent) {
+  switch (asText(criticalEvent, '', 40).toLowerCase()) {
+    case 'ash_omens':
+      return 'Ash-sign omens gather around the gate lamps.'
+    case 'hunger_rites':
+      return 'Hunger rites and thin stores draw restless things close.'
+    case 'surge_breakout':
+      return 'A surge pounds at the warded stones beyond the gate.'
+    case 'long_night_press':
+      return 'The long night presses hard against the bells and wards.'
+    case 'incursion_imminent':
+      return 'The Dead Marches answer the gate with breach pressure.'
+    default:
+      return 'The gate wards settle and the bells hold steady.'
+  }
+}
+
+/**
+ * @param {string} townName
+ * @param {any} previousGate
+ * @param {any} nextGate
+ */
+function buildTownGateMessage(townName, previousGate, nextGate) {
+  const town = asText(townName, 'Town', 80)
+  const previous = normalizeTownGate(previousGate)
+  const next = normalizeTownGate(nextGate)
+  if (previous.criticalEvent !== 'none' && next.criticalEvent === 'none' && gateStatusRank(next.status) < gateStatusRank(previous.status)) {
+    return `[${town}] GATE STABILIZED: The wardens have steadied the crossing. pressure=${next.pressure} risk=${next.travelRisk}.`
+  }
+  const criticalText = describeGateCriticalEvent(next.criticalEvent)
+  return `[${town}] GATE ${next.status.toUpperCase()}: ${criticalText} pressure=${next.pressure} risk=${next.travelRisk}.`
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, tickIdx: number, at: number}} input
+ */
+function runTownGateEscalation(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  const towns = ensureWorldTownMissionStates(memory.world)
+  const threat = ensureWorldThreat(memory.world)
+  const nether = ensureWorldNether(memory.world)
+  const latestNetherEvent = normalizeNetherLedger(nether.eventLedger).slice(-1)[0] || null
+
+  for (const townName of Object.keys(towns)) {
+    const state = towns[townName] = normalizeTownMissionState(towns[townName], townName)
+    const mood = normalizeTownMood(memory.world?.moods?.byTown?.[townName]) || freshTownMood()
+    const projectModifiers = getCompletedProjectModifiers(memory.world, townName)
+    const frontline = deriveFrontlineStatus({
+      townThreatLevel: Number(threat.byTown?.[townName] || 0),
+      activeMajorMission: state.activeMajorMissionId ? { id: state.activeMajorMissionId } : null,
+      latestNetherEvent,
+      hope: state.hope,
+      dread: state.dread,
+      projectFrontlineShield: projectModifiers.frontlineShield,
+      projectScouting: projectModifiers.scouting
+    })
+    const rationStrain = deriveRationsStrain({
+      townThreatLevel: frontline.threatLevel,
+      scarcity: Number(nether.modifiers?.scarcity || 0),
+      mood,
+      projectRations: projectModifiers.rations
+    })
+    const latestRaid = findLatestRaidImpact(state.recentImpacts)
+    const previousGate = normalizeTownGate(state.gate)
+    const nextGate = deriveTownGateState({
+      gate: previousGate,
+      readiness: state.readiness,
+      stockpiles: state.stockpiles,
+      economy: state.economy,
+      armory: state.armory,
+      hope: state.hope,
+      dread: state.dread,
+      townThreatLevel: frontline.threatLevel,
+      frontlineScore: frontline.score,
+      rationsStrain: rationStrain,
+      latestNetherEvent,
+      lastRaidOutcome: asText(latestRaid?.summary, '', 80).replace(/^raid_/, ''),
+      projectVisibility: projectModifiers.visibility,
+      projectSanctity: projectModifiers.sanctity,
+      phase: clock.phase
+    })
+    const shouldAnnounce = previousGate.status !== nextGate.status
+      || previousGate.criticalEvent !== nextGate.criticalEvent
+      || previousGate.travelRisk !== nextGate.travelRisk
+    state.gate = nextGate
+    if (state.gate.pressure >= 82) {
+      state.status = 'distressed'
+    }
+    if (!shouldAnnounce) continue
+
+    const gateEventId = asText(
+      `${input.operationId}:gate:${input.tickIdx}:${townName.toLowerCase()}:${clock.day}:${clock.phase}:${nextGate.criticalEvent}:${nextGate.status}`,
+      '',
+      200
+    )
+    state.gate.lastEventDay = clock.day
+    state.gate.lastEventId = gateEventId
+    const message = buildTownGateMessage(townName, previousGate, state.gate)
+    const summary = nextGate.criticalEvent !== 'none'
+      ? `gate_${nextGate.criticalEvent}`
+      : `gate_${nextGate.status}`
+
+    appendTownImpact(memory, {
+      townName,
+      idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:gate`,
+      type: 'gate_event',
+      summary,
+      netherEventId: latestNetherEvent?.id
+    })
+    appendTownCrier(memory, {
+      townName,
+      at: input.at,
+      idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:gate`,
+      type: 'gate',
+      message
+    })
+    appendChronicle(memory, {
+      id: `${input.operationId}:chronicle:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:gate`,
+      type: 'gate',
+      msg: message,
+      at: input.at,
+      town: townName,
+      meta: {
+        gate_status: state.gate.status,
+        gate_pressure: state.gate.pressure,
+        gate_critical_event: state.gate.criticalEvent,
+        gate_travel_risk: state.gate.travelRisk,
+        nether_event_id: latestNetherEvent?.id || null
+      }
+    })
+    appendNews(memory, {
+      id: `${input.operationId}:news:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:gate`,
+      topic: 'world',
+      msg: message,
+      at: input.at,
+      town: townName,
+      meta: {
+        gate_status: state.gate.status,
+        gate_pressure: state.gate.pressure,
+        gate_critical_event: state.gate.criticalEvent,
+        gate_travel_risk: state.gate.travelRisk,
+        nether_event_id: latestNetherEvent?.id || null
+      }
+    })
+  }
+}
+
+/**
+ * @param {any[]} impacts
+ */
+function findLatestRaidImpact(impacts) {
+  return normalizeTownRecentImpacts(impacts)
+    .filter((entry) => entry.type === 'raid')
+    .sort((left, right) => Number(right.day || 0) - Number(left.day || 0) || right.id.localeCompare(left.id))[0] || null
+}
+
+/**
+ * @param {any} memory
+ * @param {string} townName
+ */
+function refreshTownOperationalStatus(memory, townName) {
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null, townName)
+  }
+  const state = towns[townName]
+  state.readiness = normalizeTownReadiness(state.readiness)
+  state.gate = normalizeTownGate(state.gate)
+  const hope = normalizeTownPressureValue(state.hope, DEFAULT_TOWN_HOPE)
+  const dread = normalizeTownPressureValue(state.dread, DEFAULT_TOWN_DREAD)
+  // A town should flip distressed well before collapse so raid breaches
+  // and compounding shortages surface immediately in the board and alerts.
+  const distressed = state.readiness.defense <= 40
+    || state.readiness.gate <= 40
+    || state.readiness.shelter <= 42
+    || state.gate.pressure >= 82
+    || gateStatusRank(state.gate.status) >= gateStatusRank('unstable')
+    || dread >= 56
+    || (dread - hope) >= 10
+  state.status = distressed ? 'distressed' : 'active'
+  return state.status
+}
+
+/**
+ * @param {string} townName
+ * @param {'repelled'|'held'|'breached'} outcome
+ * @param {string} raidStatus
+ * @param {number} frontlineScore
+ * @param {number} militiaStrength
+ */
+function buildRaidOutcomeMessage(townName, outcome, raidStatus, frontlineScore, militiaStrength) {
+  const town = asText(townName, 'Town', 80)
+  const status = asText(raidStatus, 'watch', 20).toUpperCase()
+  const score = Math.trunc(Number(frontlineScore || 0))
+  const strength = Math.trunc(Number(militiaStrength || 0))
+  switch (outcome) {
+    case 'repelled':
+      return `[${town}] NIGHT RAID REPELLED: ${status} pressure broke against the guard line. score=${score} militia=${strength}.`
+    case 'held':
+      return `[${town}] NIGHT RAID HELD: ${status} pressure reached the walls but the line still stands. score=${score} militia=${strength}.`
+    default:
+      return `[${town}] NIGHT BREACH: ${status} pressure broke through the outer line. score=${score} militia=${strength}.`
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, tickIdx: number, at: number}} input
+ */
+function runTownDefenseEncounters(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  if (clock.phase !== 'night') return
+  const towns = ensureWorldTownMissionStates(memory.world)
+  const threat = ensureWorldThreat(memory.world)
+  const nether = ensureWorldNether(memory.world)
+  const latestNetherEvent = normalizeNetherLedger(nether.eventLedger).slice(-1)[0] || null
+
+  for (const townName of Object.keys(towns)) {
+    const state = towns[townName] = normalizeTownMissionState(towns[townName], townName)
+    const mood = normalizeTownMood(memory.world?.moods?.byTown?.[townName]) || freshTownMood()
+    const projectModifiers = getCompletedProjectModifiers(memory.world, townName)
+    const frontline = deriveFrontlineStatus({
+      townThreatLevel: Number(threat.byTown?.[townName] || 0),
+      activeMajorMission: state.activeMajorMissionId ? { id: state.activeMajorMissionId } : null,
+      latestNetherEvent,
+      hope: state.hope,
+      dread: state.dread,
+      projectFrontlineShield: projectModifiers.frontlineShield,
+      projectScouting: projectModifiers.scouting
+    })
+    const raidStatus = deriveRaidStatus(frontline.score)
+    if (raidStatus === 'calm' || raidStatus === 'watch') {
+      refreshTownOperationalStatus(memory, townName)
+      continue
+    }
+
+    const rationStrain = deriveRationsStrain({
+      townThreatLevel: frontline.threatLevel,
+      scarcity: Number(nether.modifiers?.scarcity || 0),
+      mood,
+      projectRations: projectModifiers.rations
+    })
+    const militiaStrength = deriveMilitiaStrength({
+      readiness: state.readiness,
+      stockpiles: state.stockpiles,
+      frontlineScore: frontline.score,
+      rationsStrain: rationStrain,
+      projectFrontlineShield: projectModifiers.frontlineShield,
+      projectScouting: projectModifiers.scouting,
+      hope: state.hope,
+      dread: state.dread
+    })
+    const defenseEdge = militiaStrength
+      + Math.trunc((Number(state.readiness?.gate || 0) + Number(state.readiness?.shelter || 0)) / 6)
+      - frontline.score
+    const outcome = raidStatus === 'breach'
+      ? (defenseEdge >= 25 ? 'held' : 'breached')
+      : raidStatus === 'assault'
+        ? (defenseEdge >= 15 ? 'repelled' : defenseEdge >= -5 ? 'held' : 'breached')
+        : (defenseEdge >= 10 ? 'repelled' : 'held')
+    const casualtyPressure = clamp(Math.trunc((frontline.score - militiaStrength + rationStrain.strain) / 8), 0, 18)
+
+    const stockpileDelta = outcome === 'repelled'
+      ? { munitions: -1 - Math.trunc(casualtyPressure / 6), food: -1, lampOil: -1 }
+      : outcome === 'held'
+        ? { munitions: -2 - Math.trunc(casualtyPressure / 5), food: -1, lampOil: -1, tools: -1 }
+        : { munitions: -3 - Math.trunc(casualtyPressure / 4), food: -3, lampOil: -2, timber: -1, sanctity: -1 }
+    const readinessDelta = outcome === 'repelled'
+      ? { defense: -1, gate: -1, morale: 1 }
+      : outcome === 'held'
+        ? { defense: -3, gate: -2, morale: -1, shelter: -1 }
+        : { defense: -6, gate: -5, morale: -4, shelter: -3, economy: -2 }
+    const pressureDelta = outcome === 'repelled'
+      ? { hope: 2, dread: -1 }
+      : outcome === 'held'
+        ? { hope: -1, dread: 2 }
+        : { hope: -4, dread: 6 }
+    const threatDelta = outcome === 'repelled'
+      ? -Math.max(4, Math.trunc(frontline.score / 18))
+      : outcome === 'held'
+        ? -Math.max(1, Math.trunc(frontline.score / 30))
+        : Math.max(1, Math.trunc(frontline.score / 40))
+
+    applyTownAutonomyDelta(memory, {
+      townName,
+      stockpiles: stockpileDelta,
+      readiness: readinessDelta,
+      lastResolvedDay: clock.day
+    })
+    threat.byTown[townName] = clamp(Number(threat.byTown?.[townName] || 0) + threatDelta, 0, 100)
+    applyTownPressureDelta(memory, {
+      townName,
+      delta: pressureDelta,
+      idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:raid`,
+      type: 'raid',
+      summary: `raid_${outcome}`
+    })
+    refreshTownOperationalStatus(memory, townName)
+    if (outcome === 'breached') {
+      towns[townName].status = 'distressed'
+    }
+
+    const message = buildRaidOutcomeMessage(townName, outcome, raidStatus, frontline.score, militiaStrength)
+    appendTownCrier(memory, {
+      townName,
+      at: input.at,
+      idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:raid`,
+      type: 'raid',
+      message
+    })
+    appendChronicle(memory, {
+      id: `${input.operationId}:chronicle:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:raid`,
+      type: 'raid',
+      msg: message,
+      at: input.at,
+      town: townName,
+      meta: {
+        raid_status: raidStatus,
+        raid_outcome: outcome,
+        frontline_score: frontline.score,
+        militia_strength: militiaStrength,
+        ration_strain: rationStrain.strain
+      }
+    })
+    appendNews(memory, {
+      id: `${input.operationId}:news:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:raid`,
+      topic: 'world',
+      msg: message,
+      at: input.at,
+      town: townName,
+      meta: {
+        raid_status: raidStatus,
+        raid_outcome: outcome,
+        frontline_score: frontline.score,
+        militia_strength: militiaStrength,
+        ration_strain: rationStrain.strain
+      }
+    })
+  }
+}
+
+/**
  * @param {any} impact
  */
 function formatTownImpact(impact) {
@@ -4319,6 +4974,213 @@ function buildSupportProjectDraft(world, townName, input = {}) {
 }
 
 /**
+ * @param {any} world
+ * @param {string} townName
+ * @param {string} projectType
+ */
+function createTownBuildQueueId(world, townName, projectType) {
+  const clock = ensureWorldClock(world)
+  const day = Math.max(0, Number(clock.day || 0))
+  const seed = deriveNetherSeed(world)
+  const hashBase = shortStableHash(`${seed}:${townName}:${projectType}:${day}:build_queue`)
+  return asText(`bq_${hashBase}_${day.toString(36)}`, `bq_${hashBase}`, 200)
+}
+
+/**
+ * @param {string} projectType
+ */
+function buildQueuePriorityForProjectType(projectType) {
+  switch (asText(projectType, '', 40).toLowerCase()) {
+    case 'trench_reinforcement':
+      return 'defense'
+    case 'ration_depot':
+      return 'sustain'
+    case 'field_chapel':
+      return 'faith'
+    case 'watchtower_line':
+    case 'lantern_line':
+      return 'watch'
+    default:
+      return 'industry'
+  }
+}
+
+/**
+ * @param {string} projectType
+ */
+function defaultBuildQueueReason(projectType) {
+  switch (asText(projectType, '', 40).toLowerCase()) {
+    case 'trench_reinforcement':
+      return 'The outer lanes need earthworks and hard cover before the next press.'
+    case 'ration_depot':
+      return 'Storehouses must stay ahead of hunger, ration theft, and siege strain.'
+    case 'field_chapel':
+      return 'Clergy and medics need a stronger refuge before the next wave of wounded.'
+    case 'watchtower_line':
+      return 'Watch crews need longer sight lines to catch caravans and raiders early.'
+    case 'lantern_line':
+      return 'Bell roads and lamp routes must stay lit for the night watch.'
+    default:
+      return 'The town has queued new civic works.'
+  }
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {string} projectType
+ */
+function hasActiveProjectType(world, townName, projectType) {
+  return listProjectsForTown(world?.projects, townName)
+    .some((project) => (
+      sameText(project?.type, projectType, 40)
+      && (project.status === 'active' || project.status === 'planned')
+    ))
+}
+
+/**
+ * @param {any} townState
+ */
+function queuedBuildTypes(townState) {
+  return new Set(
+    normalizeTownBuildQueue(townState?.buildQueue)
+      .map((entry) => entry.projectType)
+      .filter(Boolean)
+  )
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
+ *   projectType: string,
+ *   priority?: string,
+ *   reason?: string,
+ *   autoManaged?: boolean
+ * }} input
+ */
+function enqueueTownBuild(memory, input) {
+  const townName = asText(input?.townName, '', 80)
+  const projectType = asText(input?.projectType, '', 40).toLowerCase()
+  if (!townName || !PROJECT_TYPES.has(projectType)) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null, townName)
+  }
+  const state = towns[townName]
+  state.buildQueue = normalizeTownBuildQueue(state.buildQueue)
+  if (state.buildQueue.length >= MAX_TOWN_BUILD_QUEUE_ENTRIES) return null
+  if (queuedBuildTypes(state).has(projectType) || hasActiveProjectType(memory.world, townName, projectType)) return null
+  const priority = asText(input?.priority, buildQueuePriorityForProjectType(projectType), 40).toLowerCase()
+  if (!TOWN_BUILD_QUEUE_PRIORITIES.has(priority)) return null
+  const reason = asText(input?.reason, defaultBuildQueueReason(projectType), 160)
+  const queuedAtDay = Math.max(0, Number(ensureWorldClock(memory.world).day || 0))
+  const entry = {
+    id: createTownBuildQueueId(memory.world, townName, projectType),
+    projectType,
+    priority,
+    queuedAtDay,
+    reason,
+    autoManaged: input?.autoManaged === true
+  }
+  state.buildQueue = [...state.buildQueue, entry].slice(-MAX_TOWN_BUILD_QUEUE_ENTRIES)
+  return entry
+}
+
+/**
+ * @param {any} memory
+ * @param {string} townName
+ */
+function dequeueTownBuild(memory, townName) {
+  const safeTown = asText(townName, '', 80)
+  if (!safeTown) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, safeTown)) {
+    towns[safeTown] = normalizeTownMissionState(null, safeTown)
+  }
+  const state = towns[safeTown]
+  state.buildQueue = normalizeTownBuildQueue(state.buildQueue)
+  if (state.buildQueue.length === 0) return null
+  const [entry, ...rest] = state.buildQueue
+  state.buildQueue = rest
+  return entry
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {{
+ *   stockpiles?: Record<string, number>,
+ *   readiness?: Record<string, number>,
+ *   frontline?: {score?: number},
+ *   rationStrain?: {strain?: number, outlook?: string},
+ *   economy?: Record<string, number>,
+ *   armory?: Record<string, number>,
+ *   hope?: number,
+ *   dread?: number
+ * }} input
+ */
+function chooseTownBuildQueueCandidate(world, townName, input) {
+  const towns = ensureWorldTownMissionStates(world)
+  const state = towns[townName] || normalizeTownMissionState(null, townName)
+  const queuedTypes = queuedBuildTypes(state)
+  const activeTypes = new Set(
+    listProjectsForTown(world?.projects, townName)
+      .filter((project) => project.status === 'active' || project.status === 'planned')
+      .map((project) => project.type)
+  )
+  const blocked = new Set([...queuedTypes, ...activeTypes])
+  const stockpiles = normalizeTownStockpiles(input?.stockpiles)
+  const readiness = normalizeTownReadiness(input?.readiness)
+  const frontlineScore = clamp(Math.trunc(Number(input?.frontline?.score || 0)), 0, 200)
+  const rationStrain = clamp(Math.trunc(Number(input?.rationStrain?.strain || 0)), 0, 100)
+  const economy = normalizeTownEconomy(input?.economy)
+  const armory = normalizeTownArmory(input?.armory)
+  const hope = normalizeTownPressureValue(input?.hope, DEFAULT_TOWN_HOPE)
+  const dread = normalizeTownPressureValue(input?.dread, DEFAULT_TOWN_DREAD)
+
+  const candidates = [
+    frontlineScore >= 70 || readiness.defense <= 44 || armory.reserve <= 38
+      ? {
+          projectType: 'trench_reinforcement',
+          priority: 'defense',
+          reason: 'The walls need trench works and firing lanes before the next hard night.'
+        }
+      : null,
+    rationStrain >= 55 || stockpiles.food <= 45 || economy.caravan <= 36
+      ? {
+          projectType: 'ration_depot',
+          priority: 'sustain',
+          reason: 'Supply hands need storehouse work before shortages break the town line.'
+        }
+      : null,
+    readiness.morale <= 46 || stockpiles.sanctity <= 42 || dread >= hope + 5
+      ? {
+          projectType: 'field_chapel',
+          priority: 'faith',
+          reason: 'The wounded and the shaken need chapel space before morale buckles.'
+        }
+      : null,
+    readiness.gate <= 44 || armory.distribution <= 38 || economy.build >= 58
+      ? {
+          projectType: 'watchtower_line',
+          priority: 'watch',
+          reason: 'Watch crews and couriers need better tower lines to hold the roads together.'
+        }
+      : null,
+    stockpiles.lampOil <= 40 || frontlineScore >= 55
+      ? {
+          projectType: 'lantern_line',
+          priority: 'watch',
+          reason: 'The night watch needs bell roads and lamp lanes before dark swallows the streets.'
+        }
+      : null
+  ].filter(Boolean)
+
+  return candidates.find((candidate) => !blocked.has(candidate.projectType)) || null
+}
+
+/**
  * @param {any} clock
  * @param {any} project
  */
@@ -4409,8 +5271,10 @@ function runTownSupportOrders(memory, input) {
       if (findActiveProjectForTown(memory.world, townName)) {
         continue
       }
+      const queuedBuild = dequeueTownBuild(memory, townName)
       const draft = buildSupportProjectDraft(memory.world, townName, {
-        autoManaged: !homePriority,
+        projectType: queuedBuild?.projectType,
+        autoManaged: queuedBuild?.autoManaged === true ? true : !homePriority,
         responsibility: homePriority ? SUPPORT_ORDER_PRIORITY_HOME : SUPPORT_ORDER_PRIORITY_ALLIED
       })
       if (!draft) continue
@@ -4432,7 +5296,7 @@ function runTownSupportOrders(memory, input) {
         idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_start`,
         crierType: 'project_start',
         message: asText(
-          `[${townName}] SUPPORT ORDER: ${projectSupportOrderMetadata(draft)?.label || draft.type} due_day=${draft.requirements.dueDay} due_phase=${draft.requirements.duePhase} responsibility=${draft.requirements.responsibility}`,
+          `[${townName}] SUPPORT ORDER: ${projectSupportOrderMetadata(draft)?.label || draft.type} due_day=${draft.requirements.dueDay} due_phase=${draft.requirements.duePhase} responsibility=${draft.requirements.responsibility}${queuedBuild ? ` queued_reason=${queuedBuild.reason}` : ''}`,
           buildProjectStatusMessage(townName, draft),
           240
         )
@@ -4499,6 +5363,7 @@ function runTownAutonomyTick(memory, input) {
   const clock = ensureWorldClock(memory.world)
   const towns = ensureWorldTownMissionStates(memory.world)
   const threat = ensureWorldThreat(memory.world)
+  const nether = ensureWorldNether(memory.world)
   const playersByTown = countAssignedPlayersByTown(memory.world)
 
   for (const townName of Object.keys(towns)) {
@@ -4509,6 +5374,23 @@ function runTownAutonomyTick(memory, input) {
     const threatBand = Math.trunc(threatLevel / 25)
     const activeProject = findActiveSupportProject(memory.world, townName)
     const state = towns[townName] = normalizeTownMissionState(towns[townName], townName)
+    const mood = normalizeTownMood(memory.world?.moods?.byTown?.[townName]) || freshTownMood()
+    const projectModifiers = getCompletedProjectModifiers(memory.world, townName)
+    const frontline = deriveFrontlineStatus({
+      townThreatLevel: threatLevel,
+      activeMajorMission: state.activeMajorMissionId ? { id: state.activeMajorMissionId } : null,
+      latestNetherEvent: normalizeNetherLedger(nether.eventLedger).slice(-1)[0] || null,
+      hope: state.hope,
+      dread: state.dread,
+      projectFrontlineShield: projectModifiers.frontlineShield,
+      projectScouting: projectModifiers.scouting
+    })
+    const rationStrain = deriveRationsStrain({
+      townThreatLevel: threatLevel,
+      scarcity: Number(nether.modifiers?.scarcity || 0),
+      mood,
+      projectRations: projectModifiers.rations
+    })
 
     applyTownAutonomyDelta(memory, {
       townName,
@@ -4568,6 +5450,138 @@ function runTownAutonomyTick(memory, input) {
         readiness: { morale: 1 }
       })
     }
+
+    let economyState = deriveTownEconomyState({
+      stockpiles: state.stockpiles,
+      readiness: state.readiness,
+      mood,
+      townThreatLevel: threatLevel,
+      scarcity: Number(nether.modifiers?.scarcity || 0),
+      hope,
+      dread
+    })
+    let armoryState = deriveTownArmoryState({
+      stockpiles: state.stockpiles,
+      readiness: state.readiness,
+      economy: economyState,
+      frontlineScore: frontline.score,
+      rationsStrain: rationStrain
+    })
+
+    if (clock.phase === 'day') {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        stockpiles: {
+          food: economyState.market >= 56 ? 1 : economyState.market <= 32 ? -1 : 0,
+          tools: economyState.caravan >= 54 ? 1 : 0,
+          lampOil: economyState.caravan >= 58 ? 1 : 0,
+          sanctity: economyState.wealth >= 62 && state.readiness.morale >= 50 ? 1 : 0,
+          munitions: armoryState.repair >= 56 && threatLevel <= 60 ? 1 : 0,
+          ...(activeProject && economyState.build >= 52 ? { timber: -1, stone: -1 } : {})
+        },
+        readiness: {
+          economy: economyState.market >= 50 ? 1 : economyState.market <= 30 ? -1 : 0,
+          defense: armoryState.distribution >= 50 && threatLevel >= 40 ? 1 : 0,
+          morale: economyState.wealth >= 60 ? 1 : economyState.wealth <= 30 ? -1 : 0
+        }
+      })
+
+      const queuedToday = normalizeTownBuildQueue(state.buildQueue)
+        .some((entry) => entry.queuedAtDay === Number(clock.day || 0))
+      if (!queuedToday) {
+        const candidate = chooseTownBuildQueueCandidate(memory.world, townName, {
+          stockpiles: state.stockpiles,
+          readiness: state.readiness,
+          frontline,
+          rationStrain,
+          economy: economyState,
+          armory: armoryState,
+          hope,
+          dread
+        })
+        if (candidate) {
+          const queued = enqueueTownBuild(memory, {
+            townName,
+            projectType: candidate.projectType,
+            priority: candidate.priority,
+            reason: candidate.reason,
+            autoManaged: !homePriority
+          })
+          if (queued) {
+            const queueMessage = asText(
+              `[${townName}] BUILD QUEUED: ${candidate.projectType} priority=${candidate.priority} reason=${candidate.reason}`,
+              candidate.reason,
+              240
+            )
+            appendTownCrier(memory, {
+              townName,
+              at: input.at,
+              idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:build_queue`,
+              type: 'project_start',
+              message: queueMessage
+            })
+            appendChronicle(memory, {
+              id: `${input.operationId}:chronicle:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:build_queue`,
+              type: 'project',
+              msg: queueMessage,
+              at: input.at,
+              town: townName,
+              meta: {
+                project_type: candidate.projectType,
+                priority: candidate.priority
+              }
+            })
+            appendNews(memory, {
+              id: `${input.operationId}:news:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:build_queue`,
+              topic: 'project',
+              msg: queueMessage,
+              at: input.at,
+              town: townName,
+              meta: {
+                project_type: candidate.projectType,
+                priority: candidate.priority
+              }
+            })
+          }
+        }
+      }
+    } else {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        stockpiles: {
+          munitions: armoryState.issued >= 38 ? -1 - Math.max(0, Math.trunc((threatLevel - 50) / 25)) : 0,
+          lampOil: frontline.score >= 55 ? -1 : 0,
+          food: rationStrain.strain >= 60 ? -1 : 0
+        },
+        readiness: {
+          defense: armoryState.reserve >= 45 ? 1 : 0,
+          gate: frontline.score >= 70 && armoryState.distribution >= 42 ? 1 : 0,
+          economy: economyState.caravan <= 28 ? -1 : 0,
+          morale: economyState.wealth <= 30 ? -1 : 0
+        }
+      })
+    }
+
+    economyState = deriveTownEconomyState({
+      stockpiles: state.stockpiles,
+      readiness: state.readiness,
+      mood,
+      townThreatLevel: threatLevel,
+      scarcity: Number(nether.modifiers?.scarcity || 0),
+      hope: state.hope,
+      dread: state.dread
+    })
+    armoryState = deriveTownArmoryState({
+      stockpiles: state.stockpiles,
+      readiness: state.readiness,
+      economy: economyState,
+      frontlineScore: frontline.score,
+      rationsStrain: rationStrain
+    })
+    state.economy = economyState
+    state.armory = armoryState
+    state.buildQueue = normalizeTownBuildQueue(state.buildQueue)
+    refreshTownOperationalStatus(memory, townName)
   }
 }
 
@@ -4580,6 +5594,8 @@ function getCompletedProjectModifiers(world, townName) {
     frontlineShield: 0,
     scouting: 0,
     rations: 0,
+    sanctity: 0,
+    visibility: 0,
     longNightDelta: 0,
     scarcityDelta: 0
   }
@@ -4588,6 +5604,8 @@ function getCompletedProjectModifiers(world, townName) {
     totals.frontlineShield += Number(project.effects.frontlineShield || 0)
     totals.scouting += Number(project.effects.scouting || 0)
     totals.rations += Number(project.effects.rations || 0)
+    totals.sanctity += Number(project.effects.sanctity || 0)
+    totals.visibility += Number(project.effects.visibility || 0)
     totals.longNightDelta += Number(project.effects.longNightDelta || 0)
     totals.scarcityDelta += Number(project.effects.scarcityDelta || 0)
   }
@@ -4595,6 +5613,8 @@ function getCompletedProjectModifiers(world, townName) {
     frontlineShield: Math.trunc(totals.frontlineShield),
     scouting: Math.trunc(totals.scouting),
     rations: Math.trunc(totals.rations),
+    sanctity: Math.trunc(totals.sanctity),
+    visibility: Math.trunc(totals.visibility),
     longNightDelta: Math.trunc(totals.longNightDelta),
     scarcityDelta: Math.trunc(totals.scarcityDelta)
   }
@@ -4866,10 +5886,114 @@ function normalizeTownReadiness(readinessInput) {
 
 /**
  * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownEconomyValue(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_ECONOMY_MIN, TOWN_ECONOMY_MAX)
+}
+
+/**
+ * @param {unknown} economyInput
+ */
+function normalizeTownEconomy(economyInput) {
+  const source = (economyInput && typeof economyInput === 'object' && !Array.isArray(economyInput))
+    ? economyInput
+    : {}
+  const economy = {}
+  for (const key of TOWN_ECONOMY_KEYS) {
+    economy[key] = normalizeTownEconomyValue(source[key], DEFAULT_TOWN_ECONOMY[key])
+  }
+  return economy
+}
+
+/**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownArmoryValue(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_ARMORY_MIN, TOWN_ARMORY_MAX)
+}
+
+/**
+ * @param {unknown} armoryInput
+ */
+function normalizeTownArmory(armoryInput) {
+  const source = (armoryInput && typeof armoryInput === 'object' && !Array.isArray(armoryInput))
+    ? armoryInput
+    : {}
+  const armory = {}
+  for (const key of TOWN_ARMORY_KEYS) {
+    armory[key] = normalizeTownArmoryValue(source[key], DEFAULT_TOWN_ARMORY[key])
+  }
+  return armory
+}
+
+/**
+ * @param {unknown} queueEntryInput
+ */
+function normalizeTownBuildQueueEntry(queueEntryInput) {
+  if (!queueEntryInput || typeof queueEntryInput !== 'object' || Array.isArray(queueEntryInput)) return null
+  const id = asText(queueEntryInput.id, '', 200)
+  const projectType = asText(queueEntryInput.projectType, '', 40).toLowerCase()
+  const priority = asText(queueEntryInput.priority, '', 40).toLowerCase()
+  const queuedAtDay = Number(queueEntryInput.queuedAtDay)
+  const reason = asText(queueEntryInput.reason, '', 160)
+  if (!id || !PROJECT_TYPES.has(projectType) || !TOWN_BUILD_QUEUE_PRIORITIES.has(priority)) return null
+  if (!Number.isInteger(queuedAtDay) || queuedAtDay < 0 || !reason) return null
+  return {
+    id,
+    projectType,
+    priority,
+    queuedAtDay,
+    reason,
+    autoManaged: queueEntryInput.autoManaged === true || queueEntryInput.autoManaged === 1
+  }
+}
+
+/**
+ * @param {unknown} buildQueueInput
+ */
+function normalizeTownBuildQueue(buildQueueInput) {
+  const queue = (Array.isArray(buildQueueInput) ? buildQueueInput : [])
+    .map(normalizeTownBuildQueueEntry)
+    .filter(Boolean)
+  if (queue.length > MAX_TOWN_BUILD_QUEUE_ENTRIES) {
+    return queue.slice(-MAX_TOWN_BUILD_QUEUE_ENTRIES)
+  }
+  return queue
+}
+
+/**
+ * @param {unknown} valueInput
  */
 function normalizeTownCycleDay(valueInput) {
   const value = Number(valueInput)
   return Number.isInteger(value) && value >= 0 ? value : 0
+}
+
+/**
+ * @param {unknown} gateInput
+ */
+function normalizeTownGate(gateInput) {
+  const source = (gateInput && typeof gateInput === 'object' && !Array.isArray(gateInput))
+    ? gateInput
+    : {}
+  const status = asText(source.status, DEFAULT_TOWN_GATE.status, 40).toLowerCase()
+  const criticalEvent = asText(source.criticalEvent, DEFAULT_TOWN_GATE.criticalEvent, 40).toLowerCase()
+  const travelRisk = asText(source.travelRisk, DEFAULT_TOWN_GATE.travelRisk, 40).toLowerCase()
+  const lastEventId = asText(source.lastEventId, '', 200) || null
+  return {
+    pressure: normalizeTownReadinessValue(source.pressure, DEFAULT_TOWN_GATE.pressure),
+    status: TOWN_GATE_STATUSES.has(status) ? status : DEFAULT_TOWN_GATE.status,
+    criticalEvent: TOWN_GATE_CRITICAL_EVENTS.has(criticalEvent) ? criticalEvent : DEFAULT_TOWN_GATE.criticalEvent,
+    travelRisk: TOWN_GATE_TRAVEL_RISKS.has(travelRisk) ? travelRisk : DEFAULT_TOWN_GATE.travelRisk,
+    lastEventDay: normalizeTownCycleDay(source.lastEventDay),
+    lastEventId
+  }
 }
 
 /**
@@ -4981,6 +6105,10 @@ function normalizeTownMissionState(townInput, townIdHint = '') {
     dread: normalizeTownPressureValue(source.dread, DEFAULT_TOWN_DREAD),
     stockpiles: normalizeTownStockpiles(source.stockpiles),
     readiness: normalizeTownReadiness(source.readiness),
+    economy: normalizeTownEconomy(source.economy),
+    armory: normalizeTownArmory(source.armory),
+    gate: normalizeTownGate(source.gate),
+    buildQueue: normalizeTownBuildQueue(source.buildQueue),
     autonomy: normalizeTownAutonomy(source.autonomy),
     crierQueue: normalizeTownCrierQueue(source.crierQueue),
     recentImpacts: normalizeTownRecentImpacts(source.recentImpacts)
@@ -5127,6 +6255,10 @@ function enforceMajorMissionTownExclusivity(world) {
     towns[townName].dread = normalizeTownPressureValue(towns[townName].dread, DEFAULT_TOWN_DREAD)
     towns[townName].stockpiles = normalizeTownStockpiles(towns[townName].stockpiles)
     towns[townName].readiness = normalizeTownReadiness(towns[townName].readiness)
+    towns[townName].economy = normalizeTownEconomy(towns[townName].economy)
+    towns[townName].armory = normalizeTownArmory(towns[townName].armory)
+    towns[townName].gate = normalizeTownGate(towns[townName].gate)
+    towns[townName].buildQueue = normalizeTownBuildQueue(towns[townName].buildQueue)
     towns[townName].autonomy = normalizeTownAutonomy(towns[townName].autonomy)
     towns[townName].crierQueue = normalizeTownCrierQueue(towns[townName].crierQueue)
     towns[townName].recentImpacts = normalizeTownRecentImpacts(towns[townName].recentImpacts)
@@ -5497,6 +6629,9 @@ function applyTownAutonomyDelta(memory, input) {
   const state = towns[townName]
   state.stockpiles = normalizeTownStockpiles(state.stockpiles)
   state.readiness = normalizeTownReadiness(state.readiness)
+  state.economy = normalizeTownEconomy(state.economy)
+  state.armory = normalizeTownArmory(state.armory)
+  state.buildQueue = normalizeTownBuildQueue(state.buildQueue)
   state.autonomy = normalizeTownAutonomy(state.autonomy)
 
   if (input?.stockpiles && typeof input.stockpiles === 'object' && !Array.isArray(input.stockpiles)) {
@@ -5523,6 +6658,30 @@ function applyTownAutonomyDelta(memory, input) {
     }
   }
 
+  if (input?.economy && typeof input.economy === 'object' && !Array.isArray(input.economy)) {
+    for (const key of TOWN_ECONOMY_KEYS) {
+      const delta = Math.trunc(Number(input.economy[key] || 0))
+      if (delta === 0) continue
+      state.economy[key] = clamp(
+        Number(state.economy[key] || 0) + delta,
+        TOWN_ECONOMY_MIN,
+        TOWN_ECONOMY_MAX
+      )
+    }
+  }
+
+  if (input?.armory && typeof input.armory === 'object' && !Array.isArray(input.armory)) {
+    for (const key of TOWN_ARMORY_KEYS) {
+      const delta = Math.trunc(Number(input.armory[key] || 0))
+      if (delta === 0) continue
+      state.armory[key] = clamp(
+        Number(state.armory[key] || 0) + delta,
+        TOWN_ARMORY_MIN,
+        TOWN_ARMORY_MAX
+      )
+    }
+  }
+
   if (input?.mode !== undefined) {
     state.autonomy.mode = normalizeTownAutonomyMode(input.mode, state.autonomy.mode)
   }
@@ -5537,6 +6696,8 @@ function applyTownAutonomyDelta(memory, input) {
     townName,
     stockpiles: { ...state.stockpiles },
     readiness: { ...state.readiness },
+    economy: { ...state.economy },
+    armory: { ...state.armory },
     autonomy: { ...state.autonomy }
   }
 }
@@ -8380,8 +9541,18 @@ function createGodCommandService(deps) {
               idPrefix: `${operationId}:clock_advance:${tickIdx}:nightfall`,
               at
             })
+            runTownDefenseEncounters(memory, {
+              operationId,
+              tickIdx,
+              at
+            })
             clock = ensureWorldClock(memory.world)
           }
+          runTownGateEscalation(memory, {
+            operationId,
+            tickIdx,
+            at
+          })
         }
         clock = ensureWorldClock(memory.world)
         clock.updated_at = new Date(now()).toISOString()
@@ -9525,6 +10696,7 @@ function createGodCommandService(deps) {
       const townState = normalizeTownMissionState(missionView?.townState)
       const hope = normalizeTownPressureValue(townState.hope, DEFAULT_TOWN_HOPE)
       const dread = normalizeTownPressureValue(townState.dread, DEFAULT_TOWN_DREAD)
+      const gate = normalizeTownGate(townState.gate)
       const frontline = deriveFrontlineStatus({
         townThreatLevel,
         activeMajorMission,
@@ -9597,6 +10769,7 @@ function createGodCommandService(deps) {
         `GOD TOWN BOARD WAR FRONTLINE STATUS: label=${frontline.label} score=${frontline.score} threat=${frontline.threatLevel} mission=${frontline.mission} nether=${frontline.netherType}`,
         `GOD TOWN BOARD WAR HOPE DREAD: hope=${hope}(${toPressureTier(hope)}) dread=${dread}(${toPressureTier(dread)})`,
         `GOD TOWN BOARD WAR RATIONS STRAIN: rations=${rationStrain.rations} strain=${rationStrain.strain} outlook=${rationStrain.outlook}`,
+        `GOD TOWN BOARD GATE STATUS: status=${gate.status} pressure=${gate.pressure} critical=${gate.criticalEvent} travel=${gate.travelRisk} last_day=${gate.lastEventDay} last_event_id=${asText(gate.lastEventId, '-', 200) || '-'}`,
         `GOD TOWN BOARD WAR WHAT CHANGED TODAY: count=${warChangeLines.length}`,
         ...(warChangeLines.length > 0 ? warChangeLines : ['GOD TOWN BOARD WAR CHANGE: (none)']),
         `GOD TOWN BOARD WAR ORDERS OF THE DAY: mission=${missionOrder}`,

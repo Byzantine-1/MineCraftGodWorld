@@ -145,6 +145,11 @@ function pickStableSummary(summary) {
     historyCount: summary.historyCount,
     hope: summary.hope,
     dread: summary.dread,
+    gatePressure: summary.gatePressure,
+    gateStatus: summary.gateStatus,
+    gateCriticalEvent: summary.gateCriticalEvent,
+    gateTravelRisk: summary.gateTravelRisk,
+    gateLastEventDay: summary.gateLastEventDay,
     activeMajorMissionId: summary.activeMajorMissionId,
     recentImpactCount: summary.recentImpactCount,
     crierQueueDepth: summary.crierQueueDepth,
@@ -385,11 +390,44 @@ test('world memory history and summaries are queryable through the store boundar
     gate: 45,
     shelter: 47
   })
+  assert.deepEqual(townSummary.economy, {
+    market: 48,
+    labor: 50,
+    build: 46,
+    caravan: 44,
+    wealth: 47
+  })
+  assert.equal(townSummary.marketOutlook, 'tight')
+  assert.deepEqual(townSummary.armory, {
+    reserve: 46,
+    issued: 24,
+    repair: 42,
+    distribution: 34
+  })
+  assert.equal(townSummary.armoryStatus, 'stretching')
+  assert.equal(townSummary.gatePressure, 18)
+  assert.equal(townSummary.gateStatus, 'quiet')
+  assert.equal(townSummary.gateCriticalEvent, 'none')
+  assert.equal(townSummary.gateTravelRisk, 'low')
+  assert.equal(townSummary.gateLastEventDay, 0)
+  assert.equal(townSummary.buildQueueDepth, 0)
+  assert.equal(townSummary.leadBuildType, null)
+  assert.equal(townSummary.leadBuildPriority, null)
+  assert.equal(townSummary.leadBuildQueuedDay, null)
   assert.deepEqual(townSummary.autonomy, {
     mode: 'allied_autonomy',
     lastPlannedDay: 0,
     lastResolvedDay: 0
   })
+  assert.equal(typeof townSummary.frontlineStatusLabel, 'string')
+  assert.equal(typeof townSummary.frontlineScore, 'number')
+  assert.equal(typeof townSummary.raidStatus, 'string')
+  assert.equal(typeof townSummary.militiaStrength, 'number')
+  assert.equal(typeof townSummary.rationLevel, 'number')
+  assert.equal(typeof townSummary.supplyStrain, 'number')
+  assert.equal(typeof townSummary.supplyOutlook, 'string')
+  assert.equal(townSummary.lastRaidOutcome, null)
+  assert.equal(townSummary.lastRaidDay, null)
   assert.equal(townSummary.recentChronicle[0].recordId, 'chronicle:c_alpha_02')
 
   const factionSummary = context.executionStore.getFactionHistorySummary({ factionId: 'iron_pact' })
@@ -505,11 +543,44 @@ test('world memory context keeps retrieval ordering stable and bounded', async (
     gate: 45,
     shelter: 47
   })
+  assert.deepEqual(worldMemoryContext.townSummary.economy, {
+    market: 48,
+    labor: 50,
+    build: 46,
+    caravan: 44,
+    wealth: 47
+  })
+  assert.equal(worldMemoryContext.townSummary.marketOutlook, 'tight')
+  assert.deepEqual(worldMemoryContext.townSummary.armory, {
+    reserve: 46,
+    issued: 24,
+    repair: 42,
+    distribution: 34
+  })
+  assert.equal(worldMemoryContext.townSummary.armoryStatus, 'stretching')
+  assert.equal(worldMemoryContext.townSummary.gatePressure, 18)
+  assert.equal(worldMemoryContext.townSummary.gateStatus, 'quiet')
+  assert.equal(worldMemoryContext.townSummary.gateCriticalEvent, 'none')
+  assert.equal(worldMemoryContext.townSummary.gateTravelRisk, 'low')
+  assert.equal(worldMemoryContext.townSummary.gateLastEventDay, 0)
+  assert.equal(worldMemoryContext.townSummary.buildQueueDepth, 0)
+  assert.equal(worldMemoryContext.townSummary.leadBuildType, null)
+  assert.equal(worldMemoryContext.townSummary.leadBuildPriority, null)
+  assert.equal(worldMemoryContext.townSummary.leadBuildQueuedDay, null)
   assert.deepEqual(worldMemoryContext.townSummary.autonomy, {
     mode: 'allied_autonomy',
     lastPlannedDay: 0,
     lastResolvedDay: 0
   })
+  assert.equal(typeof worldMemoryContext.townSummary.frontlineStatusLabel, 'string')
+  assert.equal(typeof worldMemoryContext.townSummary.frontlineScore, 'number')
+  assert.equal(typeof worldMemoryContext.townSummary.raidStatus, 'string')
+  assert.equal(typeof worldMemoryContext.townSummary.militiaStrength, 'number')
+  assert.equal(typeof worldMemoryContext.townSummary.rationLevel, 'number')
+  assert.equal(typeof worldMemoryContext.townSummary.supplyStrain, 'number')
+  assert.equal(typeof worldMemoryContext.townSummary.supplyOutlook, 'string')
+  assert.equal(worldMemoryContext.townSummary.lastRaidOutcome, null)
+  assert.equal(worldMemoryContext.townSummary.lastRaidDay, null)
   assert.equal(worldMemoryContext.factionSummary.factionId, 'iron_pact')
   assert.deepEqual(worldMemoryContext.townIdentity, {
     townId: 'alpha',

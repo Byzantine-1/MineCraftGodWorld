@@ -21,6 +21,8 @@ const WORLD_MEMORY_SNAPSHOT_HASH_META_KEY = 'world_memory.snapshot_hash'
 const WORLD_MEMORY_DECISION_EPOCH_META_KEY = 'world_memory.decision_epoch'
 const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
 const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const TOWN_ECONOMY_KEYS = ['market', 'labor', 'build', 'caravan', 'wealth']
+const TOWN_ARMORY_KEYS = ['reserve', 'issued', 'repair', 'distribution']
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -36,6 +38,10 @@ function asText(value, maxLen = 200) {
 function asNullableInteger(value) {
   const parsed = Number(value)
   return Number.isInteger(parsed) ? parsed : null
+}
+
+function clamp(value, min, max) {
+  return Math.min(max, Math.max(min, value))
 }
 
 function cloneValue(value) {
@@ -107,6 +113,182 @@ function summarizeTownAutonomy(source) {
     mode: asText(input.mode, 40) || 'allied_autonomy',
     lastPlannedDay: asNullableInteger(input.lastPlannedDay),
     lastResolvedDay: asNullableInteger(input.lastResolvedDay)
+  }
+}
+
+function summarizeTownGate(source) {
+  const input = isPlainObject(source) ? source : {}
+  return {
+    pressure: asNullableInteger(input.pressure) ?? 18,
+    status: asText(input.status, 40) || 'quiet',
+    criticalEvent: asText(input.criticalEvent, 40) || 'none',
+    travelRisk: asText(input.travelRisk, 40) || 'low',
+    lastEventDay: asNullableInteger(input.lastEventDay),
+    lastEventId: asText(input.lastEventId, 200) || null
+  }
+}
+
+function buildCompletedProjectModifiers(world, townId) {
+  const totals = {
+    frontlineShield: 0,
+    scouting: 0,
+    rations: 0,
+    sanctity: 0,
+    visibility: 0
+  }
+  for (const project of Array.isArray(world?.projects) ? world.projects : []) {
+    if (!project || project.townId !== townId || project.status !== 'completed') continue
+    totals.frontlineShield += Math.trunc(Number(project.effects?.frontlineShield || 0))
+    totals.scouting += Math.trunc(Number(project.effects?.scouting || 0))
+    totals.rations += Math.trunc(Number(project.effects?.rations || 0))
+    totals.sanctity += Math.trunc(Number(project.effects?.sanctity || 0))
+    totals.visibility += Math.trunc(Number(project.effects?.visibility || 0))
+  }
+  return totals
+}
+
+function latestNetherEventType(world) {
+  const entries = Array.isArray(world?.nether?.eventLedger) ? world.nether.eventLedger : []
+  const latest = entries
+    .filter((entry) => entry && Number.isInteger(Number(entry.day)))
+    .sort((left, right) => Number(right.day || 0) - Number(left.day || 0))[0] || null
+  return asText(latest?.type, 40).toUpperCase() || '-'
+}
+
+function deriveFrontlineStatusSummary({
+  townThreatLevel,
+  hasActiveMission,
+  latestNetherType,
+  hope,
+  dread,
+  projectFrontlineShield,
+  projectScouting
+}) {
+  const threatLevel = clamp(Math.trunc(Number(townThreatLevel || 0)), 0, 100)
+  const netherPressure = latestNetherType === 'THREAT_SURGE'
+    ? 18
+    : latestNetherType === 'SCARCITY'
+      ? 12
+      : latestNetherType === 'OMEN'
+        ? 10
+        : latestNetherType === 'LONG_NIGHT'
+          ? 8
+          : latestNetherType === 'CALM_BEFORE_STORM'
+            ? -8
+            : 0
+  const score = clamp(
+    threatLevel
+      + (hasActiveMission ? 10 : 0)
+      + netherPressure
+      + Math.trunc((Number(dread || 0) - Number(hope || 0)) / 3)
+      - Math.max(0, Math.trunc(Number(projectFrontlineShield || 0)))
+      - Math.trunc(Math.max(0, Number(projectScouting || 0)) / 2),
+    0,
+    200
+  )
+  const label = score >= 120
+    ? 'BREACH IMMINENT'
+    : score >= 85
+      ? 'SIEGE PRESSURE'
+      : score >= 55
+        ? 'CONTESTED STREETS'
+        : 'HOLDING LINE'
+  return { label, score }
+}
+
+function deriveRationStrainSummary({ townThreatLevel, scarcity, mood, projectRations }) {
+  const threatLevel = clamp(Math.trunc(Number(townThreatLevel || 0)), 0, 100)
+  const scarcityValue = clamp(Math.trunc(Number(scarcity || 0)), -9, 9)
+  const prosperity = clamp(Math.trunc(Number(mood?.prosperity || 0)), 0, 100)
+  const unrest = clamp(Math.trunc(Number(mood?.unrest || 0)), 0, 100)
+  const rationBonus = Math.max(0, Math.trunc(Number(projectRations || 0)))
+  const rations = clamp(Math.trunc(72 + (prosperity / 3) - (scarcityValue * 10) - (threatLevel / 5) + rationBonus), 0, 100)
+  const strain = clamp(Math.trunc((threatLevel / 2) + (scarcityValue * 8) + (unrest / 4)), 0, 100)
+  const outlook = strain >= 75
+    ? 'fracturing'
+    : strain >= 45
+      ? 'strained'
+      : 'holding'
+  return { rations, strain, outlook }
+}
+
+function deriveMilitiaStrengthSummary({ readiness, stockpiles, frontlineScore, rationStrain, projectModifiers, hope, dread }) {
+  return clamp(Math.trunc(
+    (Number(readiness?.defense || 0) * 0.34)
+      + (Number(readiness?.gate || 0) * 0.18)
+      + (Number(readiness?.morale || 0) * 0.14)
+      + (Number(stockpiles?.munitions || 0) * 0.16)
+      + (Number(stockpiles?.food || 0) * 0.05)
+      + (Number(stockpiles?.sanctity || 0) * 0.05)
+      + (Math.max(0, Number(projectModifiers?.frontlineShield || 0)) * 2)
+      + Math.max(0, Number(projectModifiers?.scouting || 0))
+      + Math.trunc((Number(hope || 0) - Number(dread || 0)) / 4)
+      - Math.trunc(Number(frontlineScore || 0) / 5)
+      - Math.trunc(Number(rationStrain?.strain || 0) / 7)
+  ), 0, 100)
+}
+
+function deriveRaidStatusSummary(frontlineScore) {
+  const score = clamp(Math.trunc(Number(frontlineScore || 0)), 0, 200)
+  if (score >= 120) return 'breach'
+  if (score >= 85) return 'assault'
+  if (score >= 55) return 'skirmish'
+  if (score >= 35) return 'watch'
+  return 'calm'
+}
+
+function summarizeLatestRaidImpact(townState) {
+  const entries = Array.isArray(townState?.recentImpacts) ? townState.recentImpacts : []
+  const latest = entries
+    .filter((entry) => entry && entry.type === 'raid')
+    .sort((left, right) => Number(right.day || 0) - Number(left.day || 0))[0] || null
+  const summary = asText(latest?.summary, 80)
+  return {
+    lastRaidDay: latest ? asNullableInteger(latest.day) : null,
+    lastRaidOutcome: summary.startsWith('raid_') ? summary.slice(5) : (summary || null)
+  }
+}
+
+function deriveEconomyOutlookSummary(economy) {
+  const market = asNullableInteger(economy?.market) ?? 0
+  const caravan = asNullableInteger(economy?.caravan) ?? 0
+  const wealth = asNullableInteger(economy?.wealth) ?? 0
+  const floor = Math.min(market, caravan, wealth)
+  const average = Math.trunc((market + caravan + wealth) / 3)
+  if (floor <= 28) return 'starved'
+  if (average >= 72) return 'thriving'
+  if (average >= 56) return 'steady'
+  if (average >= 40) return 'tight'
+  return 'strained'
+}
+
+function deriveArmoryStatusSummary(armory) {
+  const reserve = asNullableInteger(armory?.reserve) ?? 0
+  const issued = asNullableInteger(armory?.issued) ?? 0
+  const distribution = asNullableInteger(armory?.distribution) ?? 0
+  if (reserve <= 26 || distribution <= 24) return 'bare'
+  if (issued >= 65 && reserve <= 42) return 'spent'
+  if (reserve >= 64 && distribution >= 50) return 'ready'
+  if (reserve >= 48 && issued >= 36) return 'armed'
+  return 'stretching'
+}
+
+function summarizeLeadBuildQueueEntry(townState) {
+  const queue = Array.isArray(townState?.buildQueue) ? townState.buildQueue : []
+  const lead = queue[0]
+  if (!isPlainObject(lead)) {
+    return {
+      buildQueueDepth: queue.length,
+      leadBuildType: null,
+      leadBuildPriority: null,
+      leadBuildQueuedDay: null
+    }
+  }
+  return {
+    buildQueueDepth: queue.length,
+    leadBuildType: asText(lead.projectType, 40) || null,
+    leadBuildPriority: asText(lead.priority, 40) || null,
+    leadBuildQueuedDay: asNullableInteger(lead.queuedAtDay)
   }
 }
 
@@ -386,6 +568,31 @@ function buildTownHistorySummary(world, chronicleRecords, historyRecords, townId
       && (project.status === 'active' || project.status === 'planned')
       && Number(project.requirements?.supportOrder || 0) === 1
     )) || null
+  const stockpiles = summarizeTownMetricRecord(townState?.stockpiles, TOWN_STOCKPILE_KEYS)
+  const readiness = summarizeTownMetricRecord(townState?.readiness, TOWN_READINESS_KEYS)
+  const economy = summarizeTownMetricRecord(townState?.economy, TOWN_ECONOMY_KEYS)
+  const armory = summarizeTownMetricRecord(townState?.armory, TOWN_ARMORY_KEYS)
+  const gate = summarizeTownGate(townState?.gate)
+  const autonomy = summarizeTownAutonomy(townState?.autonomy)
+  const projectModifiers = buildCompletedProjectModifiers(world, townId)
+  const netherType = latestNetherEventType(world)
+  const frontline = deriveFrontlineStatusSummary({
+    townThreatLevel: world?.threat?.byTown?.[townId],
+    hasActiveMission: Boolean(townState?.activeMajorMissionId),
+    latestNetherType: netherType,
+    hope: townState?.hope,
+    dread: townState?.dread,
+    projectFrontlineShield: projectModifiers.frontlineShield,
+    projectScouting: projectModifiers.scouting
+  })
+  const rationStrain = deriveRationStrainSummary({
+    townThreatLevel: world?.threat?.byTown?.[townId],
+    scarcity: world?.nether?.modifiers?.scarcity,
+    mood: world?.moods?.byTown?.[townId],
+    projectRations: projectModifiers.rations
+  })
+  const latestRaid = summarizeLatestRaidImpact(townState)
+  const buildQueue = summarizeLeadBuildQueueEntry(townState)
   return {
     type: 'town-history-summary.v1',
     schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
@@ -396,9 +603,39 @@ function buildTownHistorySummary(world, chronicleRecords, historyRecords, townId
     lastHistoryAt: historyRecords[0]?.at ?? null,
     hope: Number.isFinite(Number(townState?.hope)) ? Number(townState.hope) : null,
     dread: Number.isFinite(Number(townState?.dread)) ? Number(townState.dread) : null,
-    stockpiles: summarizeTownMetricRecord(townState?.stockpiles, TOWN_STOCKPILE_KEYS),
-    readiness: summarizeTownMetricRecord(townState?.readiness, TOWN_READINESS_KEYS),
-    autonomy: summarizeTownAutonomy(townState?.autonomy),
+    stockpiles,
+    readiness,
+    economy,
+    marketOutlook: deriveEconomyOutlookSummary(economy),
+    armory,
+    armoryStatus: deriveArmoryStatusSummary(armory),
+    gatePressure: gate.pressure,
+    gateStatus: gate.status,
+    gateCriticalEvent: gate.criticalEvent,
+    gateTravelRisk: gate.travelRisk,
+    gateLastEventDay: gate.lastEventDay,
+    buildQueueDepth: buildQueue.buildQueueDepth,
+    leadBuildType: buildQueue.leadBuildType,
+    leadBuildPriority: buildQueue.leadBuildPriority,
+    leadBuildQueuedDay: buildQueue.leadBuildQueuedDay,
+    autonomy,
+    frontlineStatusLabel: frontline.label,
+    frontlineScore: frontline.score,
+    raidStatus: deriveRaidStatusSummary(frontline.score),
+    militiaStrength: deriveMilitiaStrengthSummary({
+      readiness,
+      stockpiles,
+      frontlineScore: frontline.score,
+      rationStrain,
+      projectModifiers,
+      hope: townState?.hope,
+      dread: townState?.dread
+    }),
+    rationLevel: rationStrain.rations,
+    supplyStrain: rationStrain.strain,
+    supplyOutlook: rationStrain.outlook,
+    lastRaidOutcome: latestRaid.lastRaidOutcome,
+    lastRaidDay: latestRaid.lastRaidDay,
     activeMajorMissionId: asText(townState?.activeMajorMissionId, 200) || null,
     recentImpactCount: Array.isArray(townState?.recentImpacts) ? townState.recentImpacts.length : 0,
     crierQueueDepth: Array.isArray(townState?.crierQueue) ? townState.crierQueue.length : 0,

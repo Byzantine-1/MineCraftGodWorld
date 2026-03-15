@@ -6,6 +6,16 @@ const WORLD_SNAPSHOT_TYPE = 'world-snapshot.v1'
 const WORLD_SNAPSHOT_SCHEMA_VERSION = 1
 const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
 const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const TOWN_ECONOMY_KEYS = ['market', 'labor', 'build', 'caravan', 'wealth']
+const TOWN_ARMORY_KEYS = ['reserve', 'issued', 'repair', 'distribution']
+const DEFAULT_TOWN_GATE = Object.freeze({
+  pressure: 18,
+  status: 'quiet',
+  criticalEvent: 'none',
+  travelRisk: 'low',
+  lastEventDay: 0,
+  lastEventId: null
+})
 const DEFAULT_TOWN_STOCKPILES = Object.freeze({
   food: 55,
   tools: 48,
@@ -21,6 +31,19 @@ const DEFAULT_TOWN_READINESS = Object.freeze({
   morale: 50,
   gate: 45,
   shelter: 47
+})
+const DEFAULT_TOWN_ECONOMY = Object.freeze({
+  market: 48,
+  labor: 50,
+  build: 46,
+  caravan: 44,
+  wealth: 47
+})
+const DEFAULT_TOWN_ARMORY = Object.freeze({
+  reserve: 46,
+  issued: 24,
+  repair: 42,
+  distribution: 34
 })
 
 function isPlainObject(value) {
@@ -115,6 +138,50 @@ function normalizeTownAutonomy(entry) {
     mode: mode === 'home_priority' ? 'home_priority' : 'allied_autonomy',
     lastPlannedDay: asInteger(source.lastPlannedDay),
     lastResolvedDay: asInteger(source.lastResolvedDay)
+  }
+}
+
+function normalizeTownEconomy(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  const economy = {}
+  for (const key of TOWN_ECONOMY_KEYS) {
+    economy[key] = asInteger(source[key], DEFAULT_TOWN_ECONOMY[key])
+  }
+  return economy
+}
+
+function normalizeTownArmory(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  const armory = {}
+  for (const key of TOWN_ARMORY_KEYS) {
+    armory[key] = asInteger(source[key], DEFAULT_TOWN_ARMORY[key])
+  }
+  return armory
+}
+
+function normalizeTownGate(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  return {
+    pressure: asInteger(source.pressure, DEFAULT_TOWN_GATE.pressure),
+    status: asText(source.status, DEFAULT_TOWN_GATE.status),
+    criticalEvent: asText(source.criticalEvent, DEFAULT_TOWN_GATE.criticalEvent),
+    travelRisk: asText(source.travelRisk, DEFAULT_TOWN_GATE.travelRisk),
+    lastEventDay: asInteger(source.lastEventDay, DEFAULT_TOWN_GATE.lastEventDay),
+    lastEventId: asText(source.lastEventId) || null
+  }
+}
+
+function normalizeTownBuildQueueEntry(entry) {
+  const id = asText(entry?.id)
+  const projectType = asText(entry?.projectType)
+  if (!id || !projectType) return null
+  return {
+    id,
+    projectType,
+    priority: asText(entry?.priority),
+    queuedAtDay: asInteger(entry?.queuedAtDay),
+    reason: asText(entry?.reason),
+    autoManaged: entry?.autoManaged === true
   }
 }
 
@@ -372,6 +439,10 @@ function normalizeTown(entry) {
     dread: asInteger(entry?.dread),
     stockpiles: normalizeTownStockpiles(entry?.stockpiles),
     readiness: normalizeTownReadiness(entry?.readiness),
+    economy: normalizeTownEconomy(entry?.economy),
+    armory: normalizeTownArmory(entry?.armory),
+    gate: normalizeTownGate(entry?.gate),
+    buildQueue: sortObjects(entry?.buildQueue, normalizeTownBuildQueueEntry, (row) => `${String(row.queuedAtDay).padStart(6, '0')}:${row.id}`),
     autonomy: normalizeTownAutonomy(entry?.autonomy),
     crierQueue: sortObjects(entry?.crierQueue, normalizeTownCrierEntry, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
     recentImpacts: sortObjects(entry?.recentImpacts, normalizeTownImpact, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
