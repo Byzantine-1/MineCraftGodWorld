@@ -34,6 +34,13 @@ const DEFAULT_TALK_TYPE_MAP = Object.freeze({
   'morale-boost': 'gate_warden',
   casual: 'miller'
 })
+const KNOWN_PROJECT_TYPES = new Set([
+  'trench_reinforcement',
+  'watchtower_line',
+  'ration_depot',
+  'field_chapel',
+  'lantern_line'
+])
 
 function hasOwn(value, key) {
   return Object.prototype.hasOwnProperty.call(value, key)
@@ -79,6 +86,39 @@ function stableStringify(value) {
 
 function hashValue(value) {
   return createHash('sha256').update(stableStringify(value)).digest('hex')
+}
+
+function normalizeProjectType(value) {
+  if (!isNonEmptyString(value)) {
+    return ''
+  }
+  const normalized = String(value).trim().toLowerCase()
+  return KNOWN_PROJECT_TYPES.has(normalized) ? normalized : ''
+}
+
+function listTownProjects(world, townId) {
+  if (!Array.isArray(world?.projects) || !isNonEmptyString(townId)) {
+    return []
+  }
+  return world.projects.filter((project) => String(project?.townId || '').trim().toLowerCase() === String(townId).trim().toLowerCase())
+}
+
+function projectPriority(project) {
+  const supportOrder = project?.requirements?.supportOrder === 1 || project?.requirements?.supportOrder === true
+  if (supportOrder) return 0
+  return 1
+}
+
+function findActiveTownProject(world, townId) {
+  return listTownProjects(world, townId)
+    .filter((project) => project?.status === 'active' || project?.status === 'planned')
+    .sort((left, right) => {
+      const priorityDiff = projectPriority(left) - projectPriority(right)
+      if (priorityDiff !== 0) return priorityDiff
+      const updatedDiff = Number(right?.updatedAtDay || 0) - Number(left?.updatedAtDay || 0)
+      if (updatedDiff !== 0) return updatedDiff
+      return String(left?.id || '').localeCompare(String(right?.id || ''))
+    })[0] || null
 }
 
 function buildFailure(kind, detail) {
@@ -572,6 +612,21 @@ function createTranslation(handoff, world, options) {
       failures.push(buildFailure('project_exists', `Unknown project: ${projectId}`))
     } else {
       authorityCommands.push(`project advance ${resolvedTownId} ${projectId}`)
+    }
+  } else if (proposal.type === 'PROJECT_ADVANCE_ACTIVE') {
+    const activeProject = findActiveTownProject(world, resolvedTownId)
+    if (activeProject) {
+      const projectId = String(activeProject.id || '').trim()
+      if (!projectId) {
+        failures.push(buildFailure('project_exists', `Active project for ${resolvedTownId} is missing an id.`))
+      } else if (Number(activeProject.stage || 0) >= 2) {
+        authorityCommands.push(`project complete ${resolvedTownId} ${projectId}`)
+      } else {
+        authorityCommands.push(`project advance ${resolvedTownId} ${projectId}`)
+      }
+    } else {
+      const preferredProjectType = normalizeProjectType(proposal.args?.preferredProjectType) || 'lantern_line'
+      authorityCommands.push(`project start ${resolvedTownId} ${preferredProjectType}`)
     }
   } else if (proposal.type === 'SALVAGE_PLAN') {
     const focus = String(proposal.args?.focus || '')

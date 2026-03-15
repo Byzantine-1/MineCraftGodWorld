@@ -358,8 +358,31 @@ const MAX_EXECUTION_EVENT_LEDGER_ENTRIES = 1024
 const MAX_PENDING_EXECUTION_ENTRIES = 128
 const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
+const TOWN_STOCKPILE_MIN = 0
+const TOWN_STOCKPILE_MAX = 100
+const TOWN_READINESS_MIN = 0
+const TOWN_READINESS_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
+const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
+const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const TOWN_AUTONOMY_MODES = new Set(['home_priority', 'allied_autonomy'])
+const DEFAULT_TOWN_STOCKPILES = Object.freeze({
+  food: 55,
+  tools: 48,
+  munitions: 44,
+  timber: 46,
+  stone: 44,
+  lampOil: 42,
+  sanctity: 50
+})
+const DEFAULT_TOWN_READINESS = Object.freeze({
+  defense: 46,
+  economy: 48,
+  morale: 50,
+  gate: 45,
+  shelter: 47
+})
 const MAX_TOWN_REGISTRY_TAGS = 12
 const MAX_WORLD_ACTOR_ENTRIES = 256
 const TOWN_REGISTRY_STATUSES = new Set(['active', 'distressed', 'dormant'])
@@ -1666,6 +1689,77 @@ function normalizeTownPressureValueShape(valueInput, fallback) {
 }
 
 /**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownStockpileValueShape(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_STOCKPILE_MIN, TOWN_STOCKPILE_MAX)
+}
+
+/**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownReadinessValueShape(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_READINESS_MIN, TOWN_READINESS_MAX)
+}
+
+/**
+ * @param {unknown} dayInput
+ */
+function normalizeTownCycleDayShape(dayInput) {
+  const day = Number(dayInput)
+  return Number.isInteger(day) && day >= 0 ? day : 0
+}
+
+/**
+ * @param {unknown} stockpilesInput
+ */
+function normalizeTownStockpilesShape(stockpilesInput) {
+  const source = (stockpilesInput && typeof stockpilesInput === 'object' && !Array.isArray(stockpilesInput))
+    ? stockpilesInput
+    : {}
+  const stockpiles = {}
+  for (const key of TOWN_STOCKPILE_KEYS) {
+    stockpiles[key] = normalizeTownStockpileValueShape(source[key], DEFAULT_TOWN_STOCKPILES[key])
+  }
+  return stockpiles
+}
+
+/**
+ * @param {unknown} readinessInput
+ */
+function normalizeTownReadinessShape(readinessInput) {
+  const source = (readinessInput && typeof readinessInput === 'object' && !Array.isArray(readinessInput))
+    ? readinessInput
+    : {}
+  const readiness = {}
+  for (const key of TOWN_READINESS_KEYS) {
+    readiness[key] = normalizeTownReadinessValueShape(source[key], DEFAULT_TOWN_READINESS[key])
+  }
+  return readiness
+}
+
+/**
+ * @param {unknown} autonomyInput
+ */
+function normalizeTownAutonomyShape(autonomyInput) {
+  const source = (autonomyInput && typeof autonomyInput === 'object' && !Array.isArray(autonomyInput))
+    ? autonomyInput
+    : {}
+  const mode = asText(source.mode, 'allied_autonomy', 40).toLowerCase()
+  return {
+    mode: TOWN_AUTONOMY_MODES.has(mode) ? mode : 'allied_autonomy',
+    lastPlannedDay: normalizeTownCycleDayShape(source.lastPlannedDay),
+    lastResolvedDay: normalizeTownCycleDayShape(source.lastResolvedDay)
+  }
+}
+
+/**
  * @param {unknown} tagsInput
  */
 function normalizeTownRegistryTagsShape(tagsInput) {
@@ -1739,6 +1833,9 @@ function normalizeTownMissionStateShape(townInput, townIdHint = '') {
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
     hope: normalizeTownPressureValueShape(source.hope, DEFAULT_TOWN_HOPE),
     dread: normalizeTownPressureValueShape(source.dread, DEFAULT_TOWN_DREAD),
+    stockpiles: normalizeTownStockpilesShape(source.stockpiles),
+    readiness: normalizeTownReadinessShape(source.readiness),
+    autonomy: normalizeTownAutonomyShape(source.autonomy),
     crierQueue: normalizeTownCrierQueueShape(source.crierQueue),
     recentImpacts: normalizeTownRecentImpactsShape(source.recentImpacts)
   }
@@ -2153,6 +2250,9 @@ function reconcileMajorMissionState(world) {
     world.towns[townName].activeMajorMissionId = expectedActiveId
     world.towns[townName].hope = normalizeTownPressureValueShape(world.towns[townName].hope, DEFAULT_TOWN_HOPE)
     world.towns[townName].dread = normalizeTownPressureValueShape(world.towns[townName].dread, DEFAULT_TOWN_DREAD)
+    world.towns[townName].stockpiles = normalizeTownStockpilesShape(world.towns[townName].stockpiles)
+    world.towns[townName].readiness = normalizeTownReadinessShape(world.towns[townName].readiness)
+    world.towns[townName].autonomy = normalizeTownAutonomyShape(world.towns[townName].autonomy)
     world.towns[townName].crierQueue = normalizeTownCrierQueueShape(world.towns[townName].crierQueue)
     world.towns[townName].recentImpacts = normalizeTownRecentImpactsShape(world.towns[townName].recentImpacts)
     const cooldown = Number(world.towns[townName].majorMissionCooldownUntilDay)
@@ -2900,6 +3000,40 @@ function validateMemoryIntegritySnapshot(memory) {
       }
       if (!Number.isInteger(cooldown) || cooldown < 0) {
         issues.push(`world.towns.${safeTownName}.majorMissionCooldownUntilDay must be integer >= 0.`)
+      }
+      if (!townState.stockpiles || typeof townState.stockpiles !== 'object' || Array.isArray(townState.stockpiles)) {
+        issues.push(`world.towns.${safeTownName}.stockpiles must be an object.`)
+      } else {
+        for (const key of TOWN_STOCKPILE_KEYS) {
+          const value = Number(townState.stockpiles[key])
+          if (!Number.isInteger(value) || value < TOWN_STOCKPILE_MIN || value > TOWN_STOCKPILE_MAX) {
+            issues.push(`world.towns.${safeTownName}.stockpiles.${key} must be integer in [${TOWN_STOCKPILE_MIN}..${TOWN_STOCKPILE_MAX}].`)
+          }
+        }
+      }
+      if (!townState.readiness || typeof townState.readiness !== 'object' || Array.isArray(townState.readiness)) {
+        issues.push(`world.towns.${safeTownName}.readiness must be an object.`)
+      } else {
+        for (const key of TOWN_READINESS_KEYS) {
+          const value = Number(townState.readiness[key])
+          if (!Number.isInteger(value) || value < TOWN_READINESS_MIN || value > TOWN_READINESS_MAX) {
+            issues.push(`world.towns.${safeTownName}.readiness.${key} must be integer in [${TOWN_READINESS_MIN}..${TOWN_READINESS_MAX}].`)
+          }
+        }
+      }
+      if (!townState.autonomy || typeof townState.autonomy !== 'object' || Array.isArray(townState.autonomy)) {
+        issues.push(`world.towns.${safeTownName}.autonomy must be an object.`)
+      } else {
+        const mode = asText(townState.autonomy.mode, '', 40).toLowerCase()
+        if (!TOWN_AUTONOMY_MODES.has(mode)) {
+          issues.push(`world.towns.${safeTownName}.autonomy.mode must be one of ${Array.from(TOWN_AUTONOMY_MODES).join(', ')}.`)
+        }
+        if (!Number.isInteger(Number(townState.autonomy.lastPlannedDay)) || Number(townState.autonomy.lastPlannedDay) < 0) {
+          issues.push(`world.towns.${safeTownName}.autonomy.lastPlannedDay must be integer >= 0.`)
+        }
+        if (!Number.isInteger(Number(townState.autonomy.lastResolvedDay)) || Number(townState.autonomy.lastResolvedDay) < 0) {
+          issues.push(`world.towns.${safeTownName}.autonomy.lastResolvedDay must be integer >= 0.`)
+        }
       }
       if (!Array.isArray(townState.crierQueue)) {
         issues.push(`world.towns.${safeTownName}.crierQueue must be an array.`)

@@ -1850,6 +1850,91 @@ test('clock advance narration hooks are replay-safe', async () => {
   assert.equal(afterReplay.world.news.length, afterAdvance.world.news.length)
 })
 
+test('clock advance auto-sustains allied towns while home-town work orders stay player-led and time-bound', async () => {
+  const memoryStore = createStore()
+  const service = createGodCommandService({ memoryStore })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'support-order-seed-alpha'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add beta_gate 100 64 0 town:beta',
+    operationId: 'support-order-seed-beta'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'player assign Builder01 alpha',
+    operationId: 'support-order-assign-alpha'
+  })
+
+  const startOrders = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'support-order-clock-start'
+  })
+  assert.equal(startOrders.applied, true)
+
+  const afterStart = memoryStore.getSnapshot()
+  const alphaOrder = afterStart.world.projects.find((project) => (
+    project.townId === 'alpha'
+    && (project.requirements?.supportOrder === 1 || project.requirements?.supportOrder === true)
+  ))
+  const betaOrder = afterStart.world.projects.find((project) => (
+    project.townId === 'beta'
+    && (project.requirements?.supportOrder === 1 || project.requirements?.supportOrder === true)
+  ))
+
+  assert.ok(alphaOrder)
+  assert.ok(betaOrder)
+  assert.equal(alphaOrder.status, 'active')
+  assert.equal(betaOrder.status, 'active')
+  assert.equal(alphaOrder.requirements.responsibility, 'home_priority')
+  assert.equal(betaOrder.requirements.responsibility, 'allied_autonomy')
+  assert.equal(alphaOrder.requirements.autoManaged, 0)
+  assert.equal(betaOrder.requirements.autoManaged, 1)
+  assert.equal(alphaOrder.requirements.dueDay, 3)
+  assert.equal(betaOrder.requirements.dueDay, 3)
+  assert.equal(alphaOrder.requirements.duePhase, 'day')
+  assert.equal(betaOrder.requirements.duePhase, 'day')
+  assert.equal(afterStart.world.towns.alpha.autonomy.mode, 'home_priority')
+  assert.equal(afterStart.world.towns.beta.autonomy.mode, 'allied_autonomy')
+  assert.equal(afterStart.world.towns.alpha.autonomy.lastPlannedDay, 2)
+  assert.equal(afterStart.world.towns.beta.autonomy.lastPlannedDay, 2)
+  assert.equal(typeof afterStart.world.towns.alpha.stockpiles.food, 'number')
+  assert.equal(typeof afterStart.world.towns.beta.readiness.defense, 'number')
+
+  const resolveOrders = await service.applyGodCommand({
+    agents,
+    command: 'clock advance 2',
+    operationId: 'support-order-clock-resolve'
+  })
+  assert.equal(resolveOrders.applied, true)
+
+  const afterResolve = memoryStore.getSnapshot()
+  const alphaResolved = afterResolve.world.projects.find((project) => project.id === alphaOrder.id)
+  const betaResolved = afterResolve.world.projects.find((project) => project.id === betaOrder.id)
+
+  assert.ok(alphaResolved)
+  assert.ok(betaResolved)
+  assert.equal(alphaResolved.status, 'failed')
+  assert.equal(betaResolved.status, 'completed')
+  assert.equal(betaResolved.stage, 2)
+  assert.ok(afterResolve.world.towns.beta.crierQueue.some((entry) => String(entry.message || '').includes('AUTONOMY HOLDS')))
+  assert.ok(afterResolve.world.towns.alpha.crierQueue.some((entry) => String(entry.message || '').includes('SUPPORT ORDER MISSED')))
+  assert.ok(afterResolve.world.towns.alpha.dread > afterStart.world.towns.alpha.dread)
+  assert.ok(afterResolve.world.towns.beta.hope >= afterStart.world.towns.beta.hope)
+  assert.equal(afterResolve.world.towns.alpha.autonomy.lastResolvedDay, 3)
+  assert.equal(afterResolve.world.towns.beta.autonomy.lastResolvedDay, 3)
+  assert.ok(afterResolve.world.towns.beta.readiness.defense >= afterStart.world.towns.beta.readiness.defense)
+  assert.ok(afterResolve.world.towns.alpha.readiness.morale <= afterStart.world.towns.alpha.readiness.morale)
+  assert.notDeepEqual(afterResolve.world.towns.beta.stockpiles, afterStart.world.towns.beta.stockpiles)
+  assert.equal(memoryStore.validateMemoryIntegrity().ok, true)
+})
+
 test('mood commands are read-only and town board includes mood section', async () => {
   const memoryStore = createStore()
   const seedService = createGodCommandService({ memoryStore })

@@ -193,12 +193,41 @@ function projectTownSummary(summary) {
     lastHistoryAt: asNullableInteger(summary.lastHistoryAt),
     hope: Number.isFinite(Number(summary.hope)) ? Number(summary.hope) : null,
     dread: Number.isFinite(Number(summary.dread)) ? Number(summary.dread) : null,
+    stockpiles: projectTownMetricRecord(summary.stockpiles, ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']),
+    readiness: projectTownMetricRecord(summary.readiness, ['defense', 'economy', 'morale', 'gate', 'shelter']),
+    autonomy: projectTownAutonomySummary(summary.autonomy),
     activeMajorMissionId: asText(summary.activeMajorMissionId, 200) || null,
     recentImpactCount: Number(summary.recentImpactCount) || 0,
     crierQueueDepth: Number(summary.crierQueueDepth) || 0,
     activeProjectCount: Number(summary.activeProjectCount) || 0,
+    activeSupportOrderLabel: asText(summary.activeSupportOrderLabel, 160) || null,
+    activeSupportOrderType: asText(summary.activeSupportOrderType, 40) || null,
+    activeSupportOrderStage: Number.isFinite(Number(summary.activeSupportOrderStage)) ? Number(summary.activeSupportOrderStage) : null,
+    activeSupportOrderDueDay: asNullableInteger(summary.activeSupportOrderDueDay),
+    activeSupportOrderDuePhase: asText(summary.activeSupportOrderDuePhase, 20) || null,
+    activeSupportOrderAutoManaged: summary.activeSupportOrderAutoManaged === null
+      ? null
+      : summary.activeSupportOrderAutoManaged === true,
     factions: normalizeStringList(summary.factions, 12, 80),
     executionCounts: normalizeExecutionCounts(summary.executionCounts)
+  }
+}
+
+function projectTownMetricRecord(input, keys) {
+  const source = isPlainObject(input) ? input : {}
+  const record = {}
+  for (const key of keys) {
+    record[key] = Number.isFinite(Number(source[key])) ? Number(source[key]) : 0
+  }
+  return record
+}
+
+function projectTownAutonomySummary(input) {
+  const source = isPlainObject(input) ? input : {}
+  return {
+    mode: asText(source.mode, 40) || 'allied_autonomy',
+    lastPlannedDay: asNullableInteger(source.lastPlannedDay),
+    lastResolvedDay: asNullableInteger(source.lastResolvedDay)
   }
 }
 

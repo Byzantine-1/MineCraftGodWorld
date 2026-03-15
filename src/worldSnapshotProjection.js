@@ -4,6 +4,24 @@ const { normalizePlayerAssignment, normalizeTownSpawn } = require('./playerSpawn
 
 const WORLD_SNAPSHOT_TYPE = 'world-snapshot.v1'
 const WORLD_SNAPSHOT_SCHEMA_VERSION = 1
+const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
+const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const DEFAULT_TOWN_STOCKPILES = Object.freeze({
+  food: 55,
+  tools: 48,
+  munitions: 44,
+  timber: 46,
+  stone: 44,
+  lampOil: 42,
+  sanctity: 50
+})
+const DEFAULT_TOWN_READINESS = Object.freeze({
+  defense: 46,
+  economy: 48,
+  morale: 50,
+  gate: 45,
+  shelter: 47
+})
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -70,6 +88,34 @@ function normalizeScalarRecord(source) {
     if (typeof value === 'string') return asText(value) || null
     return null
   })
+}
+
+function normalizeTownStockpiles(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  const stockpiles = {}
+  for (const key of TOWN_STOCKPILE_KEYS) {
+    stockpiles[key] = asInteger(source[key], DEFAULT_TOWN_STOCKPILES[key])
+  }
+  return stockpiles
+}
+
+function normalizeTownReadiness(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  const readiness = {}
+  for (const key of TOWN_READINESS_KEYS) {
+    readiness[key] = asInteger(source[key], DEFAULT_TOWN_READINESS[key])
+  }
+  return readiness
+}
+
+function normalizeTownAutonomy(entry) {
+  const source = isPlainObject(entry) ? entry : {}
+  const mode = asText(source.mode, 'allied_autonomy')
+  return {
+    mode: mode === 'home_priority' ? 'home_priority' : 'allied_autonomy',
+    lastPlannedDay: asInteger(source.lastPlannedDay),
+    lastResolvedDay: asInteger(source.lastResolvedDay)
+  }
 }
 
 function normalizeFaction(entry) {
@@ -324,6 +370,9 @@ function normalizeTown(entry) {
     majorMissionCooldownUntilDay: asInteger(entry?.majorMissionCooldownUntilDay),
     hope: asInteger(entry?.hope),
     dread: asInteger(entry?.dread),
+    stockpiles: normalizeTownStockpiles(entry?.stockpiles),
+    readiness: normalizeTownReadiness(entry?.readiness),
+    autonomy: normalizeTownAutonomy(entry?.autonomy),
     crierQueue: sortObjects(entry?.crierQueue, normalizeTownCrierEntry, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
     recentImpacts: sortObjects(entry?.recentImpacts, normalizeTownImpact, (row) => `${String(row.day).padStart(6, '0')}:${row.id}`),
     ...(spawn ? { spawn } : {})

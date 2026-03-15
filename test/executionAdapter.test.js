@@ -146,6 +146,80 @@ test('execution adapter emits canonical executed results for direct project adva
   assert.equal(advancedProject.stage, 2)
 })
 
+test('execution adapter starts a preferred town work order when PROJECT_ADVANCE_ACTIVE finds no current project', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'execution-adapter-active-project-start-town'
+  })
+
+  const handoff = createHandoff({
+    proposalType: 'PROJECT_ADVANCE_ACTIVE',
+    command: 'project advance active alpha',
+    args: { preferredProjectType: 'ration_depot' },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+
+  const result = await executionAdapter.executeHandoff({ handoff, agents })
+
+  assert.equal(result.status, 'executed')
+  assert.deepEqual(result.authorityCommands, ['project start alpha ration_depot'])
+  assert.equal(result.proposalType, 'PROJECT_ADVANCE_ACTIVE')
+  const startedProject = memoryStore.getSnapshot().world.projects.find((entry) => entry.townId === 'alpha')
+  assert.ok(startedProject)
+  assert.equal(startedProject.type, 'ration_depot')
+  assert.equal(startedProject.stage, 1)
+})
+
+test('execution adapter advances then completes the active town work order through PROJECT_ADVANCE_ACTIVE', async () => {
+  const { memoryStore } = createStoreContext()
+  const service = createGodCommandService({ memoryStore })
+  const executionAdapter = createExecutionAdapter({ memoryStore, godCommandService: service })
+  const agents = createAgents()
+
+  await service.applyGodCommand({
+    agents,
+    command: 'mark add alpha_hall 0 64 0 town:alpha',
+    operationId: 'execution-adapter-active-project-town'
+  })
+  await service.applyGodCommand({
+    agents,
+    command: 'project start alpha trench_reinforcement',
+    operationId: 'execution-adapter-active-project-start'
+  })
+  const startedProject = memoryStore.getSnapshot().world.projects[0]
+  assert.ok(startedProject)
+
+  const advanceHandoff = createHandoff({
+    proposalType: 'PROJECT_ADVANCE_ACTIVE',
+    command: 'project advance active alpha',
+    args: { preferredProjectType: 'trench_reinforcement' },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+
+  const advanced = await executionAdapter.executeHandoff({ handoff: advanceHandoff, agents })
+  assert.equal(advanced.status, 'executed')
+  assert.deepEqual(advanced.authorityCommands, [`project advance alpha ${startedProject.id}`])
+  assert.equal(memoryStore.getSnapshot().world.projects[0].stage, 2)
+
+  const completeHandoff = createHandoff({
+    proposalType: 'PROJECT_ADVANCE_ACTIVE',
+    command: 'project advance active alpha',
+    args: { preferredProjectType: 'trench_reinforcement', interactionNonce: 'complete-pass' },
+    snapshotHash: snapshotHashForStore(memoryStore)
+  })
+  const completed = await executionAdapter.executeHandoff({ handoff: completeHandoff, agents })
+
+  assert.equal(completed.status, 'executed')
+  assert.deepEqual(completed.authorityCommands, [`project complete alpha ${startedProject.id}`])
+  assert.equal(memoryStore.getSnapshot().world.projects[0].status, 'completed')
+})
+
 test('execution adapter translates MAYOR_ACCEPT_MISSION into authoritative mayor talk + accept commands', async () => {
   const { memoryStore } = createStoreContext()
   const service = createGodCommandService({ memoryStore })

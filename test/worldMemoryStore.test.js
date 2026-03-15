@@ -369,6 +369,27 @@ test('world memory history and summaries are queryable through the store boundar
     duplicate: 0,
     failed: 0
   })
+  assert.deepEqual(townSummary.stockpiles, {
+    food: 55,
+    tools: 48,
+    munitions: 44,
+    timber: 46,
+    stone: 44,
+    lampOil: 42,
+    sanctity: 50
+  })
+  assert.deepEqual(townSummary.readiness, {
+    defense: 46,
+    economy: 48,
+    morale: 50,
+    gate: 45,
+    shelter: 47
+  })
+  assert.deepEqual(townSummary.autonomy, {
+    mode: 'allied_autonomy',
+    lastPlannedDay: 0,
+    lastResolvedDay: 0
+  })
   assert.equal(townSummary.recentChronicle[0].recordId, 'chronicle:c_alpha_02')
 
   const factionSummary = context.executionStore.getFactionHistorySummary({ factionId: 'iron_pact' })
@@ -468,6 +489,27 @@ test('world memory context keeps retrieval ordering stable and bounded', async (
   assert.equal(worldMemoryContext.recentHistory.length, 2)
   assert.deepEqual(worldMemoryContext.recentHistory.map((entry) => entry.status), ['stale', 'executed'])
   assert.equal(worldMemoryContext.townSummary.townId, 'alpha')
+  assert.deepEqual(worldMemoryContext.townSummary.stockpiles, {
+    food: 55,
+    tools: 48,
+    munitions: 44,
+    timber: 46,
+    stone: 44,
+    lampOil: 42,
+    sanctity: 50
+  })
+  assert.deepEqual(worldMemoryContext.townSummary.readiness, {
+    defense: 46,
+    economy: 48,
+    morale: 50,
+    gate: 45,
+    shelter: 47
+  })
+  assert.deepEqual(worldMemoryContext.townSummary.autonomy, {
+    mode: 'allied_autonomy',
+    lastPlannedDay: 0,
+    lastResolvedDay: 0
+  })
   assert.equal(worldMemoryContext.factionSummary.factionId, 'iron_pact')
   assert.deepEqual(worldMemoryContext.townIdentity, {
     townId: 'alpha',

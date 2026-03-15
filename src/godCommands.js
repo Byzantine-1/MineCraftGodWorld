@@ -10,6 +10,7 @@ const {
 } = require('./worldRegistry')
 const {
   getPlayerAssignment,
+  normalizePlayerAssignment,
   normalizeTownSpawn,
   resolvePlayerSpawn,
   resolveTownSpawn,
@@ -286,8 +287,31 @@ const PRESSURE_BY_OUTCOME = {
 const MAX_TOWN_RECENT_IMPACTS = 30
 const TOWN_PRESSURE_MIN = 0
 const TOWN_PRESSURE_MAX = 100
+const TOWN_STOCKPILE_MIN = 0
+const TOWN_STOCKPILE_MAX = 100
+const TOWN_READINESS_MIN = 0
+const TOWN_READINESS_MAX = 100
 const DEFAULT_TOWN_HOPE = 50
 const DEFAULT_TOWN_DREAD = 50
+const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
+const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
+const TOWN_AUTONOMY_MODES = new Set(['home_priority', 'allied_autonomy'])
+const DEFAULT_TOWN_STOCKPILES = Object.freeze({
+  food: 55,
+  tools: 48,
+  munitions: 44,
+  timber: 46,
+  stone: 44,
+  lampOil: 42,
+  sanctity: 50
+})
+const DEFAULT_TOWN_READINESS = Object.freeze({
+  defense: 46,
+  economy: 48,
+  morale: 50,
+  gate: 45,
+  shelter: 47
+})
 const MAX_TOWN_REGISTRY_TAGS = 12
 const TOWN_REGISTRY_STATUSES = new Set(['active', 'distressed', 'dormant'])
 const TOWN_IMPACT_TYPE_KEYS = new Set([
@@ -323,6 +347,70 @@ const PROJECT_TYPE_CONFIG = {
   lantern_line: {
     requirements: { labor: 2, lantern_oil: 3, timber: 1 },
     effects: { longNightDelta: -1, hopeDelta: 1, dreadDelta: -1, visibility: 2 }
+  }
+}
+const SUPPORT_PROJECT_TYPE_ROTATIONS = {
+  frontline: ['trench_reinforcement', 'watchtower_line', 'lantern_line'],
+  support: ['ration_depot', 'field_chapel', 'lantern_line']
+}
+const SUPPORT_ORDER_PRIORITY_HOME = 'home_priority'
+const SUPPORT_ORDER_PRIORITY_ALLIED = 'allied_autonomy'
+const SUPPORT_ORDER_DUE_PHASES = new Set(['day', 'night'])
+const PRESSURE_BY_SUPPORT_ORDER_MISS = { hope: -3, dread: 5 }
+const AUTONOMY_PHASE_BASELINE = {
+  day: {
+    stockpiles: { food: 2, tools: 1, timber: 1, stone: 1, sanctity: 1 },
+    readiness: { economy: 1, morale: 1, gate: 1, shelter: 1 }
+  },
+  night: {
+    stockpiles: { food: -1, lampOil: -1 },
+    readiness: { economy: -1 }
+  }
+}
+const AUTONOMY_ALLIED_DAY_BONUS = {
+  stockpiles: { food: 1, tools: 1, munitions: 1 },
+  readiness: { defense: 1, economy: 1, gate: 1 }
+}
+const SUPPORT_ORDER_AUTONOMY_DELTAS = {
+  trench_reinforcement: {
+    stockpiles: { timber: -1, stone: -1, tools: -1 },
+    readiness: { defense: 2, gate: 2, shelter: 1 }
+  },
+  watchtower_line: {
+    stockpiles: { timber: -1, lampOil: -1, tools: -1 },
+    readiness: { defense: 2, gate: 1 }
+  },
+  ration_depot: {
+    stockpiles: { food: 3, tools: 1, munitions: 1 },
+    readiness: { economy: 3, morale: 1 }
+  },
+  field_chapel: {
+    stockpiles: { sanctity: 3 },
+    readiness: { morale: 2, shelter: 1 }
+  },
+  lantern_line: {
+    stockpiles: { lampOil: 2 },
+    readiness: { gate: 1, shelter: 1, morale: 1 }
+  }
+}
+const SUPPORT_ORDER_COMPLETION_AUTONOMY_DELTAS = {
+  trench_reinforcement: {
+    readiness: { defense: 6, gate: 4, shelter: 2 }
+  },
+  watchtower_line: {
+    readiness: { defense: 5, gate: 3 }
+  },
+  ration_depot: {
+    stockpiles: { food: 5, tools: 2, munitions: 2 },
+    readiness: { economy: 4, morale: 2 }
+  },
+  field_chapel: {
+    stockpiles: { sanctity: 5 },
+    readiness: { morale: 4, shelter: 2 }
+  },
+  lantern_line: {
+    stockpiles: { lampOil: 4 },
+    readiness: { gate: 3, shelter: 2, morale: 1 }
   }
 }
 const SALVAGE_TARGET_CONFIG = {
@@ -4115,6 +4203,376 @@ function buildProjectDraft(world, townName, projectType) {
 
 /**
  * @param {any} world
+ */
+function countAssignedPlayersByTown(world) {
+  const counts = {}
+  for (const assignment of Object.values(ensureWorldPlayers(world))) {
+    const player = normalizePlayerAssignment(assignment, assignment?.playerId)
+    if (!player) continue
+    counts[player.townId] = Number(counts[player.townId] || 0) + 1
+  }
+  return counts
+}
+
+/**
+ * @param {any} project
+ */
+function projectSupportOrderMetadata(project) {
+  const normalized = normalizeProject(project)
+  if (!normalized) return null
+  const supportOrder = Number(normalized.requirements?.supportOrder || 0) === 1
+  if (!supportOrder) return null
+  const dueDay = Number(normalized.requirements?.dueDay)
+  const duePhase = asText(normalized.requirements?.duePhase, '', 20).toLowerCase()
+  const responsibility = asText(normalized.requirements?.responsibility, '', 40).toLowerCase()
+  const label = asText(normalized.requirements?.supportOrderLabel, '', 160)
+  return {
+    supportOrder,
+    dueDay: Number.isInteger(dueDay) && dueDay >= normalized.startedAtDay ? dueDay : null,
+    duePhase: SUPPORT_ORDER_DUE_PHASES.has(duePhase) ? duePhase : null,
+    autoManaged: normalized.requirements?.autoManaged === true || normalized.requirements?.autoManaged === 1,
+    responsibility: responsibility || null,
+    label: label || supportOrderLabelForProjectType(normalized.type)
+  }
+}
+
+/**
+ * @param {string} projectType
+ */
+function supportOrderLabelForProjectType(projectType) {
+  switch (asText(projectType, '', 40).toLowerCase()) {
+    case 'trench_reinforcement':
+      return 'The western trench line must be dug and reinforced before the next hard night.'
+    case 'watchtower_line':
+      return 'The wall watches need fresh tower sightlines before the next bell.'
+    case 'ration_depot':
+      return 'The ration store must be stocked before hungry shifts break order.'
+    case 'field_chapel':
+      return 'The field chapel must be readied before the wounded come in.'
+    case 'lantern_line':
+      return 'The lantern route must be lit before dark roads swallow the lane.'
+    default:
+      return 'A town work order is active and time matters.'
+  }
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function chooseSupportProjectType(world, townName) {
+  const clock = ensureWorldClock(world)
+  const threat = ensureWorldThreat(world)
+  const townState = ensureWorldTownMissionStates(world)[townName] || normalizeTownMissionState(null, townName)
+  const threatLevel = Number(threat.byTown?.[townName] || 0)
+  const frontline = Boolean(townState.activeMajorMissionId) || threatLevel >= 45
+  const rotation = frontline ? SUPPORT_PROJECT_TYPE_ROTATIONS.frontline : SUPPORT_PROJECT_TYPE_ROTATIONS.support
+  const cursor = stableHashNumber(`${townName}:${clock.day}:${clock.phase}:${frontline ? 'frontline' : 'support'}`)
+  return rotation[cursor % rotation.length]
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function findActiveSupportProject(world, townName) {
+  return listProjectsForTown(world?.projects, townName)
+    .find((project) => {
+      const metadata = projectSupportOrderMetadata(project)
+      return metadata && (project.status === 'active' || project.status === 'planned')
+    }) || null
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ */
+function findActiveProjectForTown(world, townName) {
+  return listProjectsForTown(world?.projects, townName)
+    .find((project) => project.status === 'active' || project.status === 'planned') || null
+}
+
+/**
+ * @param {any} world
+ * @param {string} townName
+ * @param {{autoManaged?: boolean, projectType?: string, responsibility?: string}} [input]
+ */
+function buildSupportProjectDraft(world, townName, input = {}) {
+  const type = asText(input.projectType, '', 40).toLowerCase() || chooseSupportProjectType(world, townName)
+  const draft = buildProjectDraft(world, townName, type)
+  if (!draft) return null
+  const clock = ensureWorldClock(world)
+  const threat = ensureWorldThreat(world)
+  const threatLevel = Number(threat.byTown?.[townName] || 0)
+  const duePhase = threatLevel >= 45 || Boolean(ensureWorldTownMissionStates(world)[townName]?.activeMajorMissionId) ? 'night' : 'day'
+  const dueDay = Number(clock.day || 1) + 1
+  draft.requirements = {
+    ...draft.requirements,
+    supportOrder: 1,
+    dueDay,
+    duePhase,
+    autoManaged: input.autoManaged === true ? 1 : 0,
+    responsibility: asText(input.responsibility, input.autoManaged === true ? SUPPORT_ORDER_PRIORITY_ALLIED : SUPPORT_ORDER_PRIORITY_HOME, 40),
+    supportOrderLabel: supportOrderLabelForProjectType(type)
+  }
+  return draft
+}
+
+/**
+ * @param {any} clock
+ * @param {any} project
+ */
+function hasSupportOrderDeadlinePassed(clock, project) {
+  const metadata = projectSupportOrderMetadata(project)
+  if (!metadata || !Number.isInteger(metadata.dueDay) || !metadata.duePhase) return false
+  const currentDay = Number(clock?.day || 0)
+  const currentPhase = asText(clock?.phase, '', 20).toLowerCase()
+  if (currentDay > metadata.dueDay) return true
+  if (currentDay < metadata.dueDay) return false
+  if (currentPhase === metadata.duePhase) return true
+  return metadata.duePhase === 'day' && currentPhase === 'night'
+}
+
+/**
+ * @param {any} memory
+ * @param {string} townName
+ * @param {any} project
+ * @param {{idPrefix: string, at?: number, reason?: string}} input
+ */
+function failSupportOrderForDeadline(memory, townName, project, input) {
+  const normalized = normalizeProject(project)
+  if (!normalized || !(normalized.status === 'active' || normalized.status === 'planned')) return normalized
+  normalized.status = 'failed'
+  const clock = ensureWorldClock(memory.world)
+  normalized.updatedAtDay = Number(clock.day || normalized.updatedAtDay || 1)
+  const projects = ensureWorldProjects(memory.world)
+  const idx = projects.findIndex((entry) => sameText(entry?.id, normalized.id, 200))
+  if (idx >= 0) projects[idx] = normalized
+  applyTownAutonomyDelta(memory, {
+    townName,
+    readiness: { defense: -3, gate: -2, morale: -2, shelter: -1 },
+    stockpiles: { munitions: -1, lampOil: -1 },
+    lastResolvedDay: clock.day
+  })
+  applyTownPressureDelta(memory, {
+    townName,
+    delta: PRESSURE_BY_SUPPORT_ORDER_MISS,
+    idPrefix: `${input.idPrefix}:support_order_miss:${normalized.id.toLowerCase()}`,
+    type: 'project_fail',
+    summary: 'support_order_missed_deadline',
+    missionId: asText(normalized.supportsMajorMissionId, '', 200) || undefined,
+    projectId: normalized.id
+  })
+  appendProjectAnnouncements(memory, {
+    townName,
+    project: normalized,
+    at: Number.isFinite(Number(input.at)) ? Number(input.at) : deterministicAtFromMemory(memory, `${input.idPrefix || 'support_order_miss'}:${normalized.id.toLowerCase()}`),
+    idPrefix: `${input.idPrefix}:support_order_miss:${normalized.id.toLowerCase()}`,
+    crierType: 'project_fail',
+    message: asText(
+      `[${townName}] SUPPORT ORDER MISSED: ${projectSupportOrderMetadata(normalized)?.label || normalized.type}`,
+      buildProjectStatusMessage(townName, normalized),
+      240
+    )
+  })
+  return normalized
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, tickIdx: number, at: number}} input
+ */
+function runTownSupportOrders(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  const towns = ensureWorldTownMissionStates(memory.world)
+  const playersByTown = countAssignedPlayersByTown(memory.world)
+  for (const townName of Object.keys(towns)) {
+    const homePriority = Number(playersByTown[townName] || 0) > 0
+    let activeProject = findActiveSupportProject(memory.world, townName)
+
+    if (activeProject && hasSupportOrderDeadlinePassed(clock, activeProject)) {
+      const metadata = projectSupportOrderMetadata(activeProject)
+      if (!metadata?.autoManaged) {
+        activeProject = failSupportOrderForDeadline(memory, townName, activeProject, {
+          idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}`,
+          at: input.at
+        })
+      }
+    }
+
+    activeProject = findActiveSupportProject(memory.world, townName)
+
+    if (!activeProject) {
+      if (clock.phase !== 'day') {
+        continue
+      }
+      if (findActiveProjectForTown(memory.world, townName)) {
+        continue
+      }
+      const draft = buildSupportProjectDraft(memory.world, townName, {
+        autoManaged: !homePriority,
+        responsibility: homePriority ? SUPPORT_ORDER_PRIORITY_HOME : SUPPORT_ORDER_PRIORITY_ALLIED
+      })
+      if (!draft) continue
+      const projects = ensureWorldProjects(memory.world)
+      projects.push(draft)
+      memory.world.projects = boundProjectHistory(projects)
+      appendTownImpact(memory, {
+        townName,
+        idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_start`,
+        type: 'project_start',
+        summary: 'support_order_started',
+        missionId: asText(draft.supportsMajorMissionId, '', 200) || undefined,
+        projectId: draft.id
+      })
+      appendProjectAnnouncements(memory, {
+        townName,
+        project: draft,
+        at: input.at,
+        idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_start`,
+        crierType: 'project_start',
+        message: asText(
+          `[${townName}] SUPPORT ORDER: ${projectSupportOrderMetadata(draft)?.label || draft.type} due_day=${draft.requirements.dueDay} due_phase=${draft.requirements.duePhase} responsibility=${draft.requirements.responsibility}`,
+          buildProjectStatusMessage(townName, draft),
+          240
+        )
+      })
+      continue
+    }
+
+    const metadata = projectSupportOrderMetadata(activeProject)
+    if (!metadata?.autoManaged || !(activeProject.status === 'active' || activeProject.status === 'planned')) {
+      continue
+    }
+
+    const projects = ensureWorldProjects(memory.world)
+    const idx = projects.findIndex((entry) => sameText(entry?.id, activeProject.id, 200))
+    if (idx < 0) continue
+    const normalized = normalizeProject(projects[idx])
+    if (!normalized) continue
+    if (normalized.stage >= 2) {
+      normalized.status = 'completed'
+      normalized.updatedAtDay = Number(clock.day || normalized.updatedAtDay || 1)
+      projects[idx] = normalized
+      applyProjectCompletionEffects(memory, normalized, {
+        idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_complete`
+      })
+      appendProjectAnnouncements(memory, {
+        townName,
+        project: normalized,
+        at: input.at,
+        idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_complete`,
+        crierType: 'project_complete',
+        message: asText(
+          `[${townName}] AUTONOMY HOLDS: ${metadata.label}`,
+          buildProjectStatusMessage(townName, normalized),
+          240
+        )
+      })
+      continue
+    }
+
+    normalized.status = 'active'
+    normalized.stage = Math.min(PROJECT_STAGE_MAX, Number(normalized.stage || 0) + 1)
+    normalized.updatedAtDay = Number(clock.day || normalized.updatedAtDay || 1)
+    projects[idx] = normalized
+    appendProjectAnnouncements(memory, {
+      townName,
+      project: normalized,
+      at: input.at,
+      idPrefix: `${input.operationId}:clock_advance:${input.tickIdx}:${townName.toLowerCase()}:support_order_phase`,
+      crierType: 'project_phase',
+      message: asText(
+        `[${townName}] AUTONOMY CREWS ADVANCE: ${metadata.label}`,
+        buildProjectStatusMessage(townName, normalized),
+        240
+      )
+    })
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{operationId: string, tickIdx: number, at: number}} input
+ */
+function runTownAutonomyTick(memory, input) {
+  const clock = ensureWorldClock(memory.world)
+  const towns = ensureWorldTownMissionStates(memory.world)
+  const threat = ensureWorldThreat(memory.world)
+  const playersByTown = countAssignedPlayersByTown(memory.world)
+
+  for (const townName of Object.keys(towns)) {
+    const homePriority = Number(playersByTown[townName] || 0) > 0
+    const mode = homePriority ? SUPPORT_ORDER_PRIORITY_HOME : SUPPORT_ORDER_PRIORITY_ALLIED
+    const phaseBaseline = AUTONOMY_PHASE_BASELINE[clock.phase] || AUTONOMY_PHASE_BASELINE.day
+    const threatLevel = clamp(Math.trunc(Number(threat.byTown?.[townName] || 0)), 0, 100)
+    const threatBand = Math.trunc(threatLevel / 25)
+    const activeProject = findActiveSupportProject(memory.world, townName)
+    const state = towns[townName] = normalizeTownMissionState(towns[townName], townName)
+
+    applyTownAutonomyDelta(memory, {
+      townName,
+      mode,
+      lastResolvedDay: clock.day,
+      ...(clock.phase === 'day' ? { lastPlannedDay: clock.day } : {}),
+      stockpiles: phaseBaseline.stockpiles,
+      readiness: phaseBaseline.readiness
+    })
+
+    if (!homePriority && clock.phase === 'day') {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        stockpiles: AUTONOMY_ALLIED_DAY_BONUS.stockpiles,
+        readiness: AUTONOMY_ALLIED_DAY_BONUS.readiness
+      })
+    }
+
+    if (activeProject && (activeProject.status === 'active' || activeProject.status === 'planned') && clock.phase === 'day') {
+      const deltas = SUPPORT_ORDER_AUTONOMY_DELTAS[activeProject.type]
+      if (deltas) {
+        applyTownAutonomyDelta(memory, {
+          townName,
+          stockpiles: deltas.stockpiles,
+          readiness: deltas.readiness
+        })
+      }
+    }
+
+    if (threatBand > 0) {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        stockpiles: {
+          munitions: clock.phase === 'night' ? -Math.max(0, threatBand - 1) : 0,
+          lampOil: clock.phase === 'night' && threatBand >= 2 ? -1 : 0
+        },
+        readiness: {
+          defense: clock.phase === 'night' ? -Math.max(1, threatBand) : -Math.max(0, threatBand - 1),
+          gate: threatBand >= 2 ? -1 : 0,
+          morale: threatBand >= 3 ? -1 : 0,
+          shelter: clock.phase === 'night' && threatBand >= 3 ? -1 : 0
+        }
+      })
+    }
+
+    const hope = normalizeTownPressureValue(state.hope, DEFAULT_TOWN_HOPE)
+    const dread = normalizeTownPressureValue(state.dread, DEFAULT_TOWN_DREAD)
+    if (dread >= hope + 20) {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        stockpiles: { sanctity: -1 },
+        readiness: { morale: -1 }
+      })
+    } else if (hope >= dread + 15) {
+      applyTownAutonomyDelta(memory, {
+        townName,
+        readiness: { morale: 1 }
+      })
+    }
+  }
+}
+
+/**
+ * @param {any} world
  * @param {string} townName
  */
 function getCompletedProjectModifiers(world, townName) {
@@ -4359,6 +4817,85 @@ function normalizeTownPressureValue(valueInput, fallback) {
 }
 
 /**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownStockpileValue(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_STOCKPILE_MIN, TOWN_STOCKPILE_MAX)
+}
+
+/**
+ * @param {unknown} valueInput
+ * @param {number} fallback
+ */
+function normalizeTownReadinessValue(valueInput, fallback) {
+  const value = Number(valueInput)
+  if (!Number.isFinite(value)) return fallback
+  return clamp(Math.trunc(value), TOWN_READINESS_MIN, TOWN_READINESS_MAX)
+}
+
+/**
+ * @param {unknown} stockpilesInput
+ */
+function normalizeTownStockpiles(stockpilesInput) {
+  const source = (stockpilesInput && typeof stockpilesInput === 'object' && !Array.isArray(stockpilesInput))
+    ? stockpilesInput
+    : {}
+  const stockpiles = {}
+  for (const key of TOWN_STOCKPILE_KEYS) {
+    stockpiles[key] = normalizeTownStockpileValue(source[key], DEFAULT_TOWN_STOCKPILES[key])
+  }
+  return stockpiles
+}
+
+/**
+ * @param {unknown} readinessInput
+ */
+function normalizeTownReadiness(readinessInput) {
+  const source = (readinessInput && typeof readinessInput === 'object' && !Array.isArray(readinessInput))
+    ? readinessInput
+    : {}
+  const readiness = {}
+  for (const key of TOWN_READINESS_KEYS) {
+    readiness[key] = normalizeTownReadinessValue(source[key], DEFAULT_TOWN_READINESS[key])
+  }
+  return readiness
+}
+
+/**
+ * @param {unknown} valueInput
+ */
+function normalizeTownCycleDay(valueInput) {
+  const value = Number(valueInput)
+  return Number.isInteger(value) && value >= 0 ? value : 0
+}
+
+/**
+ * @param {unknown} modeInput
+ * @param {string} [fallback]
+ */
+function normalizeTownAutonomyMode(modeInput, fallback = SUPPORT_ORDER_PRIORITY_ALLIED) {
+  const mode = asText(modeInput, fallback, 40).toLowerCase()
+  return TOWN_AUTONOMY_MODES.has(mode) ? mode : SUPPORT_ORDER_PRIORITY_ALLIED
+}
+
+/**
+ * @param {unknown} autonomyInput
+ */
+function normalizeTownAutonomy(autonomyInput) {
+  const source = (autonomyInput && typeof autonomyInput === 'object' && !Array.isArray(autonomyInput))
+    ? autonomyInput
+    : {}
+  return {
+    mode: normalizeTownAutonomyMode(source.mode),
+    lastPlannedDay: normalizeTownCycleDay(source.lastPlannedDay),
+    lastResolvedDay: normalizeTownCycleDay(source.lastResolvedDay)
+  }
+}
+
+/**
  * @param {unknown} impactInput
  */
 function normalizeTownImpactEntry(impactInput) {
@@ -4442,6 +4979,9 @@ function normalizeTownMissionState(townInput, townIdHint = '') {
     majorMissionCooldownUntilDay: Number.isInteger(cooldown) && cooldown >= 0 ? cooldown : 0,
     hope: normalizeTownPressureValue(source.hope, DEFAULT_TOWN_HOPE),
     dread: normalizeTownPressureValue(source.dread, DEFAULT_TOWN_DREAD),
+    stockpiles: normalizeTownStockpiles(source.stockpiles),
+    readiness: normalizeTownReadiness(source.readiness),
+    autonomy: normalizeTownAutonomy(source.autonomy),
     crierQueue: normalizeTownCrierQueue(source.crierQueue),
     recentImpacts: normalizeTownRecentImpacts(source.recentImpacts)
   }
@@ -4585,6 +5125,9 @@ function enforceMajorMissionTownExclusivity(world) {
     towns[townName].activeMajorMissionId = null
     towns[townName].hope = normalizeTownPressureValue(towns[townName].hope, DEFAULT_TOWN_HOPE)
     towns[townName].dread = normalizeTownPressureValue(towns[townName].dread, DEFAULT_TOWN_DREAD)
+    towns[townName].stockpiles = normalizeTownStockpiles(towns[townName].stockpiles)
+    towns[townName].readiness = normalizeTownReadiness(towns[townName].readiness)
+    towns[townName].autonomy = normalizeTownAutonomy(towns[townName].autonomy)
     towns[townName].crierQueue = normalizeTownCrierQueue(towns[townName].crierQueue)
     towns[townName].recentImpacts = normalizeTownRecentImpacts(towns[townName].recentImpacts)
     const cooldown = Number(towns[townName].majorMissionCooldownUntilDay)
@@ -4937,6 +5480,71 @@ function applyTownPressureDelta(memory, input) {
  * @param {any} memory
  * @param {{
  *   townName: string,
+ *   stockpiles?: Record<string, number>,
+ *   readiness?: Record<string, number>,
+ *   mode?: string,
+ *   lastPlannedDay?: number,
+ *   lastResolvedDay?: number
+ * }} input
+ */
+function applyTownAutonomyDelta(memory, input) {
+  const townName = asText(input?.townName, '', 80)
+  if (!townName) return null
+  const towns = ensureWorldTownMissionStates(memory.world)
+  if (!Object.prototype.hasOwnProperty.call(towns, townName)) {
+    towns[townName] = normalizeTownMissionState(null, townName)
+  }
+  const state = towns[townName]
+  state.stockpiles = normalizeTownStockpiles(state.stockpiles)
+  state.readiness = normalizeTownReadiness(state.readiness)
+  state.autonomy = normalizeTownAutonomy(state.autonomy)
+
+  if (input?.stockpiles && typeof input.stockpiles === 'object' && !Array.isArray(input.stockpiles)) {
+    for (const key of TOWN_STOCKPILE_KEYS) {
+      const delta = Math.trunc(Number(input.stockpiles[key] || 0))
+      if (delta === 0) continue
+      state.stockpiles[key] = clamp(
+        Number(state.stockpiles[key] || 0) + delta,
+        TOWN_STOCKPILE_MIN,
+        TOWN_STOCKPILE_MAX
+      )
+    }
+  }
+
+  if (input?.readiness && typeof input.readiness === 'object' && !Array.isArray(input.readiness)) {
+    for (const key of TOWN_READINESS_KEYS) {
+      const delta = Math.trunc(Number(input.readiness[key] || 0))
+      if (delta === 0) continue
+      state.readiness[key] = clamp(
+        Number(state.readiness[key] || 0) + delta,
+        TOWN_READINESS_MIN,
+        TOWN_READINESS_MAX
+      )
+    }
+  }
+
+  if (input?.mode !== undefined) {
+    state.autonomy.mode = normalizeTownAutonomyMode(input.mode, state.autonomy.mode)
+  }
+  if (input?.lastPlannedDay !== undefined) {
+    state.autonomy.lastPlannedDay = normalizeTownCycleDay(input.lastPlannedDay)
+  }
+  if (input?.lastResolvedDay !== undefined) {
+    state.autonomy.lastResolvedDay = normalizeTownCycleDay(input.lastResolvedDay)
+  }
+
+  return {
+    townName,
+    stockpiles: { ...state.stockpiles },
+    readiness: { ...state.readiness },
+    autonomy: { ...state.autonomy }
+  }
+}
+
+/**
+ * @param {any} memory
+ * @param {{
+ *   townName: string,
  *   project: any,
  *   at: number,
  *   idPrefix: string,
@@ -5022,6 +5630,7 @@ function applyProjectCompletionEffects(memory, project, input) {
   const longNightDelta = Math.trunc(Number(normalized.effects.longNightDelta || 0))
   const hopeDelta = Math.trunc(Number(normalized.effects.hopeDelta || 0))
   const dreadDelta = Math.trunc(Number(normalized.effects.dreadDelta || 0))
+  const autonomyDeltas = SUPPORT_ORDER_COMPLETION_AUTONOMY_DELTAS[normalized.type] || null
 
   if (threatDelta !== 0) {
     const threat = ensureWorldThreat(memory.world)
@@ -5043,6 +5652,14 @@ function applyProjectCompletionEffects(memory, project, input) {
     summary: `project_${normalized.type}_completed`,
     projectId: normalized.id
   })
+  if (autonomyDeltas) {
+    applyTownAutonomyDelta(memory, {
+      townName,
+      stockpiles: autonomyDeltas.stockpiles,
+      readiness: autonomyDeltas.readiness,
+      lastResolvedDay: ensureWorldClock(memory.world).day
+    })
+  }
 }
 
 /**
@@ -7650,7 +8267,7 @@ function createGodCommandService(deps) {
         const threat = ensureWorldThreat(memory.world)
         ensureWorldMoods(memory.world)
         ensureWorldEvents(memory.world)
-        const towns = deriveTownsFromMarkers(memory.world?.markers || [])
+        const towns = deriveTownNamesForMissionState(memory.world).map((townName) => ({ townName }))
         for (let tickIdx = 0; tickIdx < ticks; tickIdx += 1) {
           clock = ensureWorldClock(memory.world)
           const rates = SEASON_THREAT_RATES[clock.season] || SEASON_THREAT_RATES.dawn
@@ -7727,6 +8344,16 @@ function createGodCommandService(deps) {
               reason: 'clock_advance'
             })
           }
+          runTownSupportOrders(memory, {
+            operationId,
+            tickIdx,
+            at
+          })
+          runTownAutonomyTick(memory, {
+            operationId,
+            tickIdx,
+            at
+          })
           if (nextPhase === 'day') {
             generateDailyContracts(memory, {
               operationId,

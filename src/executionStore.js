@@ -19,6 +19,8 @@ const HISTORY_RECORD_TYPE = 'history-record.v1'
 const HISTORY_SUMMARY_SCHEMA_VERSION = 1
 const WORLD_MEMORY_SNAPSHOT_HASH_META_KEY = 'world_memory.snapshot_hash'
 const WORLD_MEMORY_DECISION_EPOCH_META_KEY = 'world_memory.decision_epoch'
+const TOWN_STOCKPILE_KEYS = ['food', 'tools', 'munitions', 'timber', 'stone', 'lampOil', 'sanctity']
+const TOWN_READINESS_KEYS = ['defense', 'economy', 'morale', 'gate', 'shelter']
 
 function isPlainObject(value) {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -88,6 +90,24 @@ function normalizeScalarRecord(value, maxEntries = 24) {
     }
   }
   return out
+}
+
+function summarizeTownMetricRecord(source, keys) {
+  const record = {}
+  const input = isPlainObject(source) ? source : {}
+  for (const key of keys) {
+    record[key] = asNullableInteger(input[key]) ?? 0
+  }
+  return record
+}
+
+function summarizeTownAutonomy(source) {
+  const input = isPlainObject(source) ? source : {}
+  return {
+    mode: asText(input.mode, 40) || 'allied_autonomy',
+    lastPlannedDay: asNullableInteger(input.lastPlannedDay),
+    lastResolvedDay: asNullableInteger(input.lastResolvedDay)
+  }
 }
 
 function compareRecordsDesc(left, right) {
@@ -359,6 +379,13 @@ function buildTownHistorySummary(world, chronicleRecords, historyRecords, townId
     if (!Object.prototype.hasOwnProperty.call(executionCounts, record.status)) continue
     executionCounts[record.status] += 1
   }
+  const activeSupportOrder = (Array.isArray(world?.projects) ? world.projects : [])
+    .find((project) => (
+      project
+      && project.townId === townId
+      && (project.status === 'active' || project.status === 'planned')
+      && Number(project.requirements?.supportOrder || 0) === 1
+    )) || null
   return {
     type: 'town-history-summary.v1',
     schemaVersion: HISTORY_SUMMARY_SCHEMA_VERSION,
@@ -369,12 +396,29 @@ function buildTownHistorySummary(world, chronicleRecords, historyRecords, townId
     lastHistoryAt: historyRecords[0]?.at ?? null,
     hope: Number.isFinite(Number(townState?.hope)) ? Number(townState.hope) : null,
     dread: Number.isFinite(Number(townState?.dread)) ? Number(townState.dread) : null,
+    stockpiles: summarizeTownMetricRecord(townState?.stockpiles, TOWN_STOCKPILE_KEYS),
+    readiness: summarizeTownMetricRecord(townState?.readiness, TOWN_READINESS_KEYS),
+    autonomy: summarizeTownAutonomy(townState?.autonomy),
     activeMajorMissionId: asText(townState?.activeMajorMissionId, 200) || null,
     recentImpactCount: Array.isArray(townState?.recentImpacts) ? townState.recentImpacts.length : 0,
     crierQueueDepth: Array.isArray(townState?.crierQueue) ? townState.crierQueue.length : 0,
     activeProjectCount: (Array.isArray(world?.projects) ? world.projects : [])
       .filter((project) => project?.townId === townId && project?.status === 'active')
       .length,
+    activeSupportOrderLabel: typeof activeSupportOrder?.requirements?.supportOrderLabel === 'string'
+      ? activeSupportOrder.requirements.supportOrderLabel
+      : null,
+    activeSupportOrderType: typeof activeSupportOrder?.type === 'string' ? activeSupportOrder.type : null,
+    activeSupportOrderStage: Number.isInteger(Number(activeSupportOrder?.stage)) ? Number(activeSupportOrder.stage) : null,
+    activeSupportOrderDueDay: Number.isInteger(Number(activeSupportOrder?.requirements?.dueDay))
+      ? Number(activeSupportOrder.requirements.dueDay)
+      : null,
+    activeSupportOrderDuePhase: typeof activeSupportOrder?.requirements?.duePhase === 'string'
+      ? activeSupportOrder.requirements.duePhase
+      : null,
+    activeSupportOrderAutoManaged: activeSupportOrder == null
+      ? null
+      : activeSupportOrder.requirements?.autoManaged === true || activeSupportOrder.requirements?.autoManaged === 1,
     factions: factionIds,
     executionCounts,
     recentChronicle: chronicleRecords.slice(0, 5),
